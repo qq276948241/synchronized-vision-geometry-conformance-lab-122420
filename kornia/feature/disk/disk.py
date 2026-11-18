@@ -1,0 +1,230 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from __future__ import annotations
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+from kornia.core.download import hf_url, load_state_dict_from_url
+
+from ._unets import Unet
+from .detector import heatmap_to_keypoints
+from .structs import DISKFeatures
+
+# Module level, like every other weight registry in kornia, so the CI weights
+# cache can enumerate it -- see tests/core/test_weights_prefetch.py.
+urls: dict[str, list[str]] = {
+    "depth": [
+        hf_url("disk", "depth-save.pth"),
+        "https://raw.githubusercontent.com/cvlab-epfl/disk/master/depth-save.pth",
+    ],
+    "epipolar": [
+        hf_url("disk", "epipolar-save.pth"),
+        "https://raw.githubusercontent.com/cvlab-epfl/disk/master/epipolar-save.pth",
+    ],
+}
+
+
+class DISK(nn.Module):
+    r"""Detect integer-pixel keypoints and describe them with the dense maps of one U-Net (DISK).
+
+    ``disk = DISK.from_pretrained("depth")`` loads trained weights in evaluation mode.
+    ``features = disk(images, n=2048)`` takes RGB images ``(B, 3, H, W)`` and returns one :class:`DISKFeatures`
+    per image: up to ``n`` integer-pixel keypoints ``(N, 2)``, scores ``(N,)`` and L2-normalised descriptors
+    ``(N, 128)``. Image dimensions must be multiples of 16 unless ``pad_if_not_divisible=True``.
+    Use :class:`ALIKED` for subpixel keypoints or :class:`DeDoDe` for a fixed keypoint budget per image.
+
+    See :cite:`tyszkiewicz2020disk` for details.
+
+    .. image:: _static/img/disk_outdoor_depth.jpg
+
+    Convention:
+        - ``DISK()`` creates random weights in training mode. For matching, construct LAFs with
+          :func:`~kornia.feature.laf_from_center_scale_ori` on ``keypoints[None]`` and pass them with the descriptors
+          to :class:`LightGlueMatcher` in ``"disk"`` mode.
+        - ``images`` are RGB, ``(B, 3, H, W)``, which the U-Net sees as given, without normalisation. With the
+          default U-Net, a common positive gain of the input, such as :math:`[0, 255]` instead of :math:`[0, 1]`,
+          changes the outputs only through the instance norms' ``eps``, which weighs more the lower the image's
+          contrast. At ordinary contrast the maps barely change, though a keypoint can still swap where scores nearly
+          tie or at the ``n`` cut; at low contrast the keypoints and descriptors change substantially. With the
+          ``depth`` weights and ``n=2048``, the :math:`[0, 1]` and :math:`[0, 255]` versions of Oxford graf, wall and
+          bark ``img1`` differ in 0 to 2 keypoints, in 2 to 6 % of them with the intensities multiplied by 0.1, and
+          in about 30 % multiplied by 0.01. ``H`` and ``W`` must be multiples of 16, unless
+          ``pad_if_not_divisible=True`` zero-pads the bottom and right, in which case the maps are cropped back to the
+          image before the suppression and no keypoint lies in the padding. The image must have the network's
+          dtype: a float16, bfloat16 or float64 image raises on a float32 model, so cast the model first,
+          ``disk.to(images.dtype)``.
+        - Keypoints are the integer ``(x, y)`` pixels of the strict heatmap
+          maxima (see the note), using the pixel convention of :func:`~kornia.feature.laf_from_center_scale_ori`
+          (see :ref:`Local features <local-features-conventions>`), listed in raster order (row by row, then column
+          by column) rather than by score, in float32 for a float16 or bfloat16 network and otherwise in the dtype
+          of the network's output. ``detection_scores`` are the heatmap values there, in the network's dtype, and
+          each descriptor is the dense descriptor at the keypoint's pixel, L2-normalised;
+          :meth:`heatmap_and_dense_descriptors` returns the dense descriptors without normalisation.
+        - ``score_threshold`` keeps the scores strictly above it. ``n`` is an upper bound on the maxima above
+          ``score_threshold`` in each image; the ``n`` argument of :meth:`forward` says which of them are kept when
+          there are more.
+
+    Args:
+        desc_dim: The dimension of the descriptor.
+        unet: The U-Net to use. If None, a default U-Net is used. Kornia doesn't provide the training code for DISK
+              so this is only useful when using a custom checkpoint trained using the code released with the paper.
+              The unet should take as input a torch.Tensor of shape ``(B, C, H, W)`` and output
+              a torch.Tensor of shape ``(B, desc_dim + 1, H, W)``: the descriptors, then the heatmap.
+
+    Note:
+        Keypoints are the strict local maxima of the heatmap: :func:`~kornia.geometry.subpix.nms2d` keeps a position
+        only if its score is greater than every other score in its full ``window_size`` window. Tied maxima, and the
+        positions near the border whose window runs off the image (see :func:`~kornia.geometry.subpix.nms2d`), are
+        never keypoints. This departs on purpose from the reference implementation (cvlab-epfl/disk). Its max-pool NMS
+        clips the window at the border, so it judges a border position against part of its window. Of several equal
+        maxima it keeps the one the max-pool reports first, which depends on an order PyTorch does not specify. With
+        the pretrained ``depth`` weights on Oxford graf and boat img1, every keypoint of the reference that kornia
+        leaves out lies in that border strip. The reference's ``n`` keeps the scores strictly above the
+        ``(n + 1)``-th largest, which drops the weakest maximum, with every maximum tied with it, of an image with
+        ``n`` maxima or fewer, and every maximum tied across the cut. kornia's ``n`` is an upper bound, so such an
+        image keeps every maximum, and a tie at the cut is filled in raster order.
+
+    See Also:
+        - :class:`DISKFeatures`: the per-image result of :meth:`forward`.
+        - :class:`ALIKED`: learned sub-pixel keypoints for RGB images of any size, also as padded LAF tensors.
+        - :class:`XFeat`: learned keypoints with 64-D descriptors, and its own mutual-nearest-neighbour and refined
+          matching of image pairs.
+        - :class:`DeDoDe`: separate learned detector and descriptor networks, with ``n`` keypoints in every image.
+        - :class:`LocalFeature`: a classical detector and LAF descriptor in one call, returning padded LAF tensors
+          instead of a list per image.
+        - :func:`laf_from_center_scale_ori`: turns the keypoints of one image into the LAFs that
+          :class:`LightGlueMatcher` and :class:`LAFDescriptor` take.
+        - :class:`LightGlueMatcher`: matches DISK's descriptors and keypoints with the ``"disk"`` weights.
+
+    Example:
+        >>> disk = DISK.from_pretrained('depth')
+        >>> images = torch.rand(1, 3, 256, 256)
+        >>> features = disk(images)
+
+    """
+
+    def __init__(self, desc_dim: int = 128, unet: nn.Module | None = None) -> None:
+        super().__init__()
+
+        self.desc_dim = desc_dim
+
+        if unet is None:
+            unet = Unet(in_features=3, size=5, down=[16, 32, 64, 64, 64], up=[64, 64, 64, desc_dim + 1])
+        self.unet = unet
+
+    def heatmap_and_dense_descriptors(self, images: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the heatmap and the dense descriptors.
+
+        .. image:: _static/img/DISK.png
+
+        Args:
+            images: The image to detect features in. Shape ``(B, 3, H, W)``.
+
+        Returns:
+            A tuple of dense detection scores and descriptors.
+            Shapes are ``(B, 1, H, W)`` and ``(B, D, H, W)``, where
+            ``D`` is the descriptor dimension; the descriptors are not normalised.
+
+        """
+        unet_output = self.unet(images)
+
+        if unet_output.shape[1] != self.desc_dim + 1:
+            raise ValueError(
+                f"U-Net output has {unet_output.shape[1]} channels, but expected self.desc_dim={self.desc_dim} + 1."
+            )
+
+        descriptors = unet_output[:, : self.desc_dim]
+        heatmaps = unet_output[:, self.desc_dim :]
+
+        return heatmaps, descriptors
+
+    def forward(
+        self,
+        images: torch.Tensor,
+        n: int | None = None,
+        window_size: int = 5,
+        score_threshold: float = 0.0,
+        pad_if_not_divisible: bool = False,
+    ) -> list[DISKFeatures]:
+        """Detect features in an image, returning keypoint locations, descriptors and detection scores.
+
+        Args:
+            images: The image to detect features in. Shape ``(B, 3, H, W)``.
+            n: The maximum number of keypoints per image, counted among the maxima above ``score_threshold``. An
+               image with ``n`` such maxima or fewer keeps all of them; with more, its ``n`` strongest, where maxima
+               tied at the ``n``-th score are taken in raster order. If None, all keypoints are returned.
+            window_size: The size of the non-maxima suppression window used to filter detections.
+            score_threshold: Detections must score strictly above it to be returned.
+                             See :py:class:`DISKFeatures` for details.
+            pad_if_not_divisible: if True, an input whose height or width is not a multiple of 16 is zero-padded at
+                the bottom and right to the next multiple of 16.
+
+        Returns:
+            A list of length :math:`B` containing the detected features.
+
+        """
+        B = images.shape[0]
+        if pad_if_not_divisible:
+            h, w = images.shape[2:]
+            pd_h = 16 - h % 16 if h % 16 > 0 else 0
+            pd_w = 16 - w % 16 if w % 16 > 0 else 0
+            images = F.pad(images, (0, pd_w, 0, pd_h), value=0.0)
+
+        heatmaps, descriptors = self.heatmap_and_dense_descriptors(images)
+        if pad_if_not_divisible:
+            heatmaps = heatmaps[..., :h, :w]
+            descriptors = descriptors[..., :h, :w]
+
+        keypoints = heatmap_to_keypoints(heatmaps, n=n, window_size=window_size, score_threshold=score_threshold)
+
+        features = []
+        for i in range(B):
+            features.append(keypoints[i].merge_with_descriptors(descriptors[i]))
+
+        return features
+
+    @classmethod
+    def from_pretrained(cls, checkpoint: str = "depth", device: torch.device | None = None) -> DISK:
+        r"""Load a pretrained model.
+
+        Depth model was trained using depth map supervision and is slightly more precise but biased to detect keypoints
+        only where SfM depth is available. Epipolar model was trained using epipolar geometry supervision and
+        is less precise but detects keypoints everywhere where they are matchable. The difference is especially
+        pronounced on thin structures and on edges of objects.
+
+        Args:
+            checkpoint: The checkpoint to load. One of 'depth' or 'epipolar'.
+            device: The device to load the model to.
+
+        Returns:
+            The pretrained model.
+
+        """
+        if checkpoint not in urls:
+            raise ValueError(f"Unknown pretrained model: {checkpoint}")
+
+        if device is None:
+            device = torch.device("cpu")
+        pretrained_dict = load_state_dict_from_url(urls[checkpoint], map_location=device)
+
+        model: DISK = cls().to(device)
+        model.load_state_dict(pretrained_dict["extractor"])
+        model.eval()
+        return model

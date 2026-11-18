@@ -1,0 +1,602 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+r"""Homogeneous 4x4 transforms and point transforms, with point-line distances and last-axis vector products.
+
+A transform ``trans_ab`` maps points in frame ``b`` to frame ``a``, :math:`p_a = T_a^{b} p_b`, so
+``compose_transformations(trans_01, trans_12)`` is ``trans_02`` and ``transform_points(trans_01, points_1)`` returns
+``points_0``. The ``4 x 4`` functions take ``(4, 4)`` or ``(N, 4, 4)`` inputs, two arguments with the same number of
+dimensions, and a batch of one broadcasts against a batch of ``N``. The vector functions reduce the last dimension and
+broadcast the leading ones.
+
+Which function to use:
+
+- Chain two transforms: :func:`compose_transformations`. Invert a rigid one: :func:`inverse_transformation`. The
+  transform between two poses given in one frame: :func:`relative_transformation`.
+- Apply a ``(D + 1, D + 1)`` homogeneous matrix, rigid, affine or projective, to ``(..., N, D)`` points:
+  :func:`transform_points`.
+- Distances: between paired points, :func:`euclidean_distance`; from 2D points to lines :math:`ax + by + c = 0`,
+  :func:`point_line_distance`.
+- Products over the last dimension: :func:`batched_dot_product`, and the squared norm :func:`batched_squared_norm`,
+  also exported as :func:`squared_norm`, the same function.
+"""
+
+from __future__ import annotations
+
+import torch
+
+from kornia.core.check import KORNIA_CHECK_IS_TENSOR, KORNIA_CHECK_SHAPE
+from kornia.core.utils import _autocast_disabled
+from kornia.geometry.conversions import convert_points_from_homogeneous, convert_points_to_homogeneous
+
+__all__ = [
+    "batched_dot_product",
+    "batched_squared_norm",
+    "compose_transformations",
+    "euclidean_distance",
+    "inverse_transformation",
+    "point_line_distance",
+    "relative_transformation",
+    "squared_norm",
+    "transform_points",
+]
+
+
+def compose_transformations(trans_01: torch.Tensor, trans_12: torch.Tensor) -> torch.Tensor:
+    r"""Compose two 4x4 homogeneous transforms, trans_01 @ trans_12, into trans_02.
+
+    ``trans_02 = compose_transformations(trans_01, trans_12)`` takes two homogeneous transforms ``(N, 4, 4)`` or
+    ``(4, 4)`` and returns their product ``trans_01 @ trans_12``, the transform from frame 2 to frame 0, with the
+    broadcast shape. Both inputs need the same number of dimensions: a ``(4, 4)`` with an ``(N, 4, 4)`` raises
+    ``ValueError``, while a batch of one broadcasts against a batch of ``N``. For poses that name their frames and check
+    them when composing, use :class:`~kornia.geometry.pose.NamedPose`; to apply the result to points,
+    :func:`transform_points`.
+
+    .. math::
+        T_0^{2} = \begin{bmatrix} R_0^{1} R_1^{2} & R_0^{1} t_1^{2} + t_0^{1} \\
+        \mathbf{0} & 1 \end{bmatrix}
+
+    Convention:
+        - The result is the matrix product ``trans_01 @ trans_12``, with the frame naming of
+          :func:`relative_transformation`. Only the top three rows of each input are read and the last row of the
+          result is always :math:`[0, 0, 0, 1]`: any affine pair composes exactly, and a projective input is used as
+          if its last row were :math:`[0, 0, 0, 1]`.
+
+    Args:
+        trans_01: tensor with the homogeneous transformation from
+          a reference frame 1 respect to a frame 0. The tensor must have a
+          shape of ``(N, 4, 4)`` or ``(4, 4)``.
+        trans_12: tensor with the homogeneous transformation from
+          a reference frame 2 respect to a frame 1. The tensor must have a
+          shape of ``(N, 4, 4)`` or ``(4, 4)``. A batch of one broadcasts against a batch of
+          :math:`N` in either argument.
+
+    Returns:
+        the transformation between the two frames with shape ``(N, 4, 4)`` or ``(4, 4)``.
+
+    See Also:
+        - :func:`inverse_transformation`: the inverse of a rigid transform, to compose with.
+        - :func:`relative_transformation`: ``inverse_transformation(trans_01) @ trans_02`` in one call.
+        - :func:`transform_points`: applies a composed transform to points.
+        - :class:`~kornia.geometry.pose.NamedPose`: a pose that names its two frames and checks them when composing.
+        - :class:`~kornia.geometry.liegroup.Se3`: a rigid pose as a Lie group element, composed with ``*``.
+
+    Example::
+        >>> trans_01 = torch.eye(4)  # 4x4
+        >>> trans_12 = torch.eye(4)  # 4x4
+        >>> trans_02 = compose_transformations(trans_01, trans_12)  # 4x4
+
+    """
+    KORNIA_CHECK_IS_TENSOR(trans_01)
+    KORNIA_CHECK_IS_TENSOR(trans_12)
+
+    if not ((trans_01.dim() in (2, 3)) and (trans_01.shape[-2:] == (4, 4))):
+        raise ValueError(f"Input trans_01 must be a of the shape Nx4x4 or 4x4. Got {trans_01.shape}")
+
+    if not ((trans_12.dim() in (2, 3)) and (trans_12.shape[-2:] == (4, 4))):
+        raise ValueError(f"Input trans_12 must be a of the shape Nx4x4 or 4x4. Got {trans_12.shape}")
+
+    if trans_01.dim() != trans_12.dim():
+        raise ValueError(f"Input number of dims must match. Got {trans_01.dim()} and {trans_12.dim()}")
+
+    try:
+        batch_shape = torch.broadcast_shapes(trans_01.shape[:-2], trans_12.shape[:-2])
+    except RuntimeError as err:
+        raise ValueError(f"Incompatible batch shapes: {trans_01.shape} and {trans_12.shape}") from err
+
+    # unpack input data
+    rmat_01 = trans_01[..., :3, :3]
+    rmat_12 = trans_12[..., :3, :3]
+    tvec_01 = trans_01[..., :3, 3:]
+    tvec_12 = trans_12[..., :3, 3:]
+
+    # compute the actual transforms composition
+    rmat_02 = torch.matmul(rmat_01, rmat_12)
+    tvec_02 = torch.matmul(rmat_01, tvec_12) + tvec_01
+
+    trans_02 = trans_01.new_zeros(batch_shape + (4, 4))
+    trans_02[..., :3, :3] = rmat_02
+    trans_02[..., :3, 3:] = tvec_02
+    trans_02[..., 3, 3] = 1.0
+    return trans_02
+
+
+def inverse_transformation(trans_12: torch.Tensor) -> torch.Tensor:
+    r"""Invert a 4x4 rigid transform in closed form by transposing its rotation block.
+
+    ``trans_21 = inverse_transformation(trans_12)`` takes a rigid transform :math:`[R|t]`, ``(N, 4, 4)`` or ``(4, 4)``,
+    and returns its inverse :math:`[R^\top | -R^\top t]` with the same shape, without a general matrix inversion. It
+    is the inverse only for a rigid input, as the convention below says; to invert and compose in one call, use
+    :func:`relative_transformation`.
+
+    :math:`T_1^{2} = \begin{bmatrix} R_1 & t_1 \\ \mathbf{0} & 1 \end{bmatrix}`
+
+    The inverse transformation is computed as follows:
+
+    .. math::
+
+        T_2^{1} = (T_1^{2})^{-1} = \begin{bmatrix} R_1^T & -R_1^T t_1 \\
+        \mathbf{0} & 1\end{bmatrix}
+
+    Convention:
+        - The input must be a rigid :math:`[R|t]`, and this is not validated: the rotation block is transposed, not
+          inverted, and the last row is read as :math:`[0, 0, 0, 1]`, so a scaled, sheared or projective matrix
+          returns a result that is not its inverse. Use :func:`torch.linalg.inv` for a general matrix. Frame naming
+          is on :func:`relative_transformation`.
+
+    Args:
+        trans_12: transformation tensor of shape ``(N, 4, 4)`` or ``(4, 4)``.
+
+    Returns:
+        tensor with inverted transformations with shape ``(N, 4, 4)`` or ``(4, 4)``.
+
+    See Also:
+        - :func:`relative_transformation`: the inverse of one transform composed with another, in one call.
+        - :func:`compose_transformations`: chains transforms, such as this inverse with another one.
+        - :func:`~kornia.geometry.conversions.camtoworld_to_worldtocam_Rt`: the same rigid inverse for a rotation and
+          a translation given apart.
+
+    Example:
+        >>> trans_12 = torch.eye(4)[None]  # Nx4x4: a rotation of 90 degrees about z and a translation
+        >>> trans_12[:, :3, :3] = torch.tensor([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+        >>> trans_12[:, :3, 3] = torch.tensor([1.0, 2.0, 3.0])
+        >>> trans_21 = inverse_transformation(trans_12)  # Nx4x4
+        >>> trans_21[:, :3, 3]
+        tensor([[-2.,  1., -3.]])
+
+    """
+    KORNIA_CHECK_IS_TENSOR(trans_12)
+
+    if not ((trans_12.dim() in (2, 3)) and (trans_12.shape[-2:] == (4, 4))):
+        raise ValueError(f"Input size must be a Nx4x4 or 4x4. Got {trans_12.shape}")
+    # unpack input tensor
+    rmat_12 = trans_12[..., :3, :3]  # Nx3x3 or 3x3
+    tvec_12 = trans_12[..., :3, 3:4]  # Nx3x1 or 3x1
+
+    # compute the actual inverse
+    rmat_21 = rmat_12.transpose(-1, -2)
+    tvec_21 = torch.matmul(-rmat_21, tvec_12)
+
+    # pack to output tensor
+    trans_21 = trans_12.new_zeros(trans_12.shape)
+    trans_21[..., :3, :3].copy_(rmat_21)
+    trans_21[..., :3, 3:4].copy_(tvec_21)
+    trans_21[..., 3, 3] = 1.0
+    return trans_21
+
+
+def relative_transformation(trans_01: torch.Tensor, trans_02: torch.Tensor) -> torch.Tensor:
+    r"""Compute the relative 4x4 transform trans_12 = inv(trans_01) @ trans_02 of two rigid poses.
+
+    ``trans_12 = relative_transformation(trans_01, trans_02)`` takes two transforms into a common frame 0,
+    ``(N, 4, 4)`` or ``(4, 4)``, and returns the transform from frame 2 to frame 1 with the broadcast shape: for two
+    camera-to-world poses, the pose of camera 2 in the frame of camera 1. Both inputs need the same number of
+    dimensions, as in :func:`compose_transformations`. For world-to-camera extrinsics given as rotations and
+    translations, use :func:`~kornia.geometry.epipolar.relative_camera_motion`.
+
+    Given the reference :math:`T_0^{1} = \begin{bmatrix} R_1 & t_1 \\ \mathbf{0} & 1 \end{bmatrix}` and the
+    destination :math:`T_0^{2} = \begin{bmatrix} R_2 & t_2 \\ \mathbf{0} & 1 \end{bmatrix}`, the relative
+    transformation is computed as follows:
+
+    .. math::
+
+        T_1^{2} = (T_0^{1})^{-1} \cdot T_0^{2}
+
+    Convention:
+        - ``trans_ab`` (:math:`T_a^{b}`) maps points in frame ``b`` to frame ``a``, :math:`p_a = T_a^{b} p_b`:
+          ``transform_points(trans_01, points_1)`` returns ``points_0``, and
+          ``compose_transformations(trans_01, trans_12)`` returns ``trans_02``.
+          :ref:`Rotations and rigid motions <rotation-conventions>` maps this onto other libraries.
+        - ``trans_01`` must be a rigid :math:`[R|t]`, as for :func:`inverse_transformation`, and the last row of
+          ``trans_02`` is read as :math:`[0, 0, 0, 1]`, as in :func:`compose_transformations`. Neither is validated:
+          a scaled, sheared or projective ``trans_01``, or a projective ``trans_02``, gives a wrong result silently.
+        - :func:`~kornia.geometry.epipolar.relative_camera_motion` takes world-to-camera extrinsics
+          :math:`E_1, E_2` and returns the :math:`[R|t]` of :math:`E_2 E_1^{-1}`, which is
+          ``relative_transformation`` of :math:`E_2^{-1}` and :math:`E_1^{-1}`, in this order, not of :math:`E_1` and
+          :math:`E_2`.
+
+    Args:
+        trans_01: reference transformation tensor of shape ``(N, 4, 4)`` or ``(4, 4)``.
+        trans_02: destination transformation tensor of shape ``(N, 4, 4)`` or ``(4, 4)``. A batch
+          of one broadcasts against a batch of :math:`N` in either argument.
+
+    Returns:
+        the relative transformation between the transformations with shape ``(N, 4, 4)`` or ``(4, 4)``.
+
+    See Also:
+        - :func:`inverse_transformation`: the rigid inverse this function applies to ``trans_01``, alone.
+        - :func:`compose_transformations`: the other way, ``trans_01 @ trans_12`` gives back ``trans_02``.
+        - :func:`~kornia.geometry.epipolar.relative_camera_motion`: the motion between two world-to-camera
+          extrinsics given as rotations and translations, :math:`E_2 E_1^{-1}`.
+        - :class:`~kornia.geometry.pose.NamedPose`: a pose that names its two frames.
+
+    Example::
+        >>> trans_01 = torch.eye(4)  # 4x4
+        >>> trans_02 = torch.eye(4)  # 4x4
+        >>> trans_12 = relative_transformation(trans_01, trans_02)  # 4x4
+
+    """
+    KORNIA_CHECK_IS_TENSOR(trans_01)
+    KORNIA_CHECK_IS_TENSOR(trans_02)
+    if not ((trans_01.dim() in (2, 3)) and (trans_01.shape[-2:] == (4, 4))):
+        raise ValueError(f"Input must be a of the shape Nx4x4 or 4x4. Got {trans_01.shape}")
+    if not ((trans_02.dim() in (2, 3)) and (trans_02.shape[-2:] == (4, 4))):
+        raise ValueError(f"Input must be a of the shape Nx4x4 or 4x4. Got {trans_02.shape}")
+    if not trans_01.dim() == trans_02.dim():
+        raise ValueError(f"Input number of dims must match. Got {trans_01.dim()} and {trans_02.dim()}")
+
+    try:
+        batch_shape = torch.broadcast_shapes(trans_01.shape[:-2], trans_02.shape[:-2])
+    except RuntimeError as err:
+        raise ValueError(f"Incompatible batch shapes: {trans_01.shape} and {trans_02.shape}") from err
+
+    rmat_01 = trans_01[..., :3, :3]
+    tvec_01 = trans_01[..., :3, 3:4]
+    rmat_02 = trans_02[..., :3, :3]
+    tvec_02 = trans_02[..., :3, 3:4]
+    rmat_10 = rmat_01.transpose(-1, -2)
+    rmat_12 = torch.matmul(rmat_10, rmat_02)
+    tvec_12 = torch.matmul(rmat_10, tvec_02 - tvec_01)
+    trans_12 = trans_01.new_zeros(batch_shape + (4, 4))
+    trans_12[..., :3, :3] = rmat_12
+    trans_12[..., :3, 3:4] = tvec_12
+    trans_12[..., 3, 3] = 1.0
+
+    return trans_12
+
+
+def _matrix_batch_pairs_with_points(trans_batch: list[int], points_batch: list[int]) -> bool:
+    """Whether a matrix batch with several axes lines up with the leading axes of the points' batch.
+
+    ``transform_points`` pairs the flattened matrix batch with the leading points' axes in order. That pairing is right
+    when the matrix batch equals those leading axes, or does once its size-1 axes are left out, and wrong otherwise.
+    """
+    stripped = list(trans_batch)
+    while len(stripped) > 0 and stripped[-1] == 1:
+        stripped.pop()
+    if len(stripped) == 0:
+        return True
+    nonunit: list[int] = []
+    for size in trans_batch:
+        if size != 1:
+            nonunit.append(size)
+    return list(points_batch[: len(stripped)]) == stripped or list(points_batch[: len(nonunit)]) == nonunit
+
+
+def transform_points(trans_01: torch.Tensor, points_1: torch.Tensor) -> torch.Tensor:
+    r"""Transform (..., N, D) Euclidean points by (D+1)x(D+1) homogeneous matrices, dividing by w.
+
+    ``points_0 = transform_points(trans_01, points_1)`` takes ``(D + 1, D + 1)`` or ``(B, D + 1, D + 1)`` homogeneous
+    matrices and Euclidean points ``(..., N, D)``, appends ``w = 1`` to each point, multiplies, divides by the
+    resulting ``w``, and returns the points ``(..., N, D)``. The matrix can be rigid, affine or projective: a
+    ``(B, 3, 3)`` homography for 2D points, a ``(B, 4, 4)`` pose for 3D points. A single matrix, ``(D + 1, D + 1)`` or
+    ``(1, D + 1, D + 1)``, applies to points of any leading shape; ``B > 1`` matrices pair matrix ``b`` with
+    ``points_1[b]``, so the points need a leading axis of size ``B``. To divide points that are already homogeneous by
+    their ``w``, use :func:`~kornia.geometry.conversions.convert_points_from_homogeneous`.
+
+    Convention:
+        - ``(B, D + 1, D + 1)`` matrices with ``B > 1`` raise ``ValueError`` for ``(N, D)`` points, whatever ``N``,
+          and for ``(1, N, D)`` points: neither has a leading axis of size ``B``.
+        - A matrix batch with more than one leading axis pairs with the leading batch axes of the points, either as
+          it stands or once its size-1 axes are left out, as the ``trans_01`` argument describes; any other
+          multi-axis batch raises ``ValueError``.
+        - A point mapped to ``|w| <= 1e-8`` is returned undivided, as
+          :func:`~kornia.geometry.conversions.convert_points_from_homogeneous` does.
+        - Integer and boolean operands are promoted, not rejected, because a transform moves integer coordinates
+          (pixel indices from ``torch.nonzero`` or ``argmax``) to fractional ones. Integer points return in the
+          floating dtype of ``trans_01``, or in the default floating dtype when both operands are integer, and an
+          integer ``trans_01`` is applied in the dtype of the result. Floating points keep their dtype; the product
+          is computed in the dtype of ``trans_01``, so ``float64`` points under a ``float32`` matrix are transformed
+          in ``float32``.
+        - A caller's autocast region does not change the product, outside TorchScript, where a scripted call keeps the
+          caller's precision. Under ``torch.compile`` on MPS it still does (torch ignores the nested guard there).
+
+    Args:
+        trans_01: tensor for transformations of shape
+          ``(D+1, D+1)`` or ``(B, D+1, D+1)``. A batch with several axes, ``(*, D+1, D+1)``, pairs with the
+          leading batch axes of ``points_1`` in order, as it stands or once its size-1 axes are left out, so
+          ``(B, 1, D+1, D+1)`` and ``(1, B, D+1, D+1)`` both apply matrix ``b`` to ``points_1[b]``; any other
+          multi-axis batch raises.
+        points_1: tensor of points of shape ``(*, N, D)``: ``(N, D)``, ``(B, N, D)``, or with several leading
+          axes, such as ``(M, B, N, D)``, which pair with a multi-axis ``trans_01`` as described there.
+
+    Returns:
+        transformed points with the same shape as ``points_1``.
+
+    See Also:
+        - :func:`~kornia.geometry.conversions.convert_points_from_homogeneous`: the division by ``w`` alone, for
+          points that are already homogeneous.
+        - :func:`compose_transformations`: chains two ``4 x 4`` transforms before they are applied.
+        - :func:`~kornia.geometry.transform.warp_grid`: applies homographies to a whole ``(1, H, W, 2)`` grid.
+        - :meth:`~kornia.geometry.pose.NamedPose.transform_points`: maps points by a pose that names its frames.
+
+    Examples:
+        >>> points_1 = torch.rand(2, 4, 3)  # BxNx3
+        >>> trans_01 = torch.eye(4).view(1, 4, 4)  # Bx4x4
+        >>> points_0 = transform_points(trans_01, points_1)  # BxNx3
+
+    """
+    KORNIA_CHECK_IS_TENSOR(trans_01)
+    KORNIA_CHECK_IS_TENSOR(points_1)
+    # Integer or boolean operands cannot hold the fractional coordinates a transform produces, so the result takes
+    # the points' floating dtype, else the transform's, else the default one (read off an empty tensor: TorchScript
+    # has no ``torch.get_default_dtype()``).
+    out_dtype = points_1.dtype
+    if not (points_1.is_floating_point() or points_1.is_complex()):
+        floating_trans = trans_01.is_floating_point() or trans_01.is_complex()
+        out_dtype = trans_01.dtype if floating_trans else torch.empty(0, device=points_1.device).dtype
+    if not (trans_01.is_floating_point() or trans_01.is_complex()):
+        trans_01 = trans_01.to(out_dtype)
+    if trans_01.ndim == 2:
+        trans_01 = trans_01.unsqueeze(0)
+    # A 2-D ``points_1`` is (N, D) with no batch axis, so N equal to a transform batch B > 1 is a
+    # coincidence, not a match: it used to reach ``bmm`` with an empty batch (kornia#4969).
+    unbatched_points = points_1.ndim == 2 and trans_01.shape[0] > 1
+    if (not trans_01.shape[0] == points_1.shape[0] or unbatched_points) and trans_01.shape[0] != 1:
+        raise ValueError(
+            f"Input batch size must be the same for both tensors or 1. Got {trans_01.shape} and {points_1.shape}"
+        )
+    if not trans_01.shape[-1] == (points_1.shape[-1] + 1):
+        raise ValueError(f"Last input dimensions must differ by one unit. Got {trans_01.shape} and {points_1.shape}")
+
+    # No points to transform (e.g. an image chip with no annotations): transforming an empty set
+    # yields the same empty set. Return early — the reshape below cannot infer ``-1`` from a
+    # 0-element tensor, so this also avoids a spurious crash on valid empty inputs.
+    if points_1.shape[-2] == 0:
+        return points_1.to(out_dtype)
+
+    # A matrix batch with several axes pairs with the points' leading batch axes in order (kornia#6473).
+    if trans_01.ndim > 3 and not _matrix_batch_pairs_with_points(list(trans_01.shape[:-2]), list(points_1.shape[:-2])):
+        raise ValueError(
+            "A matrix batch with several axes must match the leading batch axes of the points, size-1 matrix axes "
+            f"aside. Got {trans_01.shape} and {points_1.shape}"
+        )
+
+    # We reshape to BxNxD in case we get more dimensions, e.g., MxBxNxD
+    shape_inp = list(points_1.shape)
+    points_1 = points_1.reshape(-1, points_1.shape[-2], points_1.shape[-1])
+    trans_01 = trans_01.reshape(-1, trans_01.shape[-2], trans_01.shape[-1])
+    # We expand trans_01 to match the dimensions needed for bmm. repeats input division is cast
+    # to integer so onnx doesn't record the value as a tensor and get a device mismatch. An empty
+    # transform batch has nothing to repeat, and the validation above guarantees an empty point
+    # batch alongside it, so skip the division rather than computing ``0 // 0``.
+    repeats = points_1.shape[0] // trans_01.shape[0] if trans_01.shape[0] > 0 else 0
+    trans_01 = torch.repeat_interleave(trans_01, repeats=int(repeats), dim=0)
+    # to homogeneous
+    points_1_h = convert_points_to_homogeneous(points_1)  # BxNxD+1
+    # `torch.bmm` requires both operands to share a scalar type. Callers may pass coordinate
+    # tensors in a different dtype than the transform matrix (e.g. fp32 bbox + fp16 image), so
+    # harmonise at the bmm site and return in ``out_dtype``.
+    points_1_h = points_1_h.to(trans_01.dtype)
+    trans_01 = trans_01.permute(0, 2, 1)
+    # transform coordinates, outside a caller's autocast region: it would run this product in half precision and the
+    # result would still come back in ``out_dtype``, up to 1.36 px off in bfloat16 at 256 px (#6601). The ``to`` above
+    # already gives both operands one dtype, so the guard needs no reconciliation. TorchScript has no context managers;
+    # a scripted call keeps the caller's precision.
+    if torch.jit.is_scripting():
+        points_0_h = torch.bmm(points_1_h, trans_01)
+    else:
+        with _autocast_disabled(trans_01.device.type):
+            points_0_h = torch.bmm(points_1_h, trans_01)
+    # to euclidean
+    points_0 = convert_points_from_homogeneous(points_0_h)  # BxNxD
+    # reshape to the input shape
+    shape_inp[-2] = points_0.shape[-2]
+    shape_inp[-1] = points_0.shape[-1]
+    points_0 = points_0.reshape(shape_inp)
+    return points_0.to(out_dtype)
+
+
+def _nonzero(x: torch.Tensor) -> torch.Tensor:
+    """``x`` with 1 in place of its zeros: a divisor for entries the caller then sets to inf with :func:`_inf_where`."""
+    return torch.where(x == 0, torch.ones_like(x), x)
+
+
+def _inf_where(value: torch.Tensor, singular: torch.Tensor) -> torch.Tensor:
+    """``value`` with inf at the ``singular`` entries.
+
+    This is the guard that replaces ``eps`` in the two-view metrics (#4881): ``torch.where`` also differentiates the
+    branch it does not select, so ``value`` must be formed with divisors from :func:`_nonzero`; the gradient at a
+    singular entry is then 0 instead of NaN.
+    """
+    return torch.where(singular, torch.full_like(value, torch.inf), value)
+
+
+def _sqrt_or_zero(squared: torch.Tensor) -> torch.Tensor:
+    """``squared.sqrt()`` with a zero gradient at ``squared == 0``, an exact match, where the root's own is infinite."""
+    zero = squared <= 0
+    return torch.where(zero, torch.zeros_like(squared), torch.where(zero, torch.ones_like(squared), squared).sqrt())
+
+
+def point_line_distance(point: torch.Tensor, line: torch.Tensor, eps: float = 1e-9) -> torch.Tensor:
+    r"""Compute the distance from 2D points to lines ax + by + c = 0, at any scale of (a, b, c).
+
+    ``d = point_line_distance(points, lines)`` takes 2D points ``(*, N, 2)``, or homogeneous ``(*, N, 3)``, and lines
+    :math:`(a, b, c)` ``(*, N, 3)``, and returns the Euclidean distance from each point to its line, ``(*, N)``. The
+    leading dimensions broadcast, so ``(M, 1, 2)`` points and ``(1, N, 3)`` lines give all ``(M, N)`` distances. For
+    the distance from the points of one image to the epipolar lines of their matches, use
+    :func:`~kornia.geometry.epipolar.left_to_right_epipolar_distance`, which builds the lines from a fundamental
+    matrix.
+
+    Convention:
+        - ``line`` need not be normalised: the distance is :math:`|ax + by + c| / \|(a, b)\|` at every scale of the
+          coefficients. A line with :math:`a = b = 0`, the line at infinity or no line at all, is at distance ``inf``
+          from every point, as a point at infinity is from every line.
+
+    Args:
+       point: points ``(*, N, 2)``, or homogeneous points ``(*, N, 3)`` whose last coordinate is the
+         weight :math:`w`; a point at infinity (:math:`w = 0`) is at distance ``inf`` from every line.
+       line: lines coefficients :math:`(a, b, c)` with shape ``(*, N, 3)``, where :math:`ax + by + c = 0`.
+       eps: unused; it was added to :math:`\|(a, b)\|` and made the distance depend on the scale of the line
+         (#4881). The singular line is guarded exactly instead. Accepted so that existing calls keep working.
+
+    Returns:
+        the computed distance with shape ``(*, N)``.
+
+    Raises:
+        ValueError: if ``point`` does not end in 2 or 3 coordinates, or ``line`` does not end in 3.
+
+    See Also:
+        - :func:`~kornia.geometry.epipolar.left_to_right_epipolar_distance`: the distance from second-image points to
+          the epipolar lines of their matches, built from a fundamental matrix.
+        - :func:`euclidean_distance`: the distance between paired points instead of from a point to a line.
+        - :meth:`~kornia.geometry.line.ParametrizedLine.distance`: the distance to a line given by an origin and a
+          direction, in any dimension.
+
+    """
+    KORNIA_CHECK_IS_TENSOR(point)
+    KORNIA_CHECK_IS_TENSOR(line)
+
+    if point.shape[-1] not in (2, 3):
+        raise ValueError(f"pts must be a (*, 2 or 3) tensor. Got {point.shape}")
+
+    if line.shape[-1] != 3:
+        raise ValueError(f"lines must be a (*, 3) tensor. Got {line.shape}")
+
+    # Using in-place operations to improve performance
+    numerator = line[..., 0] * point[..., 0]
+    numerator += line[..., 1] * point[..., 1]
+    if point.shape[-1] == 3:
+        numerator += line[..., 2] * point[..., 2]
+    else:
+        numerator += line[..., 2]
+    numerator.abs_()
+
+    # The root and the divisions are taken on safe arguments (see _inf_where); a line with a = b = 0 is singular.
+    squared_norm = line[..., 0].square() + line[..., 1].square()
+    singular = squared_norm == 0
+    distance = numerator / _nonzero(squared_norm).sqrt()
+    if point.shape[-1] == 3:
+        # (x, y, w) is the Euclidean point (x / w, y / w), so its distance is |ax + by + cw| / (|w| |(a, b)|); the
+        # weight used to be ignored, which is right only for w = 1 (#4935). A point at infinity (w = 0) is singular
+        # as well.
+        w = point[..., 2].abs()
+        distance = distance / _nonzero(w)
+        singular = singular | (w == 0)
+    return _inf_where(distance, singular)
+
+
+def batched_dot_product(x: torch.Tensor, y: torch.Tensor, keepdim: bool = False) -> torch.Tensor:
+    """Compute the dot product along the last dimension of two broadcast tensors.
+
+    ``d = batched_dot_product(x, y)`` takes ``x`` and ``y`` of shape ``(*, N)``, whose shapes broadcast, and returns
+    ``(x * y).sum(-1)``: the dot product of each pair of last-dimension vectors, with that dimension removed, or kept
+    as size 1 with ``keepdim=True``. For the squared norm of one tensor, use :func:`batched_squared_norm`.
+
+    Args:
+        x: first vectors, with shape ``(*, N)``.
+        y: second vectors, with shape ``(*, N)``.
+        keepdim: whether to keep the reduced dimension as size 1.
+
+    Returns:
+        the dot products, with shape ``(*)``, or ``(*, 1)`` with ``keepdim=True``.
+
+    See Also:
+        - :func:`batched_squared_norm`: the dot product of a tensor with itself.
+        - :func:`euclidean_distance`: the root of the summed squared differences of two point sets.
+
+    """
+    KORNIA_CHECK_SHAPE(x, ["*", "N"])
+    KORNIA_CHECK_SHAPE(y, ["*", "N"])
+    return (x * y).sum(-1, keepdim)
+
+
+def batched_squared_norm(x: torch.Tensor, keepdim: bool = False) -> torch.Tensor:
+    """Compute the squared Euclidean norm along the last dimension of a tensor.
+
+    ``n2 = batched_squared_norm(x)`` takes ``(*, N)`` vectors and returns the sum of their squares over the last
+    dimension, ``batched_dot_product(x, x)``, with that dimension removed, or kept as size 1 with ``keepdim=True``.
+    ``squared_norm`` is the same function under another name. For the root, the norm of ``x - y``, use
+    :func:`euclidean_distance`.
+
+    Args:
+        x: vectors with shape ``(*, N)``.
+        keepdim: whether to keep the reduced dimension as size 1.
+
+    Returns:
+        the squared norms, with shape ``(*)``, or ``(*, 1)`` with ``keepdim=True``.
+
+    See Also:
+        - :func:`batched_dot_product`: the dot product of two tensors.
+        - :func:`euclidean_distance`: the unsquared norm of the difference of two point sets.
+
+    """
+    return batched_dot_product(x, x, keepdim)
+
+
+def euclidean_distance(x: torch.Tensor, y: torch.Tensor, keepdim: bool = False, eps: float = 1e-6) -> torch.Tensor:
+    """Compute the Euclidean distance between paired points along the last dimension.
+
+    ``d = euclidean_distance(x, y)`` takes points ``x`` and ``y`` of shape ``(*, N)`` and returns the distance between
+    each pair, with the last dimension removed, or kept as size 1 with ``keepdim=True``. The points are paired, not
+    compared all against all: the leading dimensions broadcast, so pass ``x[:, None]`` and ``y[None]`` for an
+    ``(M, K)`` distance matrix, or use :func:`torch.cdist`. Coincident points give exactly ``0`` with a zero gradient.
+
+    More: https://en.wikipedia.org/wiki/Euclidean_distance
+
+    Args:
+        x: first set of points of shape ``(*, N)``.
+        y: second set of points of shape ``(*, N)``.
+        keepdim: whether to keep the dimension after reduction.
+        eps: unused; kept for backward compatibility. The result is the exact Euclidean distance.
+
+    Returns:
+        the distances, with shape ``(*)``, or ``(*, 1)`` with ``keepdim=True``.
+
+    See Also:
+        - :func:`batched_squared_norm`: the squared norm, e.g. of ``x - y`` for squared distances without the root.
+        - :func:`batched_dot_product`: the dot product along the last dimension.
+        - :func:`point_line_distance`: the distance from 2D points to lines.
+
+    """
+    KORNIA_CHECK_SHAPE(x, ["*", "N"])
+    KORNIA_CHECK_SHAPE(y, ["*", "N"])
+
+    d2 = (x - y).pow(2).sum(dim=-1, keepdim=keepdim)
+    # Guard the singular point by substituting a safe argument into the square root and taking the
+    # value from the other arm of the ``torch.where``, so coincident points return exactly ``0``
+    # with a finite (zero) gradient instead of the ``sqrt(eps)`` floor the previous form added.
+    positive = d2 > 0
+    safe_d2 = torch.where(positive, d2, torch.ones_like(d2))
+    return torch.where(positive, safe_d2.sqrt(), torch.zeros_like(d2))
+
+
+# aliases
+squared_norm = batched_squared_norm
+
+# TODO:
+# - project_points: from opencv

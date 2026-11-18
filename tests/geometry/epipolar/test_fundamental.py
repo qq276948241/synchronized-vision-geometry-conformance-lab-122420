@@ -1,0 +1,1640 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from typing import Dict, Tuple
+
+import pytest
+import torch
+
+import kornia.geometry.epipolar as epi
+import kornia.geometry.epipolar.fundamental as fundamental_module
+from kornia.core.exceptions import ShapeError
+from kornia.core.utils import _torch_svd_cast
+from kornia.geometry.conversions import axis_angle_to_rotation_matrix, convert_points_to_homogeneous
+from kornia.geometry.epipolar.fundamental import (
+    _eight_point_fundamental,
+    _enforce_rank2,
+    _epipolar_design_rows,
+    _rank2_projection,
+    _refine_fundamental_lm,
+    _seven_point_candidates,
+)
+from kornia.geometry.solvers.homogeneous import _null_space_lu
+
+from testing.base import DYNAMO_UNAVAILABLE_REASON, BaseTester, dynamo_is_available, script_uncached
+from testing.geometry.create import create_random_fundamental_matrix, generate_two_view_random_scene
+from testing.two_view import (
+    ONE_ROUNDING_EPS,
+    affine_two_view_scene,
+    max_relative_error,
+    pixel_two_view_batch,
+    two_view_scene,
+)
+
+_NO_HALF_EIGH = "find_fundamental calls torch.linalg.eigh, which has no float16/bfloat16 kernel"
+_HALF_PIXELS = "half precision rounds the fixture's pixel coordinates, 120 to 440, to steps of 0.125 to 0.25"
+_HALF_PIXEL_F = (
+    "a pixel-unit F spans eight decades (entries down to ~1e-8): float16 flushes the small entries to zero and "
+    "bfloat16's 8-bit mantissa cannot resolve the epipolar residual, which kornia evaluates in the input dtype"
+)
+
+
+class TestNormalizePoints(BaseTester):
+    def test_zero_weight_outlier_does_not_change_transform(self, device, dtype):
+        points = torch.tensor(
+            [[[0.0, 0.0], [0.0, 2.0], [2.0, 0.0], [2.0, 2.0], [100.0, -100.0]]],
+            device=device,
+            dtype=dtype,
+        )
+        weights = torch.tensor([[1.0, 1.0, 1.0, 1.0, 0.0]], device=device, dtype=dtype)
+        normalized, transform = epi.normalize_points(points, weights=weights)
+        expected_normalized, expected_transform = epi.normalize_points(points[:, :-1])
+        self.assert_close(normalized[:, :-1], expected_normalized)
+        self.assert_close(transform, expected_transform)
+
+    def test_all_zero_weights_keep_transform_finite(self, device, dtype):
+        points = torch.tensor([[[0.0, 0.0], [0.0, 2.0], [2.0, 0.0], [2.0, 2.0]]], device=device, dtype=dtype)
+        normalized, transform = epi.normalize_points(points, weights=torch.zeros(1, 4, device=device, dtype=dtype))
+        expected_normalized, expected_transform = epi.normalize_points(points)
+        self.assert_close(normalized, expected_normalized)
+        self.assert_close(transform, expected_transform)
+
+    def test_gradcheck_weighted(self, device):
+        points = torch.rand(2, 6, 2, device=device, dtype=torch.float64, requires_grad=True)
+        weights = (torch.rand(2, 6, device=device, dtype=torch.float64) + 0.2).requires_grad_()
+        self.gradcheck(lambda p, w: epi.normalize_points(p, weights=w), (points, weights))
+
+    def test_smoke(self, device, dtype):
+        points = torch.rand(1, 1, 2, device=device, dtype=dtype)
+        output = epi.normalize_points(points)
+        assert len(output) == 2
+        assert output[0].shape == (1, 1, 2)
+        assert output[1].shape == (1, 3, 3)
+
+    @pytest.mark.parametrize("batch_size, num_points", [(1, 2), (2, 3), (3, 2)])
+    def test_shape(self, batch_size, num_points, device, dtype):
+        B, N = batch_size, num_points
+        points = torch.rand(B, N, 2, device=device, dtype=dtype)
+        output = epi.normalize_points(points)
+        assert output[0].shape == (B, N, 2)
+        assert output[1].shape == (B, 3, 3)
+
+    def test_mean_std(self, device, dtype):
+        points = torch.tensor([[[0.0, 0.0], [0.0, 2.0], [1.0, 1.0], [1.0, 3.0]]], device=device, dtype=dtype)
+
+        points_norm, _ = epi.normalize_points(points)
+        points_std, points_mean = torch.std_mean(points_norm, dim=1)
+
+        self.assert_close(points_mean, torch.zeros_like(points_mean))
+        assert (points_std < 2.0).all()
+
+    def test_gradcheck(self, device):
+        points = torch.rand(2, 3, 2, device=device, requires_grad=True, dtype=torch.float64)
+        self.gradcheck(epi.normalize_points, (points,))
+
+    @pytest.mark.parametrize("shape", [(5, 2), (1, 5, 3)])
+    def test_wrong_points_shape_raises_6454(self, shape, device, dtype):
+        # Points without the batch dimension or with three coordinates raised a bare AssertionError.
+        points = torch.rand(*shape, device=device, dtype=dtype)
+        with pytest.raises(ShapeError, match=r"points must have shape \(B, N, 2\), got \["):
+            epi.normalize_points(points)
+
+    def test_wrong_weights_shape_raises_6454(self, device, dtype):
+        points = torch.rand(1, 5, 2, device=device, dtype=dtype)
+        weights = torch.rand(1, 4, device=device, dtype=dtype)
+        with pytest.raises(ShapeError, match=r"weights must have shape \(B, N\) = \[1, 5\], got \[1, 4\]\."):
+            epi.normalize_points(points, weights=weights)
+
+
+class TestNormalizeTransformation(BaseTester):
+    def test_smoke(self, device, dtype):
+        trans = torch.rand(2, 2, device=device, dtype=dtype)
+        trans_norm = epi.normalize_transformation(trans)
+        assert trans_norm.shape == (2, 2)
+
+    @pytest.mark.parametrize("batch_size, rows, cols", [(1, 2, 2), (2, 3, 3), (3, 4, 4), (2, 1, 2)])
+    def test_shape(self, batch_size, rows, cols, device, dtype):
+        B, N, M = batch_size, rows, cols
+        trans = torch.rand(B, N, M, device=device, dtype=dtype)
+        trans_norm = epi.normalize_transformation(trans)
+        assert trans_norm.shape == (B, N, M)
+
+    def test_check_last_val(self, device, dtype):
+        trans = torch.tensor([[[0.0, 0.0, 1.0], [0.0, 2.0, 0.0], [0.5, 0.0, 0.5]]], device=device, dtype=dtype)
+
+        trans_expected = torch.tensor([[[0.0, 0.0, 2.0], [0.0, 4.0, 0.0], [1.0, 0.0, 1.0]]], device=device, dtype=dtype)
+
+        trans_norm = epi.normalize_transformation(trans)
+        self.assert_close(trans_norm, trans_expected, atol=1e-4, rtol=1e-4)
+
+    def test_check_corner_case(self, device, dtype):
+        trans = torch.tensor([[[0.0, 0.0, 1.0], [0.0, 2.0, 0.0], [0.5, 0.0, 0.0]]], device=device, dtype=dtype)
+
+        trans_expected = trans.clone()
+
+        trans_norm = epi.normalize_transformation(trans)
+        self.assert_close(trans_norm, trans_expected, atol=1e-4, rtol=1e-4)
+
+    def test_gradcheck(self, device):
+        trans = torch.rand(2, 3, 3, device=device, requires_grad=True, dtype=torch.float64)
+        self.gradcheck(epi.normalize_transformation, (trans,))
+
+    def test_vector_raises_6454(self, device, dtype):
+        # A tensor with fewer than two dimensions raised a bare AssertionError.
+        with pytest.raises(ShapeError, match=r"M must have shape \(\*, m, n\), got \[3\]\."):
+            epi.normalize_transformation(torch.rand(3, device=device, dtype=dtype))
+
+
+class TestFindFundamental(BaseTester):
+    def test_smoke(self, device, dtype):
+        points1 = torch.rand(1, 8, 2, device=device, dtype=dtype)
+        points2 = torch.rand(1, 8, 2, device=device, dtype=dtype)
+        weights = torch.ones(1, 8, device=device, dtype=dtype)
+        F_mat = epi.find_fundamental(points1, points2, weights)
+        assert F_mat.shape == (1, 3, 3)
+
+    @pytest.mark.parametrize("batch_size, num_points", [(1, 8), (2, 9), (3, 10)])
+    def test_shape(self, batch_size, num_points, device, dtype):
+        B, N = batch_size, num_points
+        points1 = torch.rand(B, N, 2, device=device, dtype=dtype)
+        points2 = torch.rand(B, N, 2, device=device, dtype=dtype)
+        weights = torch.ones(B, N, device=device, dtype=dtype)
+        F_mat = epi.find_fundamental(points1, points2, weights)
+        assert F_mat.shape == (B, 3, 3)
+
+    @pytest.mark.parametrize("batch_size, num_points", [(1, 8), (2, 8), (3, 10)])
+    def test_shape_noweights(self, batch_size, num_points, device, dtype):
+        B, N = batch_size, num_points
+        points1 = torch.rand(B, N, 2, device=device, dtype=dtype)
+        points2 = torch.rand(B, N, 2, device=device, dtype=dtype)
+        weights = None
+        F_mat = epi.find_fundamental(points1, points2, weights)
+        assert F_mat.shape == (B, 3, 3)
+
+    @pytest.mark.parametrize("batch_size", [1, 2, 3])
+    def test_shape_7point(self, batch_size, device, dtype):
+        B = batch_size
+        points1 = torch.rand(B, 7, 2, device=device, dtype=dtype)
+        points2 = torch.rand(B, 7, 2, device=device, dtype=dtype)
+        torch.ones(B, 7, device=device, dtype=dtype)
+        F_mat = epi.find_fundamental(points1, points2, method="7POINT")
+        assert F_mat.shape == (B, 3, 3, 3)
+
+    def test_opencv_svd(self, device, dtype):
+        points1 = torch.tensor(
+            [
+                [
+                    [0.8569, 0.5982],
+                    [0.0059, 0.9649],
+                    [0.1968, 0.8846],
+                    [0.6084, 0.3467],
+                    [0.9633, 0.5274],
+                    [0.8941, 0.8939],
+                    [0.0863, 0.5133],
+                    [0.2645, 0.8882],
+                    [0.2411, 0.3045],
+                    [0.8199, 0.4107],
+                ]
+            ],
+            device=device,
+            dtype=dtype,
+        )
+
+        points2 = torch.tensor(
+            [
+                [
+                    [0.0928, 0.3013],
+                    [0.0989, 0.9649],
+                    [0.0341, 0.4827],
+                    [0.8294, 0.4469],
+                    [0.2230, 0.2998],
+                    [0.1722, 0.8182],
+                    [0.5264, 0.8869],
+                    [0.8908, 0.1233],
+                    [0.2338, 0.7663],
+                    [0.4466, 0.5696],
+                ]
+            ],
+            device=device,
+            dtype=dtype,
+        )
+
+        weights = torch.ones(1, 10, device=device, dtype=dtype)
+
+        # generated with OpenCV using above points
+        # import cv2
+        # Fm_expected, _ = cv2.findFundamentalMat(
+        #   points1.detach().numpy().reshape(-1, 1, 2),
+        #   points2.detach().numpy().reshape(-1, 1, 2), cv2.FM_8POINT)
+
+        Fm_expected = torch.tensor(
+            [
+                [
+                    [-0.47408533, 0.22033807, -0.00346677],
+                    [0.54935973, 1.31080955, -1.25028275],
+                    [-0.36690215, -1.08143769, 1.0],
+                ]
+            ],
+            device=device,
+            dtype=dtype,
+        )
+
+        F_mat = epi.find_fundamental(points1, points2, weights)
+        rtol = atol = 1e-4
+        if dtype in (torch.float16, torch.bfloat16):
+            # The four-decimal points round to the dtype, which moves F by about one unit in the last place of its
+            # largest entry (the float64 fit of the rounded points does the same), and the small entries by as much.
+            rtol, atol = torch.finfo(dtype).eps, 2 * torch.finfo(dtype).eps * Fm_expected.abs().max().item()
+        self.assert_close(F_mat, Fm_expected, rtol=rtol, atol=atol)
+
+    def test_7point_opencv(self, device, dtype):
+        points1 = torch.tensor(
+            [
+                [
+                    [0.8569, 0.5982],
+                    [0.0059, 0.9649],
+                    [0.1968, 0.8846],
+                    [0.6084, 0.3467],
+                    [0.9633, 0.5274],
+                    [0.8941, 0.8939],
+                    [0.0863, 0.5133],
+                ]
+            ],
+            device=device,
+            dtype=dtype,
+        )
+
+        points2 = torch.tensor(
+            [
+                [
+                    [0.0928, 0.3013],
+                    [0.0989, 0.9649],
+                    [0.0341, 0.4827],
+                    [0.8294, 0.4469],
+                    [0.2230, 0.2998],
+                    [0.1722, 0.8182],
+                    [0.5264, 0.8869],
+                ]
+            ],
+            device=device,
+            dtype=dtype,
+        )
+
+        # generated with OpenCV using above points
+        # Fm_expected shape is 9x3
+        # import cv2
+        # Fm_expected, _ = cv2.findFundamentalMat(
+        #   points1.detach().numpy().reshape(-1, 1, 2),
+        #   points2.detach().numpy().reshape(-1, 1, 2), cv2.FM_7POINT)
+
+        Fm_expected = torch.tensor(
+            [
+                [
+                    [
+                        [-2.87490907, 5.41934672, 0.73871396],
+                        [0.34010174, 3.70371623, -4.65517276],
+                        [-0.1809933, -0.56577107, 1.0],
+                    ],
+                    [
+                        [0.14465888, 0.68711702, -0.65570944],
+                        [0.53424758, 0.7988479, -0.75446946],
+                        [-0.48201197, -1.05375511, 1.0],
+                    ],
+                    [
+                        [-0.0901827, 1.05515785, -0.54726062],
+                        [0.51914823, 1.02476892, -1.05783979],
+                        [-0.45860077, -1.01580301, 1.0],
+                    ],
+                ]
+            ],
+            device=device,
+            dtype=dtype,
+        )
+        # We need this voodoo, because the order of the solutions is not guaranteed by the algorithm.
+        F_mat = epi.find_fundamental(points1, points2, method="7POINT")
+        ordering = []
+        for expected in Fm_expected[0]:
+            min_diff = float("inf")
+            for i, estimated in enumerate(F_mat[0]):
+                diff = (expected - estimated).abs().sum()
+                if diff < min_diff:
+                    min_diff = diff
+                    min_index = i
+            ordering.append(min_index)
+        F_mat[0] = F_mat[0][ordering]
+        rtol = atol = 1e-3
+        if dtype in (torch.float16, torch.bfloat16):
+            # The points round to the dtype, and the roots of the seven-point cubic carry that rounding into each
+            # candidate: up to 3 units in the last place of the largest entry, as for the float64 fit of the rounded
+            # points.
+            rtol, atol = torch.finfo(dtype).eps, 4 * torch.finfo(dtype).eps * Fm_expected.abs().max().item()
+        self.assert_close(F_mat, Fm_expected, rtol=rtol, atol=atol)
+
+    def test_synthetic_sampson_7point(self, device, dtype):
+        scene: Dict[str, torch.Tensor] = generate_two_view_random_scene(device, dtype)
+        x1 = scene["x1"][:, :7, :]
+        x2 = scene["x2"][:, :7, :]
+        F_est = epi.find_fundamental(x1, x2, None, "7POINT")
+        for i in range(3):
+            F = F_est[0][i].unsqueeze(0)
+            if torch.all(F != 0):
+                error = epi.sampson_epipolar_distance(x1, x2, F)
+                self.assert_close(error, torch.zeros((F.shape[0], 7), device=device, dtype=dtype), atol=1e-4, rtol=1e-4)
+
+    def test_epipolar_constraint_7point(self, device, dtype):
+        scene: Dict[str, torch.Tensor] = generate_two_view_random_scene(device, dtype)
+        x1 = scene["x1"][:, :7, :]
+        x2 = scene["x2"][:, :7, :]
+        F_est = epi.find_fundamental(x1, x2, None, "7POINT")
+        for i in range(3):
+            F = F_est[0][i].unsqueeze(0)
+            if torch.all(F != 0):
+                distance = epi.symmetrical_epipolar_distance(x1, x2, F)
+                mean_error = distance.mean()
+                self.assert_close(mean_error, torch.tensor(0.0, device=device, dtype=dtype), atol=1e-4, rtol=1e-4)
+
+    def test_synthetic_sampson(self, device, dtype):
+        scene: Dict[str, torch.Tensor] = generate_two_view_random_scene(device, dtype)
+
+        x1 = scene["x1"]
+        x2 = scene["x2"]
+
+        weights = torch.ones_like(x1)[..., 0]
+        F_est = epi.find_fundamental(x1, x2, weights)
+
+        error = epi.sampson_epipolar_distance(x1, x2, F_est)
+        self.assert_close(error, torch.zeros((x1.shape[:2]), device=device, dtype=dtype), atol=1e-4, rtol=1e-4)
+
+    def test_gradcheck(self, device):
+        points1 = torch.rand(1, 10, 2, device=device, dtype=torch.float64, requires_grad=True)
+        points2 = torch.rand(1, 10, 2, device=device, dtype=torch.float64)
+        weights = torch.ones(1, 10, device=device, dtype=torch.float64)
+        self.gradcheck(epi.find_fundamental, (points1, points2, weights))
+
+    @pytest.mark.applies_to(dtypes=("float32", "float64"), reason=_NO_HALF_EIGH)
+    def test_zero_weight_backward_is_the_one_sided_derivative(self, device, dtype):
+        """The gradient of a weight of exactly 0 is finite and is the derivative from above (#4912).
+
+        A zero weight is the documented way to drop a correspondence. ``run_8point`` used to row-scale by
+        ``w.sqrt()``, whose derivative is unbounded at 0: the gradient was NaN on torch 2.5.1 and 2.9.1, and 0 on
+        2.14, where ``clamp_min(0)`` masks it at the bound. Both differ from the derivative at a tiny positive weight.
+        """
+        two_view = two_view_scene(device, dtype)
+        x1 = two_view["x1"]
+        x2 = two_view["x2"] + torch.tensor([_NOISE], device=device, dtype=dtype)
+        grads = []
+        for w3 in (0.0, 1e-6):
+            weights = torch.ones(1, x1.shape[1], device=device, dtype=dtype)
+            weights[0, 3] = w3
+            weights.requires_grad_()
+            F_mat = epi.find_fundamental(x1, x2, weights)
+            (F_mat * F_mat.detach().sign()).sum().backward()
+            grads.append(weights.grad)
+        assert torch.isfinite(grads[0]).all()
+        tol = {"rtol": 1e-3, "atol": 1e-5} if dtype == torch.float64 else {"rtol": 5e-2, "atol": 1e-4}  # f32 eigh: CPU
+        assert grads[1][0, 3].abs() > 1e-3  # control: the dropped match moves F, so a zero gradient would be wrong
+        self.assert_close(grads[0], grads[1], **tol)
+
+    def test_run_8point_wrong_sizes_raise_6454(self, device, dtype):
+        # Fewer than 8 points, or weights of another shape, raised a bare AssertionError.
+        points = torch.rand(1, 7, 2, device=device, dtype=dtype)
+        with pytest.raises(ShapeError, match=r"points1 and points2 must have shape \(B, N, 2\) with N >= 8, got"):
+            fundamental_module.run_8point(points, points)
+        points = torch.rand(1, 8, 2, device=device, dtype=dtype)
+        for weights_shape in [(1, 9), (3, 8)]:
+            weights = torch.rand(*weights_shape, device=device, dtype=dtype)
+            with pytest.raises(ShapeError, match=r"weights must have shape \(B, N\) = \[1, 8\], got \["):
+                fundamental_module.run_8point(points, points, weights)
+
+
+class TestFindFundamentalAffine(BaseTester):
+    """``method="AFFINE"``: the affine fundamental matrix, Hartley and Zisserman's algorithm 14.1."""
+
+    @staticmethod
+    def _tol(dtype: torch.dtype) -> Dict[str, float]:
+        return {"rtol": 1e-7, "atol": 1e-9} if dtype == torch.float64 else {"rtol": 5e-5, "atol": 1e-7}
+
+    @staticmethod
+    def _noisy(scene: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        return scene["x1"] + scene["noise"][..., :2], scene["x2"] + scene["noise"][..., 2:]
+
+    @pytest.mark.applies_to(dtypes=("float32", "float64"), reason=_HALF_PIXELS)
+    def test_exact_correspondences_give_the_cameras_matrix(self, device, dtype):
+        scene = affine_two_view_scene(device, dtype)
+        F = epi.find_fundamental(scene["x1"], scene["x2"], method="AFFINE")
+        assert F.shape == (1, 3, 3)
+        assert F.dtype == dtype
+        assert not F[:, :2, :2].any()
+        self.assert_close(F, scene["F"], **self._tol(dtype))
+
+    @pytest.mark.applies_to(dtypes=("float32", "float64"), reason=_HALF_PIXELS)
+    def test_four_correspondences_determine_it(self, device, dtype):
+        scene = affine_two_view_scene(device, dtype)
+        F = epi.find_fundamental(scene["x1"][:, :4], scene["x2"][:, :4], method="affine")
+        self.assert_close(F, scene["F"], **self._tol(dtype))
+
+    @pytest.mark.applies_to(dtypes=("float32", "float64"), reason=_HALF_PIXELS)
+    def test_noisy_correspondences_give_the_gold_standard(self, device, dtype):
+        scene = affine_two_view_scene(device, dtype)
+        x1, x2 = self._noisy(scene)
+        F = epi.find_fundamental(x1, x2, method="AFFINE")
+        self.assert_close(F, scene["F_gold"], **self._tol(dtype))
+        # Control: the noise moves the minimizer away from the cameras' matrix by more than the tolerance.
+        assert (scene["F_gold"] - scene["F"]).abs().max() > 1e-5
+
+    @pytest.mark.applies_to(dtypes=("float32", "float64"), reason=_HALF_PIXELS)
+    def test_swapping_the_images_transposes_it(self, device, dtype):
+        x1, x2 = self._noisy(affine_two_view_scene(device, dtype))
+        F = epi.find_fundamental(x1, x2, method="AFFINE")
+        self.assert_close(epi.find_fundamental(x2, x1, method="AFFINE"), F.transpose(-2, -1), **self._tol(dtype))
+
+    @pytest.mark.applies_to(dtypes=("float32", "float64"), reason=_HALF_PIXELS)
+    def test_weights_semantics(self, device, dtype):
+        x1, x2 = self._noisy(affine_two_view_scene(device, dtype))
+        x2[0, 5] += torch.tensor([40.0, -25.0], device=device, dtype=dtype)
+        keep = torch.arange(12, device=device) != 5
+        w = torch.tensor([[0.5, 1.0, 2.0, 1.5, 0.75, 0.0, 3.0, 0.25, 1.0, 2.5, 0.6, 1.8]], device=device, dtype=dtype)
+        F_w = epi.find_fundamental(x1, x2, w, method="AFFINE")
+        # A weight of 0 drops the gross mismatch: the fit is the weighted fit of the other eleven.
+        self.assert_close(F_w, epi.find_fundamental(x1[:, keep], x2[:, keep], w[:, keep], method="AFFINE"))
+        # Only the ratios of the weights matter.
+        self.assert_close(epi.find_fundamental(x1, x2, 7.0 * w, method="AFFINE"), F_w, **self._tol(dtype))
+        # A negative weight counts as zero, to the bit.
+        w_neg = w.clone()
+        w_neg[0, 5] = -5.0
+        assert torch.equal(epi.find_fundamental(x1, x2, w_neg, method="AFFINE"), F_w)
+        # Control: equal weights keep the mismatch and give another matrix.
+        assert (epi.find_fundamental(x1, x2, method="AFFINE") - F_w).abs().max() > 1e-4
+
+    @pytest.mark.applies_to(dtypes=("float16", "bfloat16"), reason="a half-precision input check")
+    def test_half_precision_points_fit_in_float32(self, device, dtype):
+        scene = affine_two_view_scene(device, dtype)
+        # Squared pixel coordinates in the hundreds overflow float16, so the fit runs in float32.
+        F = epi.find_fundamental(scene["x1"], scene["x2"], method="AFFINE")
+        assert F.dtype == dtype
+        assert torch.isfinite(F).all()
+        expected = epi.find_fundamental(scene["x1"].float(), scene["x2"].float(), method="AFFINE").to(dtype)
+        assert torch.equal(F, expected)
+
+    @pytest.mark.applies_to(devices=("cpu", "cuda"), reason="MPS has no float64; the fit runs in float32 there")
+    def test_float32_points_fit_in_float64(self, device):
+        x1, x2 = self._noisy(affine_two_view_scene(device, torch.float64))
+        # Far from the origin, as in a large image: the float32 points round to 2e-3 px, and a float32 scatter matrix
+        # of their centred coordinates would move F by more than that.
+        x1, x2 = (x1 + 15000.0).float(), (x2 + 15000.0).float()
+        F = epi.find_fundamental(x1, x2, method="AFFINE")
+        assert F.dtype == torch.float32
+        expected = epi.find_fundamental(x1.double(), x2.double(), method="AFFINE").float()
+        self.assert_close(F, expected, rtol=1e-6, atol=0.0)
+
+    @staticmethod
+    def _cube_seen_from_front_and_side(device: torch.device, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
+        # A 3 x 3 x 3 grid with spacing 100 seen by two orthographic cameras 90 degrees apart: x1 = (X, Y) and
+        # x2 = (Z, Y + 10). The stacked correspondences (Z, Y + 10, X, Y) have scatter eigenvalues 0, v, v and 2v:
+        # F = [[0, 0, 0], [0, 0, -0.1], [0, 0.1, 1]] is well defined, its eigenvalue 0 being simple, but eigh's
+        # backward divides by the gap between the two equal ones.
+        grid = torch.arange(3, device=device, dtype=dtype) * 100.0
+        X = torch.cartesian_prod(grid, grid, grid)
+        return X[None, :, :2], torch.stack([X[:, 2], X[:, 1] + 10.0], dim=-1)[None]
+
+    @pytest.mark.applies_to(dtypes=("float32", "float64"), reason=_HALF_PIXELS)
+    def test_gradient_is_finite_when_two_other_eigenvalues_are_equal(self, device, dtype):
+        x1, x2 = self._cube_seen_from_front_and_side(device, dtype)
+        weights = torch.ones(1, 27, device=device, dtype=dtype, requires_grad=True)
+        x1.requires_grad_()
+        x2.requires_grad_()
+        F = epi.find_fundamental(x1, x2, weights, method="AFFINE")
+        expected = torch.tensor([[[0.0, 0.0, 0.0], [0.0, 0.0, -0.1], [0.0, 0.1, 1.0]]], device=device, dtype=dtype)
+        self.assert_close(F, expected, **self._tol(dtype))
+        (F * torch.arange(9, device=device, dtype=dtype).view(3, 3)).sum().backward()
+        for grad in (x1.grad, x2.grad, weights.grad):
+            assert torch.isfinite(grad).all()
+
+    def test_gradcheck_when_two_other_eigenvalues_are_equal(self, device):
+        x1, x2 = self._cube_seen_from_front_and_side(device, torch.float64)
+        weights = torch.ones(1, 27, device=device, dtype=torch.float64)
+
+        def fit(p1: torch.Tensor, p2: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+            return epi.find_fundamental(p1, p2, w, method="AFFINE")
+
+        self.gradcheck(fit, (x1.requires_grad_(), x2.requires_grad_(), weights.requires_grad_()))
+
+    def test_float16_result_is_finite_for_centred_points(self, device):
+        # Points centred on the origin and scaled to unit size, as normalize_points leaves them, put the epipolar plane
+        # near the origin: e is near 0, and scaling F to F[2, 2] = 1 put the other entries above float16's 65504.
+        # Fifty points seen by the fixture's two affine cameras, with 0.3 px noise.
+        generator = torch.Generator().manual_seed(4)
+        X = torch.rand(50, 3, generator=generator) * 200.0 - 100.0
+        M1 = torch.tensor([[1.2, 0.1, -0.3], [0.05, -1.1, 0.4]])
+        M2 = torch.tensor([[0.9, 0.5, 0.2], [-0.3, -0.8, 0.7]])
+        points1 = (X @ M1.T)[None] + 0.3 * torch.randn(1, 50, 2, generator=generator)
+        points2 = (X @ M2.T)[None] + 0.3 * torch.randn(1, 50, 2, generator=generator)
+        points1, points2 = ((x - x.mean(1, keepdim=True)) for x in (points1, points2))
+        points1, points2 = (x / x.abs().max() for x in (points1, points2))
+        points1, points2 = points1.half().to(device), points2.half().to(device)
+        F = epi.find_fundamental(points1, points2, method="AFFINE")
+        assert F.dtype == torch.float16
+        assert torch.isfinite(F).all()
+        # The same matrix up to scale: the largest entry is 1 instead of F[2, 2].
+        expected = epi.find_fundamental(points1.float(), points2.float(), method="AFFINE")
+        self.assert_close(F.float(), expected / expected.abs().amax(), rtol=0.0, atol=1e-3)
+        assert F.abs().amax() == 1.0
+
+    @pytest.mark.parametrize("image", [1, 2])
+    def test_points_of_one_image_on_a_line_give_that_line(self, device, dtype, image):
+        # Every four of the fixture's twelve correspondences, with one image's points moved onto the line y = 50. The
+        # stacked correspondences then vary along neither that y nor, for some samples, a second direction whose
+        # scatter eigenvalue is below 1e-7 of the largest. A float32 eigh of the scatter matrix (a half input's, or a
+        # float32 input's on MPS) mixed the two; the singular vectors of the centred correspondences keep them apart.
+        scene = affine_two_view_scene(device, dtype)
+        x1, x2 = scene["x1"][0], scene["x2"][0]
+        (x1 if image == 1 else x2)[:, 1] = 50.0
+        samples = torch.combinations(torch.arange(12, device=device), 4)
+        F = epi.find_fundamental(x1[samples], x2[samples], method="AFFINE")
+        expected = torch.zeros(3, 3, device=device, dtype=dtype)
+        expected[(2, 1) if image == 1 else (1, 2)] = -0.02
+        expected[2, 2] = 1.0
+        self.assert_close(F, expected.expand_as(F), rtol=0.0, atol=1e-4)
+
+    @pytest.mark.applies_to(dtypes=("float32", "float64"), reason=_HALF_PIXELS)
+    def test_nonfinite_batch_element_gives_nan(self, device, dtype):
+        x1, x2 = self._noisy(affine_two_view_scene(device, dtype))
+        x1, x2 = x1.repeat(3, 1, 1), x2.repeat(3, 1, 1)
+        x1[1, 4] = float("nan")
+        x2[2, 7, 0] = float("inf")
+        x1.requires_grad_()
+        F = epi.find_fundamental(x1, x2, method="AFFINE")
+        # The finite element keeps its matrix and the others are NaN, rather than the whole batch raising.
+        self.assert_close(F[0], epi.find_fundamental(x1[:1].detach(), x2[:1], method="AFFINE")[0])
+        assert torch.isnan(F[1:]).all()
+        F[0].sum().backward()
+        assert torch.isfinite(x1.grad).all()
+
+    def test_too_few_correspondences_raise(self, device, dtype):
+        points = torch.rand(1, 3, 2, device=device, dtype=dtype)
+        with pytest.raises(ShapeError, match=r"points1 and points2 must have shape \(B, N, 2\) with N >= 4, got"):
+            epi.find_fundamental(points, points, method="AFFINE")
+        points = torch.rand(1, 4, 2, device=device, dtype=dtype)
+        with pytest.raises(ShapeError, match=r"weights must have shape \(B, N\) = \[1, 4\], got \["):
+            epi.find_fundamental(points, points, torch.ones(1, 5, device=device, dtype=dtype), method="AFFINE")
+
+    def test_gradcheck(self, device):
+        x1, x2 = self._noisy(affine_two_view_scene(device, torch.float64))
+        weights = torch.ones(1, 12, device=device, dtype=torch.float64)
+
+        def fit(p1: torch.Tensor, p2: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+            return epi.find_fundamental(p1, p2, w, method="AFFINE")
+
+        self.gradcheck(fit, (x1.requires_grad_(), x2.requires_grad_(), weights.requires_grad_()))
+
+    @pytest.mark.applies_to(dtypes=("float32", "float64"), reason=_HALF_PIXELS)
+    def test_zero_weight_backward_is_the_one_sided_derivative(self, device, dtype):
+        x1, x2 = self._noisy(affine_two_view_scene(device, dtype))
+        grads = []
+        for w3 in (0.0, 1e-6):
+            weights = torch.ones(1, 12, device=device, dtype=dtype)
+            weights[0, 3] = w3
+            weights.requires_grad_()
+            F_mat = epi.find_fundamental(x1, x2, weights, method="AFFINE")
+            (F_mat * F_mat.detach().sign()).sum().backward()
+            grads.append(weights.grad)
+        assert torch.isfinite(grads[0]).all()
+        assert grads[1][0, 3].abs() > 1e-6  # control: the dropped match moves F
+        tol = {"rtol": 1e-3, "atol": 1e-8} if dtype == torch.float64 else {"rtol": 5e-2, "atol": 1e-6}
+        self.assert_close(grads[0], grads[1], **tol)
+
+
+class TestFundamentalAutocast(BaseTester):
+    @pytest.mark.applies_to(devices=("cpu", "cuda"), reason="CPU and CUDA autocast")
+    @pytest.mark.parametrize(
+        "method, num_points, weighted",
+        [("7POINT", 7, False), ("8POINT", 8, False), ("8POINT", 100, False), ("8POINT", 100, True)],
+    )
+    def test_autocast_does_not_reach_the_fit(self, device, method, num_points, weighted):
+        # A caller's bfloat16 autocast ran the 7- and 8-point matrix products in bfloat16: float32 points gave a
+        # bfloat16 fundamental matrix far from the float32 one, and CUDA's eigh, which has no bfloat16 kernel, raised.
+        generator = torch.Generator().manual_seed(0)
+        points1 = torch.rand(1, num_points, 2, generator=generator) * torch.tensor([640.0, 480.0])
+        points2 = points1 + torch.tensor([30.0, -5.0]) + 4.0 * torch.randn(1, num_points, 2, generator=generator)
+        weights = torch.rand(1, num_points, generator=generator).to(device) if weighted else None
+        points1, points2 = points1.to(device), points2.to(device)
+        expected = epi.find_fundamental(points1, points2, weights, method=method)
+        with torch.autocast(device.type, dtype=torch.bfloat16):
+            actual = epi.find_fundamental(points1, points2, weights, method=method)
+        assert actual.dtype == torch.float32
+        self.assert_close(actual, expected, atol=0, rtol=0)
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize("weights_dtype", [None, "points", torch.float32])
+    def test_half_precision_points_fit_in_and_out_of_autocast(self, dtype, weights_dtype):
+        # CPU autocast ran eigh in float32, so half-precision points fitted under it; no device has a half-precision
+        # eigh kernel, so the 8-point fit promotes its normal matrix itself. Autocast also cast float32 weights
+        # together with the points, and the fit now casts them itself.
+        generator = torch.Generator().manual_seed(0)
+        points1 = torch.rand(1, 100, 2, generator=generator) * torch.tensor([640.0, 480.0])
+        points2 = points1 + torch.tensor([30.0, -5.0]) + 4.0 * torch.randn(1, 100, 2, generator=generator)
+        weights = torch.rand(1, 100, generator=generator)
+        points1, points2 = points1.to(dtype), points2.to(dtype)
+        if weights_dtype is None:
+            weights = expected_weights = None
+        else:
+            expected_weights = weights.to(dtype)
+            weights = expected_weights if weights_dtype == "points" else weights.to(weights_dtype)
+        expected = epi.find_fundamental(points1, points2, expected_weights)
+        outside = epi.find_fundamental(points1, points2, weights)
+        with torch.autocast("cpu", dtype=dtype):
+            inside = epi.find_fundamental(points1, points2, weights)
+        assert expected.dtype == dtype
+        for actual in (outside, inside):
+            assert actual.dtype == dtype
+            self.assert_close(actual, expected, atol=0, rtol=0)
+
+    def test_meta_device_infers_the_shape(self):
+        # torch.autocast raises for the meta device type, so the solvers enter it only inside an autocast region.
+        points = torch.empty(2, 9, 2, device="meta")
+        assert epi.find_fundamental(points, points).shape == (2, 3, 3)
+        assert epi.find_fundamental(points[:, :7], points[:, :7], method="7POINT").shape == (2, 3, 3, 3)
+
+    @pytest.mark.skipif(not dynamo_is_available(), reason=DYNAMO_UNAVAILABLE_REASON)
+    def test_eager_backend_traces_the_meta_device(self):
+        # Compiled shape inference worked on main; the autocast guard must not break it.
+        torch._dynamo.reset()
+        points = torch.empty(2, 9, 2, device="meta")
+        assert torch.compile(epi.find_fundamental, backend="eager", fullgraph=True)(points, points).shape == (2, 3, 3)
+
+
+class TestComputeCorrespondEpilines(BaseTester):
+    def test_scripted_empty_after_nonempty_keeps_dtype(self, device, dtype):
+        # TorchScript's CUDA fuser used to compile ``cat([a * nu, b * nu, c * nu])`` into a group that, once it had
+        # specialized on non-empty calls, returned an int32 tensor for N = 0.
+        if device.type == "cuda" and dtype == torch.bfloat16:
+            pytest.skip("TorchScript's CUDA fuser fails to compile the bfloat16 group for a * a + b * b (NVRTC)")
+        scripted = script_uncached(epi.compute_correspond_epilines)
+        F_mat = torch.rand(2, 3, 3, device=device, dtype=dtype)
+        for num_points in (5, 5, 5, 0, 5, 0, 7, 0):
+            points = torch.rand(2, num_points, 2, device=device, dtype=dtype)
+            lines = scripted(points, F_mat)
+            assert lines.dtype == dtype
+            assert lines.shape == (2, num_points, 3)
+            self.assert_close(lines, epi.compute_correspond_epilines(points, F_mat))
+
+    def test_smoke(self, device, dtype):
+        point = torch.rand(1, 1, 2, device=device, dtype=dtype)
+        F_mat = torch.rand(1, 3, 3, device=device, dtype=dtype)
+        lines = epi.compute_correspond_epilines(point, F_mat)
+        assert lines.shape == (1, 1, 3)
+
+    @pytest.mark.parametrize("batch_size, num_points", [(1, 2), (2, 3), (3, 2)])
+    def test_shape(self, batch_size, num_points, device, dtype):
+        B, N = batch_size, num_points
+        point = torch.rand(B, N, 2, device=device, dtype=dtype)
+        F_mat = torch.rand(B, 3, 3, device=device, dtype=dtype)
+        lines = epi.compute_correspond_epilines(point, F_mat)
+        assert lines.shape == (B, N, 3)
+
+    @pytest.mark.parametrize(
+        "batch_size, num_frames, num_points",
+        [(1, 1, 1), (1, 1, 2), (1, 2, 1), (1, 2, 2), (2, 1, 1), (2, 1, 2), (2, 2, 1), (2, 2, 2)],
+    )
+    def test_volumetric(self, batch_size, num_frames, num_points, device, dtype):
+        B, T, N = batch_size, num_frames, num_points
+        point = torch.rand(B, T, N, 2, device=device, dtype=dtype)
+        F_mat = torch.rand(B, T, 3, 3, device=device, dtype=dtype)
+
+        lines_T_hops = torch.zeros(B, T, N, 3, device=device, dtype=dtype)
+        for i in range(T):
+            lines_T_hops[:, i, ...] = epi.compute_correspond_epilines(point[:, i, ...], F_mat[:, i, ...])
+        lines_one_hop = epi.compute_correspond_epilines(point, F_mat)
+
+        self.assert_close(lines_T_hops, lines_one_hop, atol=2e-7, rtol=2e-7)
+
+    def test_opencv(self, device, dtype):
+        point = torch.rand(1, 2, 2, device=device, dtype=dtype)
+        F_mat = torch.rand(1, 3, 3, device=device, dtype=dtype)
+
+        point = torch.tensor([[[0.9794, 0.7994], [0.8163, 0.8500]]], device=device, dtype=dtype)
+
+        F_mat = torch.tensor(
+            [[[0.1185, 0.4438, 0.9869], [0.5670, 0.9447, 0.4100], [0.1546, 0.2554, 0.4485]]], device=device, dtype=dtype
+        )
+
+        # generated with OpenCV using above points
+        # import cv2
+        # lines_expected = cv2.computeCorrespondEpilines(
+        #    point.detach().numpy().reshape(-1, 1, 2), 0,
+        #    F_mat.detach().numpy()[0]).transpose(1, 0, 2)
+
+        lines_expected = torch.tensor(
+            [[[0.64643687, 0.7629675, 0.35658622], [0.65710586, 0.7537983, 0.35616538]]], device=device, dtype=dtype
+        )
+
+        lines_est = epi.compute_correspond_epilines(point, F_mat)
+        # The lines are computed in float32 for a half dtype and rounded once: half a unit in the last place.
+        tol = torch.finfo(dtype).eps if dtype in (torch.float16, torch.bfloat16) else 1e-4
+        self.assert_close(lines_est, lines_expected, rtol=tol, atol=tol)
+
+    def test_gradcheck(self, device):
+        point = torch.rand(1, 4, 2, device=device, dtype=torch.float64, requires_grad=True)
+        F_mat = torch.rand(1, 3, 3, device=device, dtype=torch.float64)
+        self.gradcheck(epi.compute_correspond_epilines, (point, F_mat), requires_grad=(True, False))
+
+    @pytest.mark.parametrize("shape", [(1, 5, 4), (5, 1)])
+    def test_wrong_points_width_raises_6454(self, shape, device, dtype):
+        # A last dimension other than 2 or 3 raised a bare AssertionError, batched or not.
+        F_mat = torch.rand(1, 3, 3, device=device, dtype=dtype)
+        points = torch.rand(*shape, device=device, dtype=dtype)
+        with pytest.raises(ShapeError, match=r"points must have shape \(\*, N, 2\) or \(\*, N, 3\), got \["):
+            epi.compute_correspond_epilines(points, F_mat)
+        # get_closest_point_on_epipolar_line passes pts1 straight here.
+        pts2 = torch.rand(1, 5, 2, device=device, dtype=dtype)
+        with pytest.raises(ShapeError, match=r"points must have shape \(\*, N, 2\) or \(\*, N, 3\), got \["):
+            epi.get_closest_point_on_epipolar_line(points, pts2, F_mat)
+
+    @pytest.mark.applies_to(dtypes=("float16", "bfloat16"), reason="a half-precision accuracy check")
+    def test_half_precision_rounds_once(self, device, dtype):
+        # 256 scenes with F = K2^-T E K1^-1 and 100 points each in a 1280 x 720 image. Projecting and scaling in half
+        # precision leaves the lines off by 1.0 of their largest entry in float16 and by 1.5 eps in bfloat16, and
+        # rounding F x to the dtype before the scaling by 3.9 eps and 1.04 eps.
+        scene = pixel_two_view_batch(256, 100, seed=0)
+        points, F_mat = scene["x1"].to(dtype), scene["F"].to(dtype)
+        expected = epi.compute_correspond_epilines(points.double(), F_mat.double())
+        actual = epi.compute_correspond_epilines(points.to(device), F_mat.to(device))
+        assert actual.dtype == dtype
+        assert max_relative_error(actual, expected) <= ONE_ROUNDING_EPS * torch.finfo(dtype).eps
+
+    @pytest.mark.applies_to(devices=("cpu",), reason="CUDA has no integer matmul kernel, nor MPS on torch 2.5.1")
+    def test_integer_input_returns_float32(self, device):
+        # torch promotes the integer line to float32 for the scaling, and the scaled line is not cast back.
+        points = torch.tensor([[1, 1]], device=device)
+        F_mat = torch.tensor([[0, 0, 1], [0, 0, 1], [1, 1, -3]], device=device)
+        lines = epi.compute_correspond_epilines(points, F_mat)
+        assert lines.dtype == torch.float32
+        # F (1, 1, 1) = (1, 1, -1), scaled to a unit normal.
+        self.assert_close(lines, torch.tensor([[1.0, 1.0, -1.0]], device=device) / 2**0.5)
+
+
+class TestFundamentlFromEssential(BaseTester):
+    def test_smoke(self, device, dtype):
+        E_mat = torch.rand(1, 3, 3, device=device, dtype=dtype)
+        K1 = torch.rand(1, 3, 3, device=device, dtype=dtype)
+        K2 = torch.rand(1, 3, 3, device=device, dtype=dtype)
+        F_mat = epi.fundamental_from_essential(E_mat, K1, K2)
+        assert F_mat.shape == (1, 3, 3)
+
+    @pytest.mark.parametrize("batch_size", [1, 2, 4, 7])
+    def test_shape(self, batch_size, device, dtype):
+        B: int = batch_size
+        E_mat = torch.rand(B, 3, 3, device=device, dtype=dtype)
+        K1 = torch.rand(B, 3, 3, device=device, dtype=dtype)
+        K2 = torch.rand(1, 3, 3, device=device, dtype=dtype)  # check broadcasting
+        F_mat = epi.fundamental_from_essential(E_mat, K1, K2)
+        assert F_mat.shape == (B, 3, 3)
+
+    def test_shape_large(self, device, dtype):
+        E_mat = torch.rand(1, 2, 3, 3, device=device, dtype=dtype)
+        K1 = torch.rand(1, 2, 3, 3, device=device, dtype=dtype)
+        K2 = torch.rand(1, 1, 3, 3, device=device, dtype=dtype)  # check broadcasting
+        F_mat = epi.fundamental_from_essential(E_mat, K1, K2)
+        assert F_mat.shape == (1, 2, 3, 3)
+
+    def test_singular_camera_gives_nan(self, device, dtype):
+        # kornia#5194: safe_inverse_with_mask returns the identity for a singular matrix, which must not
+        # turn a singular camera into a finite fundamental matrix.
+        E_mat = torch.rand(2, 3, 3, device=device, dtype=dtype)
+        K = torch.stack([torch.eye(3), torch.zeros(3, 3)]).to(device, dtype)
+        F_mat = epi.fundamental_from_essential(E_mat, K, K)
+        self.assert_close(F_mat[0], E_mat[0])
+        assert F_mat[1].isnan().all()
+        # a singular K2 alone is enough
+        eye = torch.eye(3, device=device, dtype=dtype).expand(2, 3, 3)
+        F_mat = epi.fundamental_from_essential(E_mat, eye, K)
+        self.assert_close(F_mat[0], E_mat[0])
+        assert F_mat[1].isnan().all()
+
+    def test_from_to_essential(self, device, dtype):
+        scene = generate_two_view_random_scene(device, dtype)
+
+        F_mat = scene["F"]
+        E_mat = epi.essential_from_fundamental(F_mat, scene["K1"], scene["K2"])
+        F_hat = epi.fundamental_from_essential(E_mat, scene["K1"], scene["K2"])
+
+        F_mat_norm = epi.normalize_transformation(F_mat)
+        F_hat_norm = epi.normalize_transformation(F_hat)
+        # E and F_hat each round to the dtype once: about one unit in the last place in half precision.
+        tol = torch.finfo(dtype).eps if dtype in (torch.float16, torch.bfloat16) else 1e-4
+        self.assert_close(F_mat_norm, F_hat_norm, atol=tol, rtol=tol)
+
+    def test_gradcheck(self, device):
+        E_mat = torch.rand(1, 3, 3, device=device, dtype=torch.float64, requires_grad=True)
+        K1 = torch.rand(1, 3, 3, device=device, dtype=torch.float64)
+        K2 = torch.rand(1, 3, 3, device=device, dtype=torch.float64)
+        self.gradcheck(epi.fundamental_from_essential, (E_mat, K1, K2), requires_grad=(True, False, False))
+
+    def test_mismatched_dimensions_raise_6454(self, device, dtype):
+        # A different number of batch dimensions raised an AssertionError without a message.
+        E_mat = torch.rand(1, 3, 3, device=device, dtype=dtype)
+        K = torch.rand(3, 3, device=device, dtype=dtype)
+        with pytest.raises(
+            ShapeError,
+            match=r"E_mat, K1 and K2 must have shape \(\*, 3, 3\) with the same number of dimensions, "
+            r"got \[1, 3, 3\], \[3, 3\] and \[1, 3, 3\]\.",
+        ):
+            epi.fundamental_from_essential(E_mat, K, E_mat)
+
+    @pytest.mark.applies_to(dtypes=("float16", "bfloat16"), reason="a half-precision accuracy check")
+    def test_half_precision_rounds_once(self, device, dtype):
+        # 256 scenes with focal lengths near 1000 px. Multiplying in half precision leaves F off by 0.33 of its
+        # largest entry in float16 and by 1.1 in bfloat16.
+        scene = pixel_two_view_batch(256, 100, seed=0)
+        E_mat, K1, K2 = (scene[key].to(dtype) for key in ("E", "K1", "K2"))
+        expected = epi.fundamental_from_essential(E_mat.double(), K1.double(), K2.double())
+        actual = epi.fundamental_from_essential(E_mat.to(device), K1.to(device), K2.to(device))
+        assert actual.dtype == dtype
+        assert max_relative_error(actual, expected) <= ONE_ROUNDING_EPS * torch.finfo(dtype).eps
+
+
+class TestFundamentalFromProjections(BaseTester):
+    def test_smoke(self, device, dtype):
+        P1 = torch.rand(1, 3, 4, device=device, dtype=dtype)
+        P2 = torch.rand(1, 3, 4, device=device, dtype=dtype)
+        F_mat = epi.fundamental_from_projections(P1, P2)
+        assert F_mat.shape == (1, 3, 3)
+
+    @pytest.mark.parametrize("batch_size", [1, 2, 4, 7])
+    def test_shape(self, batch_size, device, dtype):
+        B: int = batch_size
+        P1 = torch.rand(B, 3, 4, device=device, dtype=dtype)
+        P2 = torch.rand(B, 3, 4, device=device, dtype=dtype)
+        F_mat = epi.fundamental_from_projections(P1, P2)
+        assert F_mat.shape == (B, 3, 3)
+
+    def test_shape_large(self, device, dtype):
+        P1 = torch.rand(1, 2, 3, 4, device=device, dtype=dtype)
+        P2 = torch.rand(1, 2, 3, 4, device=device, dtype=dtype)
+        F_mat = epi.fundamental_from_projections(P1, P2)
+        assert F_mat.shape == (1, 2, 3, 3)
+
+    def test_from_to_projections(self, device, dtype):
+        P1 = torch.tensor(
+            [[[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [1.0, 0.0, 1.0, 0.0]]], device=device, dtype=dtype
+        )
+
+        P2 = torch.tensor(
+            [[[1.0, 1.0, 1.0, 3.0], [0.0, 2.0, 0.0, 3.0], [0.0, 1.0, 1.0, 0.0]]], device=device, dtype=dtype
+        )
+
+        F_mat = epi.fundamental_from_projections(P1, P2)
+        P_mat = epi.projections_from_fundamental(F_mat)
+        F_hat = epi.fundamental_from_projections(P_mat[..., 0], P_mat[..., 1])
+
+        F_mat_norm = epi.normalize_transformation(F_mat)
+        F_hat_norm = epi.normalize_transformation(F_hat)
+        self.assert_close(F_mat_norm, F_hat_norm, atol=1e-4, rtol=1e-4)
+
+    def test_gradcheck(self, device):
+        P1 = torch.rand(1, 3, 4, device=device, dtype=torch.float64, requires_grad=True)
+        P2 = torch.rand(1, 3, 4, device=device, dtype=torch.float64)
+        self.gradcheck(epi.fundamental_from_projections, (P1, P2), requires_grad=(True, False))
+
+    def test_batch_support_check(self, device, dtype):
+        P1_batch = torch.tensor(
+            [
+                [
+                    [9.4692e02, -9.6658e02, 6.0862e02, -2.3076e05],
+                    [-2.1829e02, 5.4163e02, 1.3445e03, -6.4387e05],
+                    [-6.0675e-01, -6.9807e-01, 3.8021e-01, 3.8896e02],
+                ],
+                [
+                    [9.4692e02, -9.6658e02, 6.0862e02, -2.3076e05],
+                    [-2.1829e02, 5.4163e02, 1.3445e03, -6.4387e05],
+                    [-6.0675e-01, -6.9807e-01, 3.8021e-01, 3.8896e02],
+                ],
+            ],
+            device=device,
+            dtype=dtype,
+        )
+        P1 = torch.tensor(
+            [
+                [
+                    [9.4692e02, -9.6658e02, 6.0862e02, -2.3076e05],
+                    [-2.1829e02, 5.4163e02, 1.3445e03, -6.4387e05],
+                    [-6.0675e-01, -6.9807e-01, 3.8021e-01, 3.8896e02],
+                ]
+            ],
+            device=device,
+            dtype=dtype,
+        )
+        P2_batch = torch.tensor(
+            [
+                [
+                    [1.1518e03, -7.5822e02, 5.4764e02, -1.9764e05],
+                    [-2.1548e02, 5.3102e02, 1.3492e03, -6.4731e05],
+                    [-4.3727e-01, -7.8632e-01, 4.3646e-01, 3.4515e02],
+                ],
+                [
+                    [9.9595e02, -8.6464e02, 6.7959e02, -2.7517e05],
+                    [-8.1716e01, 7.7826e02, 1.2395e03, -5.8137e05],
+                    [-5.7090e-01, -6.0416e-01, 5.5594e-01, 2.8111e02],
+                ],
+            ],
+            device=device,
+            dtype=dtype,
+        )
+        P2 = torch.tensor(
+            [
+                [
+                    [1.1518e03, -7.5822e02, 5.4764e02, -1.9764e05],
+                    [-2.1548e02, 5.3102e02, 1.3492e03, -6.4731e05],
+                    [-4.3727e-01, -7.8632e-01, 4.3646e-01, 3.4515e02],
+                ]
+            ],
+            device=device,
+            dtype=dtype,
+        )
+
+        F_batch = epi.fundamental_from_projections(P1_batch, P2_batch)
+        F = epi.fundamental_from_projections(P1, P2)
+        self.assert_close(F_batch[0], F[0])
+
+    def test_mismatched_batch_shapes_raise_6454(self, device, dtype):
+        # Different batch shapes raised an AssertionError without a message.
+        P1 = torch.rand(1, 3, 4, device=device, dtype=dtype)
+        P2 = torch.rand(2, 3, 4, device=device, dtype=dtype)
+        with pytest.raises(
+            ShapeError,
+            match=r"P1 and P2 must have shape \(\*, 3, 4\) with the same batch shape, "
+            r"got \[1, 3, 4\] and \[2, 3, 4\]\.",
+        ):
+            epi.fundamental_from_projections(P1, P2)
+
+
+class TestPerpendicular(BaseTester):
+    def test_shape(self, device, dtype):
+        lines = torch.rand(2, 4, 3, device=device, dtype=dtype)
+        points = torch.rand(2, 4, 2, device=device, dtype=dtype)
+        perp = epi.get_perpendicular(lines, points)
+        assert perp.shape == (2, 4, 3)
+
+    def test_result(self, device, dtype):
+        points = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]], device=device, dtype=dtype)
+
+        lines = torch.tensor([[[1.0, -1.0, 0.0], [0.0, 1.0, 1.0]]], device=device, dtype=dtype)
+        perp = epi.get_perpendicular(lines, points)
+        expected = torch.tensor([[[1.0, 1.0, -1.0], [-1.0, 0.0, 0.0]]], device=device, dtype=dtype)
+        self.assert_close(perp, expected)
+
+    def test_gradcheck(self, device):
+        pt = torch.rand(1, 3, 3, device=device, dtype=torch.float64, requires_grad=True)
+        line = torch.rand(1, 3, 3, device=device, dtype=torch.float64)
+        self.gradcheck(epi.get_perpendicular, (pt, line), requires_grad=(True, False))
+
+    @pytest.mark.parametrize("lines_shape, points_shape", [((5, 3), (5, 2)), ((1, 5, 3), (1, 5, 4))])
+    def test_wrong_points_shape_raises_6422(self, lines_shape, points_shape, device, dtype):
+        # Unbatched points reached points.shape[2], an IndexError; four coordinates reached a bare AssertionError.
+        lines = torch.rand(*lines_shape, device=device, dtype=dtype)
+        points = torch.rand(*points_shape, device=device, dtype=dtype)
+        with pytest.raises(ShapeError, match=r"points must have shape \(B, N, 2\) or \(B, N, 3\)"):
+            epi.get_perpendicular(lines, points)
+
+    def test_unbatched_lines_still_broadcast_6422(self, device, dtype):
+        # Only points are read on dimension 2: unbatched lines broadcast against batched points, as before.
+        lines = torch.rand(4, 3, device=device, dtype=dtype)
+        points = torch.rand(2, 4, 2, device=device, dtype=dtype)
+        self.assert_close(epi.get_perpendicular(lines, points), epi.get_perpendicular(lines.expand(2, 4, 3), points))
+
+
+class TestGetClosestPointOnEpipolarLine(BaseTester):
+    def test_shape(self, device, dtype):
+        pts1 = torch.rand(2, 4, 2, device=device, dtype=dtype)
+        pts2 = torch.rand(2, 4, 2, device=device, dtype=dtype)
+        Fm = create_random_fundamental_matrix(1, device=device, dtype=dtype)
+        perp = epi.get_closest_point_on_epipolar_line(pts1, pts2, Fm)
+        assert perp.shape == (2, 4, 2)
+
+    def test_shift(self, device, dtype):
+        pts1 = torch.zeros(3, 2, device=device, dtype=dtype)[None]
+        pts2 = torch.tensor([[2, 4.0], [2, 1], [2, 2.0]], device=device, dtype=dtype)[None]
+        Fm = torch.tensor([[0.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]], dtype=dtype, device=device)[None]
+        cp = epi.get_closest_point_on_epipolar_line(pts1, pts2, Fm)
+        expected = torch.tensor([[[2.0, 0.0], [2.0, 0.0], [2.0, 0.0]]], device=device, dtype=dtype)
+        self.assert_close(cp, expected)
+
+    def test_gradcheck(self, device):
+        pts1 = torch.rand(2, 4, 2, device=device, dtype=torch.float64, requires_grad=True)
+        pts2 = torch.rand(2, 4, 2, device=device, dtype=torch.float64)
+        Fm = create_random_fundamental_matrix(1, dtype=torch.float64, device=device)
+        self.gradcheck(epi.get_closest_point_on_epipolar_line, (pts1, pts2, Fm), requires_grad=(True, False, False))
+
+    @pytest.mark.parametrize("pts_shape", [(5, 2), (1, 5, 4)])
+    def test_wrong_pts2_shape_raises_6422(self, pts_shape, device, dtype):
+        # pts2 reached get_perpendicular, where an unbatched one raised an IndexError and one with four
+        # coordinates a bare AssertionError.
+        pts1 = torch.rand(pts_shape[:-1] + (2,), device=device, dtype=dtype)
+        pts2 = torch.rand(pts_shape, device=device, dtype=dtype)
+        Fm = create_random_fundamental_matrix(1, device=device, dtype=dtype)
+        with pytest.raises(ShapeError, match=r"pts2 must have shape \(B, N, 2\) or \(B, N, 3\)"):
+            epi.get_closest_point_on_epipolar_line(pts1, pts2, Fm)
+
+    def test_unbatched_pts1_still_broadcasts_6422(self, device, dtype):
+        # An unbatched pts1 broadcasts against Fm in compute_correspond_epilines, as before.
+        pts1 = torch.rand(4, 2, device=device, dtype=dtype)
+        pts2 = torch.rand(1, 4, 2, device=device, dtype=dtype)
+        Fm = create_random_fundamental_matrix(1, device=device, dtype=dtype)
+        expected = epi.get_closest_point_on_epipolar_line(pts1[None], pts2, Fm)
+        self.assert_close(epi.get_closest_point_on_epipolar_line(pts1, pts2, Fm), expected)
+
+
+# Fixed pixel offsets added to x2 where a pin needs inexact matches.
+_NOISE = [
+    [1.5, -2.0], [-2.5, 1.0], [0.5, 3.0], [-1.0, -1.5], [2.0, 0.5], [-3.0, 2.5],
+    [1.0, -0.5], [-0.5, -3.0], [2.5, 1.5], [-2.0, -2.5], [3.0, -1.0], [-1.5, 2.0],
+]  # fmt: skip
+
+
+def _hom(p: torch.Tensor) -> torch.Tensor:
+    return torch.cat([p, torch.ones_like(p[..., :1])], -1)
+
+
+def _epipolar_residual(F: torch.Tensor, pts1: torch.Tensor, pts2: torch.Tensor) -> torch.Tensor:
+    """|pts2^T F pts1| per correspondence."""
+    return (_hom(pts2) * (_hom(pts1) @ F.transpose(-2, -1))).sum(-1).abs()
+
+
+def _pixel_F(scene: Dict[str, torch.Tensor]) -> torch.Tensor:
+    """Ground-truth F of the two-view fixture in closed form, scaled so that F[2, 2] = 1."""
+    eye = torch.eye(3, device=scene["R"].device, dtype=scene["R"].dtype)[None]
+    E = epi.essential_from_Rt(eye, torch.zeros_like(scene["t"]), scene["R"], scene["t"])
+    F = epi.fundamental_from_essential(E, scene["K1"], scene["K2"])
+    return F / F[..., 2:, 2:]
+
+
+class TestConventionFundamental(BaseTester):
+    @pytest.mark.applies_to(dtypes=("float32", "float64"), reason=_NO_HALF_EIGH)
+    def test_convention_find_fundamental_acts_x2_F_x1(self, device, dtype):
+        two_view = two_view_scene(device, dtype)
+        x1, x2 = two_view["x1"], two_view["x2"]
+        F = epi.find_fundamental(x1, x2, torch.ones_like(x1[..., 0]))
+        # x2^T F x1 = 0 for points1 from the first image and points2 from the second (OpenCV's findFundamentalMat
+        # order). The swapped product is the control: on this fixture it is of order 1.
+        assert _epipolar_residual(F, x1, x2).max() < 1e-3 * _epipolar_residual(F, x2, x1).max()
+        # Relabelling the images returns the transpose.
+        self.assert_close(epi.find_fundamental(x2, x1), F.transpose(-2, -1), rtol=1e-4, atol=1e-4)
+        # The result is scaled so that F[2, 2] = 1.
+        self.assert_close(F[..., 2, 2], torch.ones_like(F[..., 2, 2]))
+
+    @pytest.mark.applies_to(dtypes=("float32", "float64"), reason=_NO_HALF_EIGH)
+    def test_convention_find_fundamental_7point_candidates(self, device, dtype):
+        two_view = two_view_scene(device, dtype)
+        # A 7-point sample whose cubic has three real roots, so all three candidates are genuine solutions.
+        idx = [0, 1, 2, 3, 4, 5, 6]
+        x1, x2 = two_view["x1"][:, idx], two_view["x2"][:, idx]
+        F = epi.find_fundamental(x1, x2, method="7POINT")
+        assert F.shape == (1, 3, 3, 3)
+        for k in range(3):
+            Fk = F[:, k]
+            assert _epipolar_residual(Fk, x1, x2).max() < 1e-3 * _epipolar_residual(Fk, x2, x1).max()
+            sv = torch.linalg.svdvals(Fk.cpu().double())
+            assert sv[..., 2] < 1e-8 * sv[..., 0]  # rank 2
+        self.assert_close(F[..., 2, 2], torch.ones_like(F[..., 2, 2]))
+        # The candidate order carries no meaning: exactly one candidate fits all twelve points, so it is selected by
+        # residual, never by position.
+        fits = [bool(_epipolar_residual(F[:, k], two_view["x1"], two_view["x2"]).max() < 1e-2) for k in range(3)]
+        assert sum(fits) == 1
+        # Relabelling the images returns the transposed candidates, as a set.
+        Fs = epi.find_fundamental(x2, x1, method="7POINT").transpose(-2, -1)
+        dist = (F[0, :, None] - Fs[0, None]).abs().amax(dim=(-2, -1))
+        assert dist.amin(dim=1).max() < 1e-3
+
+    @pytest.mark.applies_to(dtypes=("float32", "float64"), reason=_NO_HALF_EIGH)
+    def test_convention_find_fundamental_weights_semantics(self, device, dtype):
+        two_view = two_view_scene(device, dtype)
+        x1 = two_view["x1"]
+        x2 = two_view["x2"] + torch.tensor([_NOISE], device=device, dtype=dtype)
+        w = torch.tensor([[0.5, 1.0, 2.0, 1.5, 0.75, 1.25, 3.0, 0.25, 1.0, 2.5, 0.6, 1.8]], device=device, dtype=dtype)
+        F_w = epi.find_fundamental(x1, x2, w)
+        # Only the ratios of the weights matter: scaling them all by 7 gives the same F.
+        self.assert_close(epi.find_fundamental(x1, x2, 7.0 * w), F_w, rtol=1e-4, atol=1e-4)
+        # Control: other ratios (all ones) give a different F on these inexact matches.
+        assert (epi.find_fundamental(x1, x2, torch.ones_like(w)) - F_w).abs().max() > 1e-3
+        # A negative weight counts as zero, to the bit; both differ from the original weight.
+        w_zero, w_neg = w.clone(), w.clone()
+        w_zero[0, 3], w_neg[0, 3] = 0.0, -5.0
+        F_zero = epi.find_fundamental(x1, x2, w_zero)
+        assert torch.equal(epi.find_fundamental(x1, x2, w_neg), F_zero)
+        assert (F_zero - F_w).abs().max() > 1e-3
+        # method="7POINT" ignores the weights: a zero and a negative weight, which would drop a constraint from a
+        # weighted minimal system, leave the three candidates unchanged to the bit.
+        x1_7, x2_7 = x1[:, :7], two_view["x2"][:, :7]
+        w7 = torch.tensor([[1.0, 0.0, -2.0, 5.0, 0.1, 3.0, 1.0]], device=device, dtype=dtype)
+        F7 = epi.find_fundamental(x1_7, x2_7, method="7POINT")
+        assert torch.equal(epi.find_fundamental(x1_7, x2_7, w7, method="7POINT"), F7)
+
+    @pytest.mark.applies_to(dtypes=("float32", "float64"), reason=_HALF_PIXEL_F)
+    def test_convention_fundamental_from_projections_direction_and_scale(self, device, dtype):
+        two_view = two_view_scene(device, dtype)
+        x1, x2 = two_view["x1"], two_view["x2"]
+        F = epi.fundamental_from_projections(two_view["P1"], two_view["P2"])
+        # x2^T F x1 = 0 for (P1, P2): points1 from the first camera, the order of find_fundamental.
+        F_unit = F / F.norm()
+        assert _epipolar_residual(F_unit, x1, x2).max() < 1e-3 * _epipolar_residual(F_unit, x2, x1).max()
+        # Control: swapping the cameras gives the transposed relation, which fails on (x1, x2).
+        F_sw = epi.fundamental_from_projections(two_view["P2"], two_view["P1"])
+        F_sw_unit = F_sw / F_sw.norm()
+        assert _epipolar_residual(F_sw_unit, x1, x2).max() > 1e3 * _epipolar_residual(F_unit, x1, x2).max()
+        # Not normalised: neither F[2, 2] = 1 nor unit Frobenius norm.
+        assert (F[..., 2, 2] - 1.0).abs().max() > 1.0
+        assert (F.norm() - 1.0).abs() > 1.0
+        # For P1 = [I | 0], P2 = [R | t] it is the negative of essential_from_Rt for the same motion, at its scale.
+        R, t = two_view["R"], two_view["t"]
+        eye = torch.eye(3, device=device, dtype=dtype)[None]
+        zero = torch.zeros_like(t)
+        F_n = epi.fundamental_from_projections(torch.cat([eye, zero], -1), torch.cat([R, t], -1))
+        E = epi.essential_from_Rt(eye, zero, R, t)
+        self.assert_close(F_n, -E)
+        assert (F_n - E).abs().max() > 0.5
+
+    @pytest.mark.applies_to(dtypes=("float32", "float64"), reason=_HALF_PIXEL_F)
+    def test_convention_fundamental_from_essential_K_sides(self, device, dtype):
+        two_view = two_view_scene(device, dtype)
+        K1, K2, x1, x2 = two_view["K1"], two_view["K2"], two_view["x1"], two_view["x2"]
+        eye = torch.eye(3, device=device, dtype=dtype)[None]
+        E = epi.essential_from_Rt(eye, torch.zeros_like(two_view["t"]), two_view["R"], two_view["t"])
+        F = epi.fundamental_from_essential(E, K1, K2)
+        # F = K2^-T E K1^-1: K1 is the camera of points1, so x2^T F x1 = 0 in pixels.
+        self.assert_close(K2.transpose(-2, -1) @ F @ K1, E)
+        F_swapped = epi.fundamental_from_essential(E, K2, K1)
+        resid = _epipolar_residual(F / F.norm(), x1, x2)
+        assert resid.max() < 1e-3 * _epipolar_residual(F_swapped / F_swapped.norm(), x1, x2).max()
+
+    @pytest.mark.applies_to(dtypes=("float32", "float64"), reason=_HALF_PIXEL_F)
+    def test_convention_epilines_of_image1_points_lie_in_image2(self, device, dtype):
+        two_view = two_view_scene(device, dtype)
+        x1, x2 = two_view["x1"], two_view["x2"]
+        F = _pixel_F(two_view)
+        # Lines F x1 of first-image points live in the second image, scaled to a^2 + b^2 = 1.
+        lines = epi.compute_correspond_epilines(x1, F)
+        self.assert_close(lines[..., :2].norm(dim=-1), torch.ones_like(lines[..., 0]))
+        on, off = (_hom(x2) * lines).sum(-1).abs(), (_hom(x1) * lines).sum(-1).abs()
+        assert on.max() < 1e-3 * off.max()
+        # For second-image points pass F transposed: the lines live in the first image.
+        lines1 = epi.compute_correspond_epilines(x2, F.transpose(-2, -1))
+        self.assert_close(lines1[..., :2].norm(dim=-1), torch.ones_like(lines1[..., 0]))
+        on1, off1 = (_hom(x1) * lines1).sum(-1).abs(), (_hom(x2) * lines1).sum(-1).abs()
+        assert on1.max() < 1e-3 * off1.max()
+
+    def test_convention_normalize_points_hartley(self, device, dtype):
+        two_view = two_view_scene(device, dtype)
+        # Hartley normalisation: translate to zero mean and scale isotropically to mean distance sqrt(2); the
+        # returned T maps the input onto the output. The fixture's spread differs in x and y.
+        points = two_view["x1"]
+        points_norm, T = epi.normalize_points(points)
+        mean_atol = {torch.bfloat16: 3e-2, torch.float16: 3e-3}.get(dtype, 1e-5)
+        self.assert_close(points_norm.mean(dim=1), torch.zeros_like(points_norm[:, 0]), rtol=0.0, atol=mean_atol)
+        mean_dist = points_norm.norm(dim=-1).mean(dim=-1)
+        self.assert_close(mean_dist, torch.full_like(mean_dist, 2.0**0.5))
+        self.assert_close((_hom(points) @ T.transpose(-2, -1))[..., :2], points_norm, low_tolerance=True)
+        assert T[0, 0, 0] == T[0, 1, 1]
+        assert T[0, 0, 1] == 0
+        assert T[0, 1, 0] == 0
+
+    def test_convention_normalize_transformation_keeps_zero_last_entry(self, device, dtype):
+        # The F[2, 2] = 1 scaling skips a last entry within eps of zero, such as the F of an exactly rectified pair
+        # (x2^T F x1 = v1 - v2): the matrix comes back unchanged instead of divided by eps.
+        M = torch.tensor([[[0.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]]], device=device, dtype=dtype)
+        assert torch.equal(epi.normalize_transformation(M), M)
+        # Control: a last entry above eps is divided out.
+        M[0, 2, 2] = 0.5
+        self.assert_close(epi.normalize_transformation(M), M / 0.5)
+
+    @pytest.mark.applies_to(dtypes=("float32", "float64"), reason=_HALF_PIXEL_F)
+    def test_convention_get_closest_point_on_epipolar_line_in_image2(self, device, dtype):
+        two_view = two_view_scene(device, dtype)
+        x1 = two_view["x1"]
+        x2 = two_view["x2"] + torch.tensor([_NOISE], device=device, dtype=dtype)
+        F = _pixel_F(two_view)
+        # The result lies in the second image, on the epiline F x1, at the foot of the perpendicular from x2.
+        closest = epi.get_closest_point_on_epipolar_line(x1, x2, F)
+        lines = epi.compute_correspond_epilines(x1, F)
+        assert (_hom(closest) * lines).sum(-1).abs().max() < 1e-3
+        self.assert_close((closest - x2).norm(dim=-1), epi.left_to_right_epipolar_distance(x1, x2, F))
+        # Control: with the arguments swapped the point is off that line by pixels.
+        swapped = epi.get_closest_point_on_epipolar_line(x2, x1, F)
+        assert (_hom(swapped) * lines).sum(-1).abs().max() > 1.0
+
+    @pytest.mark.applies_to(dtypes=("float32", "float64"), reason=_NO_HALF_EIGH)
+    def test_run_7point_zeroes_padded_roots_4862(self, device, dtype):
+        two_view = two_view_scene(device, dtype)
+        # #4862: a 7-point sample whose cubic has one real root. The candidates of its two missing roots used to be one
+        # rank-3 matrix repeated, and are now zero matrices.
+        idx = [0, 1, 2, 3, 4, 6, 10]
+        F = epi.find_fundamental(two_view["x1"][:, idx], two_view["x2"][:, idx], method="7POINT")
+        assert F.shape == (1, 3, 3, 3)
+        assert (F[:, 1:] == 0).all()
+        sv = torch.linalg.svdvals(F[0, 0].cpu().double())
+        assert sv[2] < 1e-8 * sv[0]  # candidate 0 is a genuine rank-2 solution
+        # Control: a sample whose cubic has three real roots keeps three rank-2 candidates.
+        idx = [0, 1, 2, 3, 4, 5, 6]
+        F = epi.find_fundamental(two_view["x1"][:, idx], two_view["x2"][:, idx], method="7POINT")
+        sv = torch.linalg.svdvals(F[0].cpu().double())
+        assert (sv[:, 0] > 0).all()
+        assert (sv[:, 2] < 1e-8 * sv[:, 0]).all()
+
+    def test_convention_normalize_transformation_eps_divisor_4874(self, device, dtype):
+        # #4874: eps guards the divisor without biasing the normalized matrix.
+        M = torch.tensor([[[2.0, 0.5, 3.0], [-1.0, 4.0, 0.25], [0.75, -2.0, 0.1]]], device=device, dtype=dtype)
+        out = epi.normalize_transformation(M, eps=1e-3)
+        self.assert_close(out, M / M[..., -1:, -1:], rtol=0, atol=0)
+
+    @pytest.mark.applies_to(
+        dtypes=("bfloat16", "float32", "float64"), reason="the near-threshold values are not representable in float16"
+    )
+    @pytest.mark.parametrize("value", [1.0, 1e-3, 1e-6, -1e-7, 1.01e-8, -1.01e-8])
+    def test_normalize_transformation_exact_last_entry(self, device, dtype, value):
+        M = torch.tensor([[2.0, 0.5, 1.0], [0.3, 1.5, -2.0], [0.1, 0.2, value]], device=device, dtype=dtype)
+        out = epi.normalize_transformation(M)
+        assert out[2, 2] == 1
+        self.assert_close(out, M / M[2, 2], rtol=0, atol=0)
+
+    def test_normalize_transformation_singular_guard(self, device, dtype):
+        values = torch.tensor([0.0, 0.99e-8, -0.99e-8, 1e-8, -1e-8], device=device, dtype=dtype)
+        M = torch.ones(5, 3, 3, device=device, dtype=dtype)
+        M[..., 2, 2] = values
+        M.requires_grad_()
+        out = epi.normalize_transformation(M)
+        self.assert_close(out, M, rtol=0, atol=0)
+        out.sum().backward()
+        self.assert_close(M.grad, torch.ones_like(M), rtol=0, atol=0)
+
+    @pytest.mark.applies_to(dtypes=("float32", "float64"), reason=_NO_HALF_EIGH)
+    def test_find_fundamental_zero_weight_ignores_outlier_4875(self, device, dtype):
+        two_view = two_view_scene(device, dtype)
+        # #4875: zero-weight correspondences must not enter either the DLT system or Hartley statistics.
+        x1 = two_view["x1"]
+        x2 = two_view["x2"] + torch.tensor([_NOISE], device=device, dtype=dtype)
+        outlier1 = torch.tensor([[[2000.0, -1500.0]]], device=device, dtype=dtype)
+        outlier2 = torch.tensor([[[-1800.0, 2500.0]]], device=device, dtype=dtype)
+        weights = torch.ones(1, 13, device=device, dtype=dtype)
+        weights[0, 12] = 0.0
+        F_weighted = epi.find_fundamental(torch.cat([x1, outlier1], 1), torch.cat([x2, outlier2], 1), weights)
+        F_dropped = epi.find_fundamental(x1, x2)
+        self.assert_close(F_weighted, F_dropped, rtol=1e-3, atol=1e-3)
+
+    def test_convention_fundamental_from_projections_float16_unit_max_4877(self, device):
+        # #4877: pixel-unit projection matrices give entries of ~1e10, above float16's maximum, so a float16 F is
+        # divided by its own largest absolute entry. Three batch rows on different scales: pixel units, normalised
+        # cameras (largest entry negative, below 1) and coincident camera centres (F = 0, which stays 0).
+        two_view = two_view_scene(device, torch.float16)
+        eye = torch.eye(3, 4, device=device, dtype=torch.float16)[None]
+        P1 = torch.cat([two_view["P1"], eye, two_view["P1"]])
+        P2 = torch.cat([two_view["P2"], torch.cat([two_view["R"], two_view["t"]], -1), two_view["P1"]])
+        F = epi.fundamental_from_projections(P1, P2)
+        assert F.dtype == torch.float16
+        F_ref = epi.fundamental_from_projections(P1.cpu().double(), P2.cpu().double())
+        assert F_ref[:2].abs().amax() > 1e9
+        assert F_ref[1].abs().amax() < 1
+        assert (F_ref[2] == 0).all()
+        F_ref[:2] = F_ref[:2] / F_ref[:2].abs().amax(dim=(-2, -1), keepdim=True)
+        self.assert_close(F.cpu().double(), F_ref, rtol=0.0, atol=1e-3)
+
+
+def _rotation(axis_angle):
+    return axis_angle_to_rotation_matrix(torch.tensor([axis_angle], dtype=torch.float64))[0]
+
+
+def _with_singular_values(values, rotate: bool) -> torch.Tensor:
+    S = torch.diag(torch.tensor(values, dtype=torch.float64))
+    if not rotate:
+        return S
+    return _rotation([0.3, -0.2, 0.5]) @ S @ _rotation([-0.4, 0.1, 0.2]).T
+
+
+class TestEpipolarDesignRows(BaseTester):
+    def test_inhomogeneous_and_homogeneous_rows_agree(self, device, dtype):
+        # Each entry is one product x2_i * x1_j, so every construction (chosen per device for speed) gives the same
+        # bits, and inhomogeneous points imply w = 1.
+        generator = torch.Generator().manual_seed(7)
+        p1 = torch.rand(5, 11, 2, generator=generator).to(device, dtype)
+        p2 = torch.rand(5, 11, 2, generator=generator).to(device, dtype)
+        rows = _epipolar_design_rows(p1, p2)
+        assert rows.shape == (5, 11, 9)
+        assert torch.equal(rows, _epipolar_design_rows(_hom(p1), _hom(p2)))
+        x1, y1 = p1.unbind(-1)
+        x2, y2 = p2.unbind(-1)
+        one = torch.ones_like(x1)
+        expected = torch.stack([x2 * x1, x2 * y1, x2, y2 * x1, y2 * y1, y2, x1, y1, one], -1)
+        assert torch.equal(rows, expected)
+
+
+class TestRankTwoProjection(BaseTester):
+    @pytest.mark.applies_to(devices=("cpu", "cuda"), reason="MPS does not support float64")
+    def test_matches_svd(self, device):
+        F = torch.randn(128, 3, 3, generator=torch.Generator().manual_seed(0), dtype=torch.float64).to(device)
+        U, S, Vh = torch.linalg.svd(F)
+        expected = U @ torch.diag_embed(S * torch.tensor([1.0, 1.0, 0.0], device=device, dtype=torch.float64)) @ Vh
+        self.assert_close(_rank2_projection(F), expected, atol=1e-9, rtol=0)
+
+    @pytest.mark.applies_to(devices=("cpu", "cuda"), reason="MPS does not support float64")
+    @pytest.mark.parametrize(
+        "values, rotate",
+        [
+            ([1.0, 1.0, 1.0], False),
+            ([2.0, 2.0, 2.0], True),
+            ([3.0, 1.0, 1.0], False),
+            ([3.0, 1.0, 1.0], True),
+            ([3.0, 1.0, 1.0 - 1e-12], True),
+            ([3.0, 1.0, 1.0 - 1e-8], True),
+            ([3.0, 1.0, 1.0 - 1e-4], True),
+            ([1.0, 0.0, 0.0], True),
+            ([0.0, 0.0, 0.0], False),
+        ],
+    )
+    def test_repeated_singular_values(self, device, values, rotate):
+        # At a repeated smallest singular value the nearest rank-2 matrix is not unique, so compare what every one of
+        # them shares with the SVD's: the two largest singular values, a zero third one, and the distance sigma_3.
+        F = _with_singular_values(values, rotate).to(device)[None]
+        P = _rank2_projection(F)
+        s = torch.linalg.svdvals(F)[0]
+        sp = torch.linalg.svdvals(P)[0]
+        tol = 1e-9 * max(float(s[0]), 1.0)
+        self.assert_close(sp[:2], s[:2], atol=tol, rtol=0)
+        assert float(sp[2]) <= tol
+        self.assert_close((F - P).norm(), s[2], atol=tol, rtol=0)
+
+    def test_enforce_rank2_keeps_the_svd_without_float64(self, device, monkeypatch):
+        # Without float64 (MPS) the closed form runs in float32, where its error grows like eps (sigma_1 / sigma_2)^2
+        # through F^T F; batches of any size then keep the SVD. Simulated here by patching the solve dtype.
+        monkeypatch.setattr(fundamental_module, "_solve_dtype", lambda device: torch.float32)
+        generator = torch.Generator().manual_seed(4)
+        U = torch.linalg.qr(torch.randn(600, 3, 3, generator=generator, dtype=torch.float64))[0]
+        V = torch.linalg.qr(torch.randn(600, 3, 3, generator=generator, dtype=torch.float64))[0]
+        F = U @ torch.diag(torch.tensor([1.0, 1e-2, 1e-3], dtype=torch.float64)) @ V.mT
+        expected = U[..., :2] @ torch.diag(torch.tensor([1.0, 1e-2], dtype=torch.float64)) @ V[..., :2].mT
+        P = _enforce_rank2(F.to(device, torch.float32)).cpu().double()
+        assert (P - expected).abs().max() < 1e-5
+
+    @pytest.mark.applies_to(devices=("cpu", "cuda"), reason="MPS does not support float64")
+    def test_backward_is_finite_at_a_repeated_spectrum(self, device):
+        F = torch.eye(3, device=device, dtype=torch.float64)[None].requires_grad_()
+        _rank2_projection(F).sum().backward()
+        assert torch.isfinite(F.grad).all()
+
+    def test_gradcheck(self, device):
+        F = torch.randn(4, 3, 3, generator=torch.Generator().manual_seed(1), dtype=torch.float64).to(device)
+        self.gradcheck(_rank2_projection, (F,))
+
+    def test_keeps_dtype(self, device, dtype):
+        F = torch.randn(2, 3, 3, generator=torch.Generator().manual_seed(2)).to(device, dtype)
+        assert _rank2_projection(F).dtype == dtype
+
+    @pytest.mark.applies_to(
+        dtypes=("float32", "float64"), reason="the eight-point kernel is compared at float32 and float64 accuracy"
+    )
+    def test_eight_point_fundamental_is_exact(self, device, dtype):
+        two_view = two_view_scene(torch.device("cpu"), torch.float64)
+        x1, x2 = two_view["x1"][:, :8], two_view["x2"][:, :8]
+        n1, t1 = epi.normalize_points(x1)
+        n2, t2 = epi.normalize_points(x2)
+        A = _epipolar_design_rows(_hom(n1), _hom(n2)).to(device, dtype)
+        F = t2.mT @ _eight_point_fundamental(A).cpu().double() @ t1
+        F = F / F.norm()
+        truth = _pixel_F(two_view)
+        truth = truth / truth.norm()
+        tolerance = 1e-6 if dtype == torch.float64 else 1e-2
+        assert torch.linalg.det(F).abs().max() < tolerance
+        assert min((F - truth).norm(), (F + truth).norm()) < tolerance
+
+    @pytest.mark.applies_to(dtypes=("float32", "float64"), reason=_NO_HALF_EIGH)
+    @pytest.mark.parametrize("num_points", [8, 12])
+    def test_run_8point_small_batches_keep_the_svd(self, device, dtype, num_points):
+        # Below a few hundred matrices a batched 3x3 SVD is cheaper than the closed form's fixed cost, so small
+        # batches keep the SVD rank-2 step, and their results, to the bit.
+        generator = torch.Generator().manual_seed(num_points)
+        points1 = torch.rand(4, num_points, 2, generator=generator).to(device, dtype)
+        points2 = torch.rand(4, num_points, 2, generator=generator).to(device, dtype)
+        n1, t1 = epi.normalize_points(points1)
+        n2, t2 = epi.normalize_points(points2)
+        A = _epipolar_design_rows(_hom(n1), _hom(n2))
+        if num_points == 8:
+            h = _null_space_lu(A.to(torch.promote_types(A.dtype, torch.float32)))[..., 0]
+            h = (h / h.norm(dim=-1, keepdim=True)).to(A.dtype)
+        else:
+            h = torch.linalg.eigh(A.transpose(-2, -1).contiguous() @ A)[1][..., 0]
+        U, S, V = _torch_svd_cast(h.reshape(4, 3, 3))
+        S_new = torch.zeros_like(S)
+        S_new[..., :-1] = S[..., :-1]
+        expected = epi.normalize_transformation(t2.transpose(-2, -1) @ ((U @ torch.diag_embed(S_new) @ V.mH) @ t1))
+        assert torch.equal(epi.find_fundamental(points1, points2), expected)
+
+    @pytest.mark.applies_to(dtypes=("float32", "float64"), reason=_NO_HALF_EIGH)
+    def test_run_8point_large_batches_match_small_ones(self, device, dtype):
+        generator = torch.Generator().manual_seed(3)
+        points1 = torch.rand(600, 12, 2, generator=generator).to(device, dtype)
+        points2 = torch.rand(600, 12, 2, generator=generator).to(device, dtype)
+        batched = epi.find_fundamental(points1, points2)
+        one_by_one = torch.cat(
+            [epi.find_fundamental(points1[i : i + 1], points2[i : i + 1]) for i in range(0, 600, 60)]
+        )
+        scale = one_by_one.flatten(1).norm(dim=1)[:, None, None]
+        self.assert_close(batched[::60] / scale, one_by_one / scale, rtol=1e-3, atol=1e-3)
+
+    @pytest.mark.parametrize("num_points", [8, 12])
+    def test_gradcheck_run_8point_unweighted(self, device, num_points):
+        generator = torch.Generator().manual_seed(num_points)
+        points1 = torch.rand(1, num_points, 2, generator=generator, dtype=torch.float64).to(device)
+        points2 = torch.rand(1, num_points, 2, generator=generator, dtype=torch.float64).to(device)
+        self.gradcheck(lambda p1: epi.find_fundamental(p1, points2), (points1,))
+
+
+class TestSevenPoint(BaseTester):
+    @pytest.mark.applies_to(
+        dtypes=("float32", "float64"), reason="the seven-point kernel is compared at float32 and float64 accuracy"
+    )
+    def test_identically_singular_pencil_is_finite(self, device, dtype):
+        # Only the first two entries of F are free: every matrix in this null space is rank deficient.
+        design = torch.eye(9, device=device, dtype=dtype)[None, 2:]
+        candidates, valid = _seven_point_candidates(design)
+        assert torch.isfinite(candidates).all()
+        assert not valid.any()
+
+    @pytest.mark.applies_to(
+        dtypes=("float32", "float64"), reason="the seven-point kernel is compared at float32 and float64 accuracy"
+    )
+    def test_singular_pencil_endpoints(self, device, dtype):
+        points1 = torch.tensor(
+            [[[0, -2], [-2, 1], [0, 1], [0, 0], [-1, 2], [-1, 1], [2, -1]]], device=device, dtype=dtype
+        )
+        points2 = torch.tensor(
+            [[[1, 2], [2, 2], [0, -2], [-1, 2], [0, -1], [-1, -2], [2, 2]]], device=device, dtype=dtype
+        )
+        # The constraints have full row rank, but both LU null-space basis matrices have zero determinant.
+        design = _epipolar_design_rows(points1, points2)
+        assert torch.linalg.matrix_rank(design).item() == 7
+        candidates = fundamental_module.run_7point(points1, points2)
+        norms = candidates.flatten(-2).norm(dim=-1)
+        valid = norms > 0
+        assert valid.any()
+        if dtype == torch.float64:
+            assert valid.all()  # Keep the double projective root as well as the simple root.
+        # Float32 perturbations of the constraints can split the double root into a complex pair.
+        candidates = candidates / torch.where(valid, norms, torch.ones_like(norms))[..., None, None]
+        tolerance = 1e-10 if dtype == torch.float64 else 1e-5
+        self.assert_close(torch.linalg.det(candidates), torch.zeros_like(norms), atol=tolerance, rtol=0)
+        residuals = design @ candidates.flatten(-2).mT
+        self.assert_close(residuals, torch.zeros_like(residuals), atol=tolerance, rtol=0)
+        if dtype == torch.float64:
+            distances = torch.cdist(candidates.flatten(-2), candidates.flatten(-2))
+            assert distances.max() > 0.1  # Keep both distinct matrices, including the root at infinity.
+
+    @pytest.mark.applies_to(
+        dtypes=("float32", "float64"), reason="the seven-point kernel is compared at float32 and float64 accuracy"
+    )
+    def test_candidates_are_exact(self, device, dtype):
+        two_view = two_view_scene(torch.device("cpu"), torch.float64)
+        x1, x2 = two_view["x1"][:, :7], two_view["x2"][:, :7]
+        n1, t1 = epi.normalize_points(x1)
+        n2, t2 = epi.normalize_points(x2)
+        candidates, valid = _seven_point_candidates(_epipolar_design_rows(_hom(n1), _hom(n2)).to(device, dtype))
+        assert valid.any()
+        F = t2[:, None].mT @ candidates.cpu().double() @ t1[:, None]
+        F = (F / F.flatten(-2).norm(dim=-1)[..., None, None])[valid.cpu()]
+        truth = _pixel_F(two_view)[0]
+        truth = truth / truth.norm()
+        tolerance = 1e-6 if dtype == torch.float64 else 1e-2
+        assert torch.linalg.det(F).abs().max() < tolerance
+        distance = torch.minimum((F - truth).flatten(1).norm(dim=1), (F + truth).flatten(1).norm(dim=1))
+        assert distance.min() < tolerance
+
+    @pytest.mark.applies_to(devices=("cpu", "cuda"), reason="MPS does not support float64")
+    @pytest.mark.parametrize("idx", [[0, 1, 2, 3, 4, 5, 6], [0, 1, 2, 3, 4, 6, 10]])
+    def test_backward_is_finite(self, device, idx):
+        # The second sample has one real root (#4862): masking candidates built from NaN roots used to leave NaN in
+        # the backward pass although the output was finite.
+        two_view = two_view_scene(device, torch.float64)
+        x1 = two_view["x1"][:, idx].clone().requires_grad_()
+        F = epi.find_fundamental(x1, two_view["x2"][:, idx], method="7POINT")
+        F.sum().backward()
+        assert torch.isfinite(x1.grad).all()
+
+    @pytest.mark.parametrize("idx", [[0, 1, 2, 3, 4, 5, 6], [0, 1, 2, 3, 4, 6, 10]])
+    def test_gradcheck(self, device, idx):
+        two_view = two_view_scene(device, torch.float64)
+        x2 = two_view["x2"][:, idx]
+        self.gradcheck(lambda p1: epi.find_fundamental(p1, x2, method="7POINT"), (two_view["x1"][:, idx],))
+
+
+class TestRefineFundamentalLM(BaseTester):
+    @staticmethod
+    def _problem(seed):
+        generator = torch.Generator().manual_seed(seed)
+        x1 = torch.rand(30, 2, generator=generator, dtype=torch.float64) * 2 - 1
+        x2 = x1 + 0.1 * torch.rand(30, 2, generator=generator, dtype=torch.float64)
+        F = torch.randn(2, 3, 3, generator=generator, dtype=torch.float64)
+        mask = (torch.rand(2, 30, generator=generator, dtype=torch.float64) > 0.3).to(torch.float64)
+        return F, convert_points_to_homogeneous(x1), convert_points_to_homogeneous(x2), mask
+
+    def test_matches_recorded_outputs(self):
+        # Recorded at c27b2dac, before the normal equations were shared with the essential refiner, on x86-64 with
+        # MKL: sharing them changed no bit there. Other BLAS builds round differently and five LM iterations amplify
+        # it (MKL restricted to SSE4.2 moves the result by up to 3.8e-11), so the pin allows 1e-9.
+        F, h1, h2, _ = self._problem(0)
+        truncated = _refine_fundamental_lm(F, h1, h2, None, "truncated", 0.01, 5)
+        expected = [
+            [
+                [0.006098700800078563, -0.5116733906310833, -0.4728232264343061],
+                [0.5402957876915827, 0.026014512989784022, -0.7119944428694382],
+                [0.4517012115690219, 0.719917958973044, 0.03858329173804309],
+            ],
+            [
+                [0.030697813957637547, 0.6162157569540634, 0.3919058257981223],
+                [-0.09984663113859049, -0.6936885856570343, 0.38216094006781043],
+                [0.016680785956596982, -0.28587426648587977, -0.5717588387569966],
+            ],
+        ]
+        self.assert_close(truncated, torch.tensor(expected, dtype=torch.float64), atol=1e-9, rtol=0)
+        F, h1, h2, mask = self._problem(1)
+        cauchy = _refine_fundamental_lm(F, h1, h2, mask, "cauchy", 0.001, 5)
+        expected = [
+            [
+                [0.004714855956989089, -0.09624554989117944, 0.5789110476966798],
+                [0.09642747178202637, -0.004227697559524207, -0.8101614368196856],
+                [-0.5879441787194538, 0.793171411548398, -0.0025179985239673804],
+            ],
+            [
+                [-0.01217626570990575, 0.8162523711647025, 0.0863979715658775],
+                [-0.792854504738295, -0.01999050672309971, 0.6096130586816405],
+                [-0.041273601467539764, -0.660172201639381, -0.0304491757491199],
+            ],
+        ]
+        self.assert_close(cauchy, torch.tensor(expected, dtype=torch.float64), atol=1e-9, rtol=0)
+
+
+class TestClosestPointOnEpipolarLineMixedPrecision(BaseTester):
+    """A caller's autocast region does not reach get_closest_point_on_epipolar_line (#6177)."""
+
+    @staticmethod
+    def _inputs(device, dtype=torch.float32):
+        generator = torch.Generator().manual_seed(6177)
+        Fm = torch.randn(2, 3, 3, generator=generator)
+        points1 = torch.rand(2, 10, 2, generator=generator) * 600
+        points2 = torch.rand(2, 10, 2, generator=generator) * 600
+        return points1.to(device, dtype), points2.to(device, dtype), Fm.to(device, dtype)
+
+    @pytest.mark.parametrize("half_pts2", [False, True], ids=["float32_pts2", "half_pts2"])
+    @pytest.mark.parametrize("region_dtype", [torch.bfloat16, torch.float16], ids=["bfloat16", "float16"])
+    def test_a_mixed_precision_region_does_not_change_the_result_6177(self, device, region_dtype, half_pts2):
+        # The epipolar lines came out of autocast in half precision and met the caller's float32 points in
+        # torch.linalg.cross, which raised "expected scalar type Float but found BFloat16" on CPU and returned wrong
+        # values on MPS. A half-precision pts2, which autocast used to unify with the lines, keeps working. No
+        # "autocast" in the name: conftest skips those on MPS.
+        if device.type not in ("cpu", "cuda", "mps"):
+            pytest.skip("CPU, CUDA and MPS autocast")
+        # MPS autocasts to float16, and so does a CUDA device without bfloat16, where bfloat16 autocast raises.
+        bfloat16_ok = device.type == "cpu" or (device.type == "cuda" and torch.cuda.is_bf16_supported())
+        if region_dtype == torch.bfloat16 and not bfloat16_ok:
+            pytest.skip("no bfloat16 autocast on this device")
+        points1, points2, Fm = self._inputs(device)
+        if half_pts2:
+            points2 = points2.to(region_dtype)
+        expected = epi.get_closest_point_on_epipolar_line(points1, points2.float(), Fm)
+        with torch.autocast(device.type, dtype=region_dtype):
+            actual = epi.get_closest_point_on_epipolar_line(points1, points2, Fm)
+        assert actual.dtype == torch.float32
+        self.assert_close(actual, expected, atol=0, rtol=0)
+
+    @pytest.mark.applies_to(
+        when=lambda p: not ((p["device_name"] == "mps") and (p["other_dtype"] == torch.float64)),
+        reason="MPS does not support float64",
+    )
+    @pytest.mark.parametrize("operand", ["Fm", "pts2"])
+    @pytest.mark.parametrize("other_dtype", [torch.float32, torch.float64])
+    def test_fm_and_pts2_take_the_dtype_of_pts1_6177(self, device, dtype, other_dtype, operand):
+        # Autocast used to unify half-precision operands with float32 ones; the function now casts Fm and pts2 to the
+        # dtype of pts1 itself, in and out of autocast. A mixed pts2 raised on CPU and gave wrong values on MPS.
+        points1, points2, Fm = self._inputs(device, dtype)
+        expected = epi.get_closest_point_on_epipolar_line(points1, points2, Fm)
+        if operand == "Fm":
+            actual = epi.get_closest_point_on_epipolar_line(points1, points2, Fm.to(other_dtype))
+        else:
+            actual = epi.get_closest_point_on_epipolar_line(points1, points2.to(other_dtype), Fm)
+        assert actual.dtype == dtype
+        self.assert_close(actual, expected, atol=0, rtol=0)
+
+    def test_still_scriptable_6177(self, device, dtype):
+        # TorchScript has no context managers, so a scripted call skips the autocast guard; it must keep scripting.
+        points1, points2, Fm = self._inputs(device, dtype)
+        scripted = torch.jit.script(epi.get_closest_point_on_epipolar_line)
+        self.assert_close(scripted(points1, points2, Fm), epi.get_closest_point_on_epipolar_line(points1, points2, Fm))

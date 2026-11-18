@@ -1,0 +1,460 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# kornia.geometry.so2 module inspired by Sophus-sympy.
+# https://github.com/strasdat/Sophus/blob/master/sympy/sophus/so2.py
+from __future__ import annotations
+
+from collections.abc import Callable
+from typing import Optional, Union, overload
+
+import torch
+from torch import nn
+
+from kornia.core.check import KORNIA_CHECK, KORNIA_CHECK_IS_TENSOR, KORNIA_CHECK_SHAPE
+from kornia.core.exceptions import TypeCheckError
+from kornia.core.tensor_wrapper import _unwrap
+from kornia.core.utils import _deepcopy_module_state, is_compiling, register_module_state
+from kornia.geometry.vector import Vector2
+
+
+def _complex_rotation(real: torch.Tensor, imag: torch.Tensor) -> torch.Tensor:
+    """Build the complex ``z`` an So2 stores, rejecting bfloat16 parts, for which PyTorch has no complex dtype."""
+    if torch.bfloat16 in (real.dtype, imag.dtype):
+        # torch.complex would raise a RuntimeError that names neither So2 nor a way out
+        raise TypeCheckError(
+            "So2 stores its rotation as a complex tensor, and PyTorch has no complex bfloat16 dtype; got a bfloat16 "
+            "real or imaginary part. Build the rotation in float16, float32 or float64; `.bfloat16()` on a built So2 "
+            "or Se2 keeps the rotation's complex precision.",
+            actual_type=torch.bfloat16,
+        )
+    return torch.complex(real, imag)
+
+
+class So2(nn.Module):
+    r"""Represent a 2D rotation as an SO(2) Lie group element stored as a complex number.
+
+    ``r = So2.exp(theta)`` builds rotations from angles ``theta`` in radians, ``()`` or ``(B,)``, and ``So2(z)`` wraps
+    complex numbers ``z`` of shape ``()``, ``(B,)`` or ``(B, 1)``, read as ``(B,)``; ``So2.identity(B)`` and
+    ``So2.random(B)`` build ``B`` rotations, or an unbatched one with ``batch_size=None``. ``r * p`` rotates points
+    ``p`` as :math:`R p`, ``r1 * r2`` composes, ``r.inverse()`` inverts, ``r.log()`` returns the angles and
+    ``r.matrix()`` the ``(B, 2, 2)`` matrices (``(2, 2)`` unbatched). An unbatched rotation maps ``(2,)`` or
+    ``(N, 2)`` points, and a batch of ``B`` maps ``(B, 2)``, one point per rotation, or a single ``(2,)`` point. For a
+    rotation and a translation, use :class:`Se2`; for 3D rotations, :class:`So3`.
+
+    SO(2) is the group of rotations of :math:`R^2` about the origin under composition; see
+    https://en.wikipedia.org/wiki/Orthogonal_group#Special_orthogonal_group.
+
+    Convention:
+        - For unit :math:`z = \cos\theta + i \sin\theta`, ``matrix()`` is
+          :math:`[[\cos\theta, -\sin\theta], [\sin\theta, \cos\theta]]`. Non-unit ``z = a + i b``
+          is accepted and produces :math:`[[a, -b], [b, a]]`, which rotates and scales by :math:`|z|`. The complex
+          storage has no bfloat16 counterpart in PyTorch, so ``exp``, ``identity``, ``random`` and ``from_matrix``
+          raise ``TypeCheckError`` for bfloat16 values.
+        - A positive angle rotates the x axis toward the y axis: counter-clockwise in a y-up frame, clockwise as
+          displayed on y-down image axes. For a unit rotation, ``matrix()`` is the transpose of
+          :func:`~kornia.geometry.conversions.angle_to_rotation_matrix`, which takes degrees.
+          ``log`` returns the angle in :math:`[-\pi, \pi]`, and ``adjoint()`` is the 2x2 identity.
+        - ``a * b`` composes like ``a.matrix() @ b.matrix()``, so ``b`` acts first; an unbatched rotation composes
+          with each rotation of a batch.
+        - ``hat`` returns the so(2) generator :math:`[[0, -\theta], [\theta, 0]]` and ``vee`` reads its ``[1, 0]``
+          entry, so ``matrix_exp(hat(theta))`` equals ``exp(theta).matrix()``.
+        - Module dtype conversions act on the real and imaginary components together: ``.float()`` and
+          ``.to(torch.float32)`` use complex64 state, while ``.double()`` and ``.to(torch.float64)`` use complex128.
+          Device-only conversions preserve the complex precision, and explicit complex dtypes are also accepted.
+          The complex checkpoint key ``_z`` and its shape are unchanged. ``.half()`` uses PyTorch's experimental
+          complex32 dtype, which torch's CUDA ``foreach`` SGD step does not support: build a ``torch.optim.SGD``
+          of a CUDA complex32 rotation with ``foreach=False``. Since PyTorch has no complex bfloat16 dtype,
+          ``.bfloat16()`` and ``.to(torch.bfloat16)`` keep the rotation's existing complex precision while
+          following any requested device move.
+        - ``copy.deepcopy`` holds a ``z`` with autograd history, as from ``exp(theta)`` for a ``theta`` that
+          requires grad, as a new leaf that keeps ``requires_grad``, as for
+          :class:`~kornia.geometry.quaternion.Quaternion`.
+
+    See Also:
+        - :class:`So3`: the 3D rotation group, stored as a quaternion.
+        - :class:`Se2`: a 2D rotation followed by a translation, mapping points as :math:`R p + t`.
+        - :func:`~kornia.geometry.conversions.angle_to_rotation_matrix`: a ``(*, 2, 2)`` matrix from an angle in
+          degrees on a plain tensor, the transpose of :meth:`matrix` for the same angle.
+
+    Example:
+        >>> real = torch.tensor([0.6])
+        >>> imag = torch.tensor([0.8])
+        >>> So2(torch.complex(real, imag))
+        Parameter containing:
+        tensor([0.6000+0.8000j], requires_grad=True)
+
+    """
+
+    # Autograd history cannot be deep-copied, so a deep copy holds that state as new leaves.
+    __deepcopy__ = _deepcopy_module_state
+
+    def __init__(self, z: torch.Tensor) -> None:
+        """Construct an So2 from complex numbers ``z``, stored as given.
+
+        Args:
+            z: Complex number with the shape of ``(B,)`` or ``()``; ``(B, 1)`` is read as ``(B,)``.
+
+        Raises:
+            TypeCheckError: if ``z`` is not a complex tensor (an integer, bool or real floating-point tensor).
+
+        Example:
+            >>> real = torch.tensor(0.6)
+            >>> imag = torch.tensor(0.8)
+            >>> So2(torch.complex(real, imag)).z
+            Parameter containing:
+            tensor(0.6000+0.8000j, requires_grad=True)
+
+        """
+        super().__init__()
+        KORNIA_CHECK_IS_TENSOR(z)
+        if not z.is_complex():
+            # Every method reads z.real and z.imag, and a real z (or an integer one) only fails there, inside torch.
+            raise TypeCheckError(
+                f"So2 stores 'z' as a complex tensor; got {z.dtype}. Build it with `torch.complex(real, imag)`.",
+                actual_type=z.dtype,
+            )
+        # check_so2_z_shape(z)
+        is_scalar = len(z.shape) == 0
+        is_flat = KORNIA_CHECK_SHAPE(z, ["B"], raises=False)
+        is_column = KORNIA_CHECK_SHAPE(z, ["B", "1"], raises=False)
+
+        if not (is_scalar or is_flat or is_column):
+            raise ValueError(f"Invalid input size, we expect [], [B], or [B, 1]. Got: {z.shape}")
+        # A (B, 1) z is stored as given, so a caller's nn.Parameter stays the module's own parameter, and the ``z``
+        # property reads it as (B,): kept as a column, it broadcast against the (B,) coordinates of __mul__ as an
+        # outer product (#4932).
+        register_module_state(self, "_z", z)
+
+    def _apply(self, fn: Callable[[torch.Tensor], torch.Tensor], recurse: bool = True) -> So2:
+        def convert(tensor: torch.Tensor) -> torch.Tensor:
+            if not tensor.is_complex():
+                return fn(tensor)
+            # Apply real dtype conversions to both components, without losing the imaginary part.
+            components = torch.view_as_real(tensor.resolve_conj())
+            converted = fn(components)
+            if converted.is_complex():
+                return fn(tensor)  # An explicit complex target already has the correct native semantics.
+            if converted is components:
+                return tensor
+            if converted.dtype == torch.bfloat16:
+                # No complex bfloat16 exists: move the rotation, keeping its complex precision.
+                return tensor.to(device=converted.device)
+            return torch.view_as_complex(converted)
+
+        # Let Module manage parameters, existing gradients, buffers and child-module recursion.
+        return super()._apply(convert, recurse=recurse)
+
+    def __repr__(self) -> str:
+        return f"{self.z}"
+
+    def __getitem__(self, idx: int | slice) -> So2:
+        return So2(self.z[idx])
+
+    @overload
+    def __mul__(self, right: So2) -> So2: ...
+
+    @overload
+    def __mul__(self, right: torch.Tensor) -> torch.Tensor: ...
+
+    def __mul__(self, right: So2 | torch.Tensor) -> So2 | torch.Tensor:
+        """Perform a left-multiplication either rotation concatenation or point-transform.
+
+        Args:
+            right: the other So2 transformation, or points as a tensor or a ``Vector2``: ``(2,)`` or ``(N, 2)``
+                for an unbatched rotation, ``(B, 2)``, one point per rotation, or a single ``(2,)`` point for a
+                batch of ``B`` (a batch of one also maps ``(N, 2)``).
+
+        Return:
+            The resulting So2 transformation, or the rotated points with the type of ``right``.
+
+        """
+        z = self.z
+        if isinstance(right, So2):
+            return So2(z * right.z)
+        if isinstance(right, (Vector2, torch.Tensor)):
+            if isinstance(right, torch.Tensor):
+                # (2,) under any pose, (N, 2) under an unbatched pose, and one point per pose for a batch
+                is_batch_shape = KORNIA_CHECK_SHAPE(right, ["B", "2"], raises=False)
+                is_single_shape = KORNIA_CHECK_SHAPE(right, ["2"], raises=False)
+                if is_batch_shape and z.dim() == 1:
+                    is_batch_shape = right.shape[0] in (z.shape[0], 1) or z.shape[0] == 1
+                if not (is_batch_shape or is_single_shape):
+                    raise ValueError(
+                        "Expected points of shape (2,) or (N, 2) for an unbatched pose, or (B, 2), one point per "
+                        "pose, for a batch of B poses (a batch of one pose also maps (N, 2), and one point (2,) or "
+                        f"(1, 2) maps under every pose). Got points of shape {tuple(right.shape)} for a pose of batch "
+                        f"shape {tuple(z.shape)}."
+                    )
+            right_data = _unwrap(right)
+            x = right_data[..., 0]
+            y = right_data[..., 1]
+            real = z.real
+            imag = z.imag
+            out = torch.stack((real * x - imag * y, imag * x + real * y), -1)
+            if isinstance(right, torch.Tensor):
+                return out
+            return Vector2(out)
+        raise TypeError(f"Not So2 or torch.Tensor type. Got: {type(right)}")
+
+    @property
+    def z(self) -> torch.Tensor:
+        """Return the underlying complex number of shape ``()`` or ``(B,)``.
+
+        A ``(B, 1)`` ``z`` given to the constructor stays stored, and registered, as it was given, and is read
+        here as a ``(B,)`` view.
+        """
+        return self._z.squeeze(-1) if self._z.dim() == 2 else self._z
+
+    @staticmethod
+    def exp(theta: torch.Tensor) -> So2:
+        """Convert elements of lie algebra to elements of lie group.
+
+        Args:
+            theta: angle in radians of shape ``(B,)`` or ``()``; ``(B, 1)`` is squeezed to ``(B,)``.
+
+        Raises:
+            TypeCheckError: if ``theta`` is bfloat16, which has no complex dtype in PyTorch.
+
+        Example:
+            >>> v = torch.tensor([3.1415/2])
+            >>> s = So2.exp(v)
+            >>> s
+            Parameter containing:
+            tensor([4.6329e-05+1.j], requires_grad=True)
+
+        """
+        # check_so2_theta_shape
+        is_scalar = len(theta.shape) == 0
+        is_flat = KORNIA_CHECK_SHAPE(theta, ["B"], raises=False)
+        is_column = KORNIA_CHECK_SHAPE(theta, ["B", "1"], raises=False)
+        if not (is_scalar or is_flat or is_column):
+            raise ValueError(f"Invalid input size, we expect [], [B], or [B, 1]. Got: {theta.shape}")
+        return So2(_complex_rotation(torch.cos(theta), torch.sin(theta)))
+
+    def log(self) -> torch.Tensor:
+        """Convert elements of lie group to elements of lie algebra.
+
+        Example:
+            >>> real = torch.tensor([0.6])
+            >>> imag = torch.tensor([0.8])
+            >>> So2(torch.complex(real, imag)).log()
+            tensor([0.9273], grad_fn=<Atan2Backward0>)
+
+        """
+        return self.z.imag.atan2(self.z.real)
+
+    @staticmethod
+    def hat(theta: torch.Tensor) -> torch.Tensor:
+        r"""Convert an angle to the so(2) generator :math:`[[0, -\theta], [\theta, 0]]`, which :meth:`vee` inverts.
+
+        The output has shape ``(2, 2)`` or ``(B, 2, 2)``; a ``(B, 1)`` angle is squeezed to ``(B,)``.
+        Its matrix exponential is the rotation :meth:`exp` returns.
+
+        Args:
+            theta: angle in radians of shape ``(B,)`` or ``()``; ``(B, 1)`` is squeezed to ``(B,)``.
+
+        Example:
+            >>> theta = torch.tensor(3.1415/2)
+            >>> So2.hat(theta)
+            tensor([[ 0.0000, -1.5707],
+                    [ 1.5707,  0.0000]])
+
+        """
+        # check_so2_theta_shape
+        is_scalar = len(theta.shape) == 0
+        is_flat = KORNIA_CHECK_SHAPE(theta, ["B"], raises=False)
+        is_column = KORNIA_CHECK_SHAPE(theta, ["B", "1"], raises=False)
+        if not (is_scalar or is_flat or is_column):
+            raise ValueError(f"Invalid input size, we expect [], [B], or [B, 1]. Got: {theta.shape}")
+        if is_column:
+            theta = theta.squeeze(-1)  # (B, 1) would give (B, 1, 2, 2), which vee() rejects (#4932)
+        z = torch.zeros_like(theta)
+        row0 = torch.stack((z, -theta), -1)
+        row1 = torch.stack((theta, z), -1)
+        return torch.stack((row0, row1), -2)
+
+    @staticmethod
+    def vee(omega: torch.Tensor) -> torch.Tensor:
+        r"""Read the angle back from a :meth:`hat` matrix of shape ``(2, 2)`` or ``(B, 2, 2)``.
+
+        Returns a scalar or a ``(B,)`` vector, respectively.
+
+        It reads the ``[1, 0]`` entry, :math:`\theta` in the so(2) generator :math:`[[0, -\theta], [\theta, 0]]`.
+
+        Args:
+            omega: 2x2-matrix built by :meth:`hat`.
+
+        Example:
+            >>> v = torch.ones(3)
+            >>> omega = So2.hat(v)
+            >>> So2.vee(omega)
+            tensor([1., 1., 1.])
+
+        """
+        # check_so2_matrix_shape
+        is_batch = KORNIA_CHECK_SHAPE(omega, ["B", "2", "2"], raises=False)
+        is_single = KORNIA_CHECK_SHAPE(omega, ["2", "2"], raises=False)
+        if not (is_batch or is_single):
+            raise ValueError(f"Invalid input size, we expect [B, 2, 2] or [2, 2]. Got: {omega.shape}")
+        return omega[..., 1, 0]
+
+    def matrix(self) -> torch.Tensor:
+        """Return a matrix of shape ``z.shape + (2, 2)`` for each stored complex number.
+
+        Example:
+            >>> s = So2.identity()
+            >>> m = s.matrix()
+            >>> m
+            tensor([[1., -0.],
+                    [0., 1.]], grad_fn=<StackBackward0>)
+
+        """
+        row0 = torch.stack((self.z.real, -self.z.imag), -1)
+        row1 = torch.stack((self.z.imag, self.z.real), -1)
+        return torch.stack((row0, row1), -2)
+
+    @classmethod
+    def from_matrix(cls, matrix: torch.Tensor) -> So2:
+        """Create So2 from a rotation matrix.
+
+        Args:
+            matrix: the rotation matrix to convert of shape ``(B, 2, 2)``.
+
+        Raises:
+            TypeCheckError: if ``matrix`` is bfloat16, which has no complex dtype in PyTorch.
+
+        Example:
+            >>> m = torch.eye(2)
+            >>> s = So2.from_matrix(m)
+            >>> s.z
+            Parameter containing:
+            tensor(1.+0.j, requires_grad=True)
+
+        """
+        # check_so2_matrix_shape
+        is_batch = KORNIA_CHECK_SHAPE(matrix, ["B", "2", "2"], raises=False)
+        is_single = KORNIA_CHECK_SHAPE(matrix, ["2", "2"], raises=False)
+        if not (is_batch or is_single):
+            raise ValueError(f"Invalid input size, we expect [B, 2, 2] or [2, 2]. Got: {matrix.shape}")
+        # check_so2_matrix
+        KORNIA_CHECK_IS_TENSOR(matrix)
+        if len(matrix.shape) < 2 or matrix.shape[-2:] != (2, 2):
+            raise ValueError(f"Input size must be (*, 2, 2). Got {matrix.shape}")
+        # Value validation reads the data, which graph capture cannot do; skip it under any capture (torch.compile,
+        # torch.export).
+        if not is_compiling():
+            mask_diag = torch.allclose(matrix[..., 0, 0], matrix[..., 1, 1])
+            mask_off_diag = torch.allclose(matrix[..., 0, 1], -matrix[..., 1, 0])
+            if not (mask_diag and mask_off_diag):
+                raise ValueError("Invalid SO2 rotation matrix: constraints m00==m11 and m01==-m10 not met.")
+        z = _complex_rotation(matrix[..., 0, 0], matrix[..., 1, 0])
+        return cls(z)
+
+    @classmethod
+    def identity(
+        cls,
+        batch_size: Optional[int] = None,
+        device: Union[str, torch.device, None] = None,
+        dtype: Union[torch.dtype, None] = None,
+    ) -> So2:
+        """Create a So2 group representing an identity rotation.
+
+        Args:
+            batch_size: the batch size of the underlying data.
+            device: device to place the result on.
+            dtype: dtype of the result.
+
+        Raises:
+            TypeCheckError: if ``dtype`` is bfloat16, which has no complex dtype in PyTorch.
+
+        Example:
+            >>> s = So2.identity(batch_size=2)
+            >>> s
+            Parameter containing:
+            tensor([1.+0.j, 1.+0.j], requires_grad=True)
+
+        """
+        real_data = torch.tensor(1.0, device=device, dtype=dtype)
+        imag_data = torch.tensor(0.0, device=device, dtype=dtype)
+        if batch_size is not None:
+            KORNIA_CHECK(batch_size >= 1, msg="batch_size must be positive")
+            real_data = real_data.repeat(batch_size)
+            imag_data = imag_data.repeat(batch_size)
+        return cls(_complex_rotation(real_data, imag_data))
+
+    def inverse(self) -> So2:
+        """Return the inverse transformation.
+
+        Complex-half state is inverted in complex64 and returned in its original dtype.
+
+        Example:
+            >>> s = So2.identity()
+            >>> s.inverse().z
+            tensor(1.+0.j, grad_fn=<MulBackward0>)
+
+        """
+        z = self.z
+        # CPU reciprocal has no ComplexHalf kernel. Promotion also preserves the inverse of non-unit z.
+        if z.dtype == torch.complex32:
+            return So2((1 / z.to(torch.complex64)).to(z.dtype))
+        return So2(1 / z)
+
+    @classmethod
+    def random(
+        cls,
+        batch_size: Optional[int] = None,
+        device: Union[str, torch.device, None] = None,
+        dtype: Union[torch.dtype, None] = None,
+    ) -> So2:
+        r"""Create a So2 group with a unit rotation whose angle is drawn from :math:`U[-\pi, \pi)`.
+
+        Args:
+            batch_size: the batch size of the underlying data.
+            device: device to place the result on.
+            dtype: dtype of the result.
+
+        Raises:
+            TypeCheckError: if ``dtype`` is bfloat16, which has no complex dtype in PyTorch.
+
+        Example:
+            >>> s = So2.random()
+            >>> s = So2.random(batch_size=3)
+
+        """
+        shape: tuple[int, ...] = ()
+        if batch_size is not None:
+            KORNIA_CHECK(batch_size >= 1, msg="batch_size must be positive")
+            shape = (batch_size,)
+        # a uniform rotation has a uniform angle on [-pi, pi). Independent uniform real and imaginary parts on
+        # [0, 1) gave |z| anywhere in (0, sqrt 2), so matrix() was a rotation scaled by |z| (determinant |z|**2),
+        # and every angle was in the first quadrant (#4930).
+        theta = (2 * torch.rand(shape, device=device, dtype=dtype) - 1) * torch.pi
+        return cls.exp(theta)
+
+    def adjoint(self) -> torch.Tensor:
+        """Return the adjoint matrix, the identity, of shape ``(B, 2, 2)`` (``(2, 2)`` unbatched).
+
+        Example:
+            >>> s = So2.identity()
+            >>> s.adjoint()
+            tensor([[1., -0.],
+                    [0., 1.]], grad_fn=<StackBackward0>)
+
+        """
+        batch_size = len(self.z) if len(self.z.shape) > 0 else None
+        return self.identity(batch_size, self.z.device, self.z.real.dtype).matrix()

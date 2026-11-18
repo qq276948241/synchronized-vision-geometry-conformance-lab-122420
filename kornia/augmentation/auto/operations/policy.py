@@ -1,0 +1,209 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union, cast
+
+import torch
+from torch import Size, nn
+
+import kornia.augmentation as K
+from kornia.augmentation.auto.operations import OperationBase
+from kornia.augmentation.container.base import ImageSequentialBase, TransformMatrixMinIn
+from kornia.augmentation.container.ops import InputSequentialOps, _filter_child_options, _validate_extra_args
+from kornia.augmentation.container.params import ParamItem
+from kornia.augmentation.utils import _transform_input, override_parameters
+from kornia.core.ops import eye_like
+from kornia.core.utils import is_exporting
+
+
+class PolicySequential(TransformMatrixMinIn, ImageSequentialBase):
+    """Apply one ordered sub-policy of automatic augmentation operations.
+
+    ``output = PolicySequential(*operations)(input)`` applies the wrapped operations in order and records their
+    parameters for replay. Use :class:`~kornia.augmentation.auto.AutoAugment` to sample one of a searched policy's
+    sub-policies.
+
+    Convention:
+        - accepts only :class:`~kornia.augmentation.auto.operations.OperationBase` children. Generated parameters
+          apply every child in construction order. Supplied ``params`` define the execution path instead: their
+          order and membership select the referenced children, so they may replay a reordered or partial path.
+          ``forward`` stores the ``ParamItem`` objects for the path it executed in ``_params``; those parameters can
+          replay the same operations through ``forward(input, params=...)``.
+        - its transformation matrix is the ordered product of its geometric wrapped operations. Intensity
+          operations do not contribute to that matrix.
+        - ``forward_parameters`` uses :meth:`~kornia.augmentation.auto.operations.OperationBase.forward_parameters`
+          for each child, so the operation's magnitude, magnitude mapping and symmetric sign apply; the gate comes
+          from the wrapped augmentation's ``p`` and ``p_batch``.
+
+    Args:
+        operations: the operations to perform, passed as positional arguments rather than as one list.
+
+    See Also:
+        - :class:`~kornia.augmentation.auto.operations.OperationBase`: wraps an individual policy operation.
+        - :class:`~kornia.augmentation.auto.AutoAugment`: selects from a fixed searched policy.
+
+    """
+
+    def __init__(self, *operations: OperationBase) -> None:
+        self.validate_operations(*operations)
+        super().__init__(*operations)
+        self._valid_ops_for_transform_computation: Tuple[Any, ...] = (OperationBase,)
+
+    def _update_transform_matrix_for_valid_op(self, module: nn.Module) -> None:
+        self._transform_matrices.append(module.transform_matrix)
+
+    def clear_state(self) -> None:
+        """Reset cached params and transformation-matrix state."""
+        self._reset_transform_matrix_state()
+        return super().clear_state()
+
+    def validate_operations(self, *operations: OperationBase) -> None:
+        """Ensure all provided modules are :class:`OperationBase` instances.
+
+        Args:
+            *operations: Operations passed to :class:`PolicySequential`.
+
+        Raises:
+            ValueError: Any provided operation is not a Kornia auto operation.
+        """
+        invalid_ops: List[OperationBase] = []
+        for op in operations:
+            if not isinstance(op, OperationBase):
+                invalid_ops.append(op)
+        if len(invalid_ops) != 0:
+            raise ValueError(f"All operations must be Kornia Operations. Got {invalid_ops}.")
+
+    def identity_matrix(self, input: torch.Tensor) -> torch.Tensor:
+        """Return identity matrix."""
+        return eye_like(3, input)
+
+    def get_transformation_matrix(
+        self,
+        input: torch.Tensor,
+        params: Optional[List[ParamItem]] = None,
+        recompute: bool = False,
+        extra_args: Optional[Dict[str, Any]] = None,
+    ) -> torch.Tensor:
+        """Compute the transformation matrix according to the provided parameters.
+
+        Args:
+            input: the input torch.Tensor.
+            params: params for the sequence.
+            recompute: if to recompute the transformation matrix according to the params.
+                default: False.
+            extra_args: Optional dictionary of extra arguments with specific options for different input types.
+
+        """
+        if params is None:
+            raise NotImplementedError("requires params to be provided.")
+        extra_args = _validate_extra_args(self, extra_args, params)
+        named_modules: Iterator[Tuple[str, nn.Module]] = self.get_forward_sequence(params)
+
+        # Define as 1 for broadcasting
+        res_mat: torch.Tensor = self.identity_matrix(_transform_input(input))
+        for (_, module), param in zip(named_modules, params if params is not None else []):
+            module = cast(OperationBase, module)
+            child_args = _filter_child_options(module, extra_args, param)
+            if isinstance(module.op, (K.GeometricAugmentationBase2D,)) and isinstance(param.data, dict):
+                ori_shape = input.shape
+                input = module.op.transform_tensor(input)
+                # Standardize shape
+                if recompute:
+                    flags = override_parameters(module.op.flags, child_args, in_place=False)
+                    mat = module.op.generate_transformation_matrix(input, param.data, flags)
+                elif module.op.transform_matrix is not None:
+                    mat = torch.as_tensor(module.transform_matrix, device=input.device, dtype=input.dtype)
+                else:
+                    raise RuntimeError(f"{module}.transform_matrix is None while `recompute=False`.")
+                res_mat = mat @ res_mat
+                input = module.op.transform_output_tensor(input, ori_shape)
+                if module.op.keepdim and ori_shape != input.shape:
+                    res_mat = res_mat.squeeze()
+        return res_mat
+
+    def is_intensity_only(self) -> bool:
+        """Check whether the policy contains only intensity transforms.
+
+        Returns:
+            ``True`` when no geometric operation is present.
+        """
+        for module in self.children():
+            module = cast(OperationBase, module)
+            if isinstance(module.op, (K.GeometricAugmentationBase2D,)):
+                return False
+        return True
+
+    def get_forward_sequence(self, params: Optional[List[ParamItem]] = None) -> Iterator[Tuple[str, nn.Module]]:
+        """Return the operation sequence used for execution.
+
+        Args:
+            params: Optional recorded parameters. When provided, only modules
+                referenced by those params are returned.
+
+        Returns:
+            Iterator of ``(name, module)`` pairs.
+        """
+        if params is not None:
+            return super().get_children_by_params(params)
+        return self.named_children()
+
+    def forward_parameters(self, batch_shape: Size) -> List[ParamItem]:
+        """Generate parameter dictionaries for each operation in the policy.
+
+        Args:
+            batch_shape: Input shape used to sample operation parameters.
+
+        Returns:
+            List of :class:`ParamItem` objects in execution order.
+        """
+        named_modules: Iterator[Tuple[str, nn.Module]] = self.get_forward_sequence()
+
+        params: List[ParamItem] = []
+        mod_param: Union[Dict[str, torch.Tensor], List[ParamItem]]
+        for name, module in named_modules:
+            module = cast(OperationBase, module)
+            mod_param = module.forward_parameters(batch_shape)
+            param = ParamItem(name, mod_param)
+            params.append(param)
+        return params
+
+    def transform_inputs(
+        self, input: torch.Tensor, params: List[ParamItem], extra_args: Optional[Dict[str, Any]] = None
+    ) -> torch.Tensor:
+        """Apply all operations using a prepared parameter list.
+
+        Leaves the policy in the same state as :meth:`forward` with these ``params``: the cached
+        transformation matrix is rebuilt from this call and ``_params`` records ``params``. This is the
+        entry point used when the policy is nested inside another container.
+
+        Args:
+            input: Input tensor.
+            params: Parameters for each operation in this policy.
+            extra_args: Optional overrides forwarded to child modules.
+
+        Returns:
+            Transformed tensor.
+        """
+        extra_args = _validate_extra_args(self, extra_args, params)
+        self._reset_transform_matrix_state()
+        for param in params:
+            module = self.get_submodule(param.name)
+            input = InputSequentialOps.transform(input, module=module, param=param, extra_args=extra_args)
+            self._update_transform_matrix_by_module(module)
+        if not is_exporting():
+            self._params = params
+        return input

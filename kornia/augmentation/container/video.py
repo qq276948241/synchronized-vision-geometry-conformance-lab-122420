@@ -1,0 +1,597 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, cast
+
+import torch
+from torch import nn
+
+import kornia.augmentation as K
+from kornia.augmentation.base import _AugmentationBase
+from kornia.augmentation.container.base import SequentialBase
+from kornia.augmentation.container.image import ImageSequential, _get_new_batch_shape
+from kornia.augmentation.utils.helpers import (
+    _frame_boxes,
+    _frame_keypoints,
+    _raise_input_rank_error,
+    _video_boxes,
+    _video_keypoints,
+)
+from kornia.geometry.boxes import Boxes, VideoBoxes
+from kornia.geometry.keypoints import Keypoints, VideoKeypoints
+
+from .params import ParamItem
+
+__all__ = ["VideoSequential"]
+
+
+class VideoSequential(ImageSequential):
+    r"""Apply an image augmentation sequence to a video while optionally sharing draws across frames.
+
+    ``output = VideoSequential(*modules, data_format=...)(video)`` accepts ``(B, T, C, H, W)`` by default or
+    ``(B, C, T, H, W)`` with ``data_format="BCTHW"``, flattens it for the child modules, then restores that layout.
+    ``same_on_frame=True`` shares supported augmentation draws across each clip's frames; use
+    :class:`~kornia.augmentation.container.AugmentationSequential` to transform a video with aligned annotations.
+
+    See the Convention block on :class:`~kornia.augmentation.AugmentationBase2D`.
+
+    Args:
+        *args: a list of augmentation module.
+        data_format: only BCTHW and BTCHW are supported.
+        same_on_frame: share each clip's sampled transform parameters across its temporal frames.
+        random_apply: randomly select a sublist (order agnostic) of args to
+            apply transformation. Selections repeat when the requested count is larger than the number of children
+            that can be drawn, or, for an int or a range that is not fixed to the number of children, than the sum of
+            the weights. That second rule is deprecated since kornia 0.9.1, with a ``FutureWarning`` on the calls whose
+            draw it changes. See :class:`~kornia.augmentation.container.ImageSequential`.
+            If int, a fixed number of transformations will be selected.
+            If (a,), x number of transformations (a <= x <= len(args)) will be selected.
+            If (a, b), x number of transformations (a <= x <= b) will be selected.
+            If True, the whole list of args will be processed as a sequence in a random order, whatever the scale of
+            the weights, and so will a count fixed to the number of children. With a non-mix child of weight 0 or more
+            than one mix augmentation, that count cannot be filled: children repeat and some may be left out.
+            If False, the whole list of args will be processed as a sequence in original order.
+        random_apply_weights: selection weights for each child, as in
+            :class:`~kornia.augmentation.container.ImageSequential`.
+        if_unsupported_ops: what ``inverse`` does on reaching a plain ``nn.Module``, as in
+            :class:`~kornia.augmentation.container.ImageSequential`: ``'raise'`` or ``'skip'``.
+
+    Convention:
+        - the input is 5-dimensional and the layout is named by ``data_format``, which accepts ``"BTCHW"``
+          (the default) and ``"BCTHW"``, case-insensitively; any other spelling raises ``AssertionError``.
+          The output keeps the input layout.
+        - ``same_on_frame`` is ``True`` by default, so supported Kornia augmentation parameters are shared by every
+          frame of a clip. With ``same_on_frame=False`` each frame draws parameters independently. It does not
+          synchronize randomness inside ordinary ``nn.Module`` children such as ``Dropout``. Nested
+          :class:`ImageSequential` and other ``SequentialBase`` children require ``same_on_frame=False``.
+        - like :class:`~kornia.augmentation.container.ImageSequential`, this container takes image tensors only: it has
+          no ``data_keys`` and no ``.transform_matrix`` attribute. Register a ``VideoSequential`` as a child of
+          :class:`~kornia.augmentation.container.AugmentationSequential` to augment video masks, boxes and keypoints
+          alongside the clip. For video boxes, use ``bbox`` vertices with shape ``(B, T, N, 4, 2)``;
+          coordinate keys ``bbox_xyxy`` and ``bbox_xywh`` do not accept ``(B, T, N, 4)`` tensors.
+
+    See Also:
+        - :class:`~kornia.augmentation.container.ImageSequential`: applies the same kind of sequence to images.
+        - :class:`~kornia.augmentation.container.AugmentationSequential`: transforms a video with aligned annotations.
+
+    Example:
+        If set `same_on_frame` to True, we would expect the same augmentation has been applied to each
+        timeframe.
+
+        >>> import kornia
+        >>> input = torch.randn(2, 3, 1, 5, 6).repeat(1, 1, 4, 1, 1)
+        >>> aug_list = VideoSequential(
+        ...     kornia.augmentation.ColorJiggle(0.1, 0.1, 0.1, 0.1, p=1.0),
+        ...     kornia.color.BgrToRgb(),
+        ...     kornia.augmentation.RandomAffine(360, p=1.0),
+        ...     random_apply=10,
+        ...     data_format="BCTHW",
+        ...     same_on_frame=True)
+        >>> output = aug_list(input)
+        >>> (output[0, :, 0] == output[0, :, 1]).all()
+        tensor(True)
+        >>> (output[0, :, 1] == output[0, :, 2]).all()
+        tensor(True)
+        >>> (output[0, :, 2] == output[0, :, 3]).all()
+        tensor(True)
+
+        If set `same_on_frame` to False:
+
+        >>> aug_list = VideoSequential(
+        ...     kornia.augmentation.ColorJiggle(0.1, 0.1, 0.1, 0.1, p=1.0),
+        ...     kornia.augmentation.RandomAffine(360, p=1.0),
+        ...     kornia.augmentation.RandomMixUpV2(p=1.0),
+        ... data_format="BCTHW",
+        ... same_on_frame=False)
+        >>> output = aug_list(input)
+        >>> output.shape
+        torch.Size([2, 3, 4, 5, 6])
+        >>> (output[0, :, 0] == output[0, :, 1]).all()
+        tensor(False)
+
+        Reproduce with provided params.
+        >>> out2 = aug_list(input, params=aug_list._params)
+        >>> torch.equal(output, out2)
+        True
+
+    Perform ``OneOf`` transformation with ``random_apply=1`` and ``random_apply_weights`` in ``VideoSequential``.
+
+        >>> import kornia
+        >>> input, label = torch.randn(2, 3, 1, 5, 6).repeat(1, 1, 4, 1, 1), torch.tensor([0, 1])
+        >>> aug_list = VideoSequential(
+        ...     kornia.augmentation.ColorJiggle(0.1, 0.1, 0.1, 0.1, p=1.0),
+        ...     kornia.augmentation.RandomAffine(360, p=1.0),
+        ...     kornia.augmentation.RandomMixUpV2(p=1.0),
+        ... data_format="BCTHW",
+        ... same_on_frame=False,
+        ... random_apply=1,
+        ... random_apply_weights=[0.5, 0.3, 0.8]
+        ... )
+        >>> out = aug_list(input)
+        >>> out.shape
+        torch.Size([2, 3, 4, 5, 6])
+
+    """
+
+    # TODO: implement transform_matrix
+
+    def __init__(
+        self,
+        *args: nn.Module,
+        data_format: str = "BTCHW",
+        same_on_frame: bool = True,
+        random_apply: Union[int, bool, Tuple[int, int]] = False,
+        random_apply_weights: Optional[Union[Sequence[float], torch.Tensor]] = None,
+        if_unsupported_ops: str = "raise",
+    ) -> None:
+        super().__init__(
+            *args,
+            same_on_batch=None,
+            keepdim=None,
+            random_apply=random_apply,
+            random_apply_weights=random_apply_weights,
+            if_unsupported_ops=if_unsupported_ops,
+        )
+        self.same_on_frame = same_on_frame
+        self.data_format = data_format.upper()
+        if self.data_format not in ["BCTHW", "BTCHW"]:
+            raise AssertionError(f"Only `BCTHW` and `BTCHW` are supported. Got `{data_format}`.")
+        self._temporal_channel: int
+        if self.data_format == "BCTHW":
+            self._temporal_channel = 2
+        elif self.data_format == "BTCHW":
+            self._temporal_channel = 1
+
+    def __infer_channel_exclusive_batch_shape__(self, batch_shape: torch.Size, chennel_index: int) -> torch.Size:
+        # Fix mypy complains: error: Incompatible return value type (got "Tuple[int, ...]", expected "Size")
+        return cast(torch.Size, batch_shape[:chennel_index] + batch_shape[chennel_index + 1 :])
+
+    def __repeat_param_across_channels__(self, param: torch.Tensor, frame_num: int) -> torch.Tensor:
+        """Repeat parameters across channels.
+
+        The input is shaped as (B, ...), while to output (B * same_on_frame, ...), which
+        to guarantee that the same transformation would happen for each frame.
+
+        (B1, B2, ..., Bn) => (B1, ... B1, B2, ..., B2, ..., Bn, ..., Bn)
+                              | ch_size | | ch_size |  ..., | ch_size |
+        """
+        repeated = param[:, None, ...].repeat(1, frame_num, *([1] * len(param.shape[1:])))
+        return repeated.reshape(-1, *list(param.shape[1:]))
+
+    def __broadcast_param__(
+        self, v: torch.Tensor, batch_shape: torch.Size, frame_num: int, same_on_frame: bool, same_on_batch: bool
+    ) -> torch.Tensor:
+        if not v.numel():
+            return v
+
+        if same_on_frame and same_on_batch:
+            return v.repeat(batch_shape[0] * frame_num, *([1] * (v.ndim - 1)))
+        if same_on_frame:
+            return self.__repeat_param_across_channels__(v, frame_num)
+        if same_on_batch:
+            return v.unsqueeze(1).repeat(1, batch_shape[0], *([1] * (v.ndim - 1))).reshape(-1, *v.shape[1:])
+        return v
+
+    def _broadcast_cutmix_params(self, params: Dict[str, torch.Tensor], frame_num: int) -> None:
+        """Repeat the parameters of :class:`~kornia.augmentation.RandomCutMixV2` over the frames of each video.
+
+        The generator lays its parameters out as ``(num_mix, B, ...)``: the video is axis 1, so the repeat of
+        :meth:`__broadcast_param__` over axis 0 would repeat the mixes instead of the frames. ``mix_pairs`` also
+        holds video indices, which must become indices into the ``B * T`` flattened frames. Frame ``t`` of a video
+        is mixed with frame ``t`` of its partner video, so all frames of a video cut the same box from the same
+        partner.
+
+        Args:
+            params: Parameters drawn for the ``B`` videos; updated in place to cover the ``B * T`` frames.
+            frame_num: Number of frames ``T`` in each video.
+        """
+        for key, value in list(params.items()):
+            if not value.numel():
+                continue
+            if key == "mix_pairs":
+                # (num_mix, B) => (num_mix, B * T), entry [m, b * T + t] = pairs[m, b] * T + t.
+                frames = torch.arange(frame_num, device=value.device, dtype=value.dtype)
+                params[key] = (value[..., None] * frame_num + frames).reshape(value.shape[0], -1)
+            elif key == "crop_src":
+                # (num_mix, B, 4, 2) => (num_mix, B * T, 4, 2)
+                params[key] = value.repeat_interleave(frame_num, dim=1)
+            elif key == "batch_prob":
+                # (B,) => (B * T,)
+                params[key] = self.__repeat_param_across_channels__(value, frame_num)
+            # ``image_shape`` is the (H, W) of every image and ``forward_input_shape`` / ``video_batch_size`` are
+            # metadata: none of them has a per-video axis, so they stay as drawn.
+
+    @staticmethod
+    def _batch_index_param(module: nn.Module) -> Optional[str]:
+        """Name the parameter of a mix augmentation that holds indices into the image batch.
+
+        Along its first axis the parameter has one row per image, and its values index the batch as well. Drawn per
+        video, those values are video indices, which must become indices into the ``B * T`` flattened frames.
+        """
+        if isinstance(module, K.RandomMixUpV2):
+            return "mixup_pairs"
+        if isinstance(module, K.PatchMix):
+            return "mix_pairs"
+        if isinstance(module, K.RandomMosaic):
+            return "permutation"
+        return None
+
+    @staticmethod
+    def _video_to_frame_indices(v: torch.Tensor, frame_num: int) -> torch.Tensor:
+        """Map video indices, already repeated over the frames, to frame ``t`` of each indexed video."""
+        frames = torch.arange(v.shape[0], device=v.device, dtype=v.dtype) % frame_num
+        return v * frame_num + frames.view(-1, *([1] * (v.ndim - 1)))
+
+    @staticmethod
+    def _record_video_batch_size(
+        param: Union[Dict[str, torch.Tensor], List[ParamItem]], original_batch_size: int
+    ) -> None:
+        """Attach the original video batch size to nested replay metadata.
+
+        Args:
+            param: Parameter tree returned by a nested sequential container.
+            original_batch_size: Batch size of the public video before frame flattening.
+        """
+        if isinstance(param, dict):
+            if "forward_input_shape" in param:
+                param["video_batch_size"] = torch.full(
+                    (), original_batch_size, device=param["forward_input_shape"].device, dtype=torch.long
+                )
+            return
+        if isinstance(param, list):
+            for item in param:
+                if isinstance(item, ParamItem) and isinstance(item.data, (dict, list)):
+                    VideoSequential._record_video_batch_size(item.data, original_batch_size)
+
+    def _input_shape_convert_in(self, input: torch.Tensor, frame_num: int) -> torch.Tensor:
+        # Convert any shape to (B, T, C, H, W)
+        if self.data_format == "BCTHW":
+            # Convert (B, C, T, H, W) to (B, T, C, H, W)
+            input = input.transpose(1, 2)
+        if self.data_format == "BTCHW":
+            pass
+
+        return input.reshape(-1, *input.shape[2:])
+
+    def _input_shape_convert_back(self, input: torch.Tensor, frame_num: int) -> torch.Tensor:
+        """Reshape a flattened video tensor back to its original layout.
+
+        Args:
+            input: Flattened tensor with the frame dimension merged into the batch axis.
+            frame_num: Number of frames in each video clip.
+
+        Returns:
+            The tensor reshaped back to the original video layout.
+        """
+        input = input.view(-1, frame_num, *input.shape[1:])
+        if self.data_format == "BCTHW":
+            input = input.transpose(1, 2)
+        if self.data_format == "BTCHW":
+            pass
+
+        return input
+
+    def forward_parameters(self, batch_shape: torch.Size) -> List[ParamItem]:
+        """Generate per-module parameters for video inputs.
+
+        Args:
+            batch_shape: Video batch shape, typically 5D.
+
+        Returns:
+            Parameter list aligned with execution order, with values broadcast
+            across frames depending on ``same_on_frame`` and module settings.
+        """
+        frame_num = batch_shape[self._temporal_channel]
+        original_batch_size = batch_shape[0]
+        named_modules = self.get_forward_sequence()
+        # Got param generation shape to (B, C, H, W). Ignoring T.
+        batch_shape = self.__infer_channel_exclusive_batch_shape__(batch_shape, self._temporal_channel)
+
+        params = []
+        for name, module in named_modules:
+            if isinstance(module, (K.RandomCrop, _AugmentationBase, K.MixAugmentationBaseV2)):
+                batch_index_param = self._batch_index_param(module)
+                is_cutmix = isinstance(module, K.RandomCutMixV2)
+                # A mix pairs the images of a batch with each other, so it needs one draw per video, or per frame with
+                # same_on_frame=False, never a shared one. Its own generator applies same_on_batch.
+                is_same_on_batch = (
+                    getattr(module, "same_on_batch", False) and batch_index_param is None and not is_cutmix
+                )
+
+                if self.same_on_frame and is_same_on_batch:
+                    mod_shape = torch.Size([1, *batch_shape[1:]])
+                elif self.same_on_frame:
+                    mod_shape = batch_shape
+                elif is_same_on_batch:
+                    mod_shape = torch.Size([frame_num, *batch_shape[1:]])
+                else:
+                    mod_shape = torch.Size([batch_shape[0] * frame_num, *batch_shape[1:]])
+
+                mod_param = module.forward_parameters(mod_shape)
+
+                if isinstance(mod_param, dict) and self.same_on_frame and is_cutmix:
+                    self._record_video_batch_size(mod_param, original_batch_size)
+                    self._broadcast_cutmix_params(mod_param, frame_num)
+                elif isinstance(mod_param, dict):
+                    self._record_video_batch_size(mod_param, original_batch_size)
+                    for k, v in list(mod_param.items()):
+                        # TODO: revise ColorJiggle and ColorJitter order param in the future to align the standard.
+                        if k == "order" and isinstance(module, (K.ColorJiggle, K.ColorJitter)):
+                            continue
+                        if k == "video_batch_size":
+                            continue
+                        if k == "forward_input_shape":
+                            mod_param.update({k: v})
+                            continue
+                        mod_param[k] = self.__broadcast_param__(
+                            v, batch_shape, frame_num, self.same_on_frame, is_same_on_batch
+                        )
+                        if self.same_on_frame and k == batch_index_param:
+                            mod_param[k] = self._video_to_frame_indices(mod_param[k], frame_num)
+                elif isinstance(mod_param, list):
+                    self._record_video_batch_size(mod_param, original_batch_size)
+
+                param = ParamItem(name, mod_param)
+
+            elif isinstance(module, (SequentialBase,)):
+                # Frames are flattened to (B * T, ...) before the nested container runs, so it
+                # needs one draw per frame, like the unnested branch above.
+                seq_param = module.forward_parameters(torch.Size([batch_shape[0] * frame_num, *batch_shape[1:]]))
+                self._record_video_batch_size(seq_param, original_batch_size)
+                if self.same_on_frame:
+                    raise ValueError("nn.Sequential is currently unsupported for ``same_on_frame``.")
+                param = ParamItem(name, seq_param)
+
+            else:
+                param = ParamItem(name, None)
+
+            batch_shape = _get_new_batch_shape(param, batch_shape, module)
+            params.append(param)
+
+        return params
+
+    def transform_inputs(
+        self, input: torch.Tensor, params: List[ParamItem], extra_args: Optional[Dict[str, Any]] = None
+    ) -> torch.Tensor:
+        """Apply sequence transforms to video tensors.
+
+        Args:
+            input: Input video tensor.
+            params: Parameters aligned with the execution sequence.
+            extra_args: Optional per-input-type overrides.
+
+        Returns:
+            Transformed video tensor in the original video layout.
+        """
+        frame_num: int = input.size(self._temporal_channel)
+        input = self._input_shape_convert_in(input, frame_num)
+
+        input = super().transform_inputs(input, params, extra_args=extra_args)
+
+        return self._input_shape_convert_back(input, frame_num)
+
+    def inverse_inputs(
+        self, input: torch.Tensor, params: List[ParamItem], extra_args: Optional[Dict[str, Any]] = None
+    ) -> torch.Tensor:
+        """Apply inverse sequence transforms to video tensors.
+
+        Args:
+            input: Augmented video tensor.
+            params: Parameters used during forward execution.
+            extra_args: Optional per-input-type overrides.
+
+        Returns:
+            Inverse-transformed video tensor in the original layout.
+        """
+        frame_num: int = input.size(self._temporal_channel)
+        input = self._input_shape_convert_in(input, frame_num)
+
+        input = super().inverse_inputs(input, params, extra_args=extra_args)
+
+        return self._input_shape_convert_back(input, frame_num)
+
+    def transform_masks(
+        self, input: torch.Tensor, params: List[ParamItem], extra_args: Optional[Dict[str, Any]] = None
+    ) -> torch.Tensor:
+        """Apply sequence transforms to video mask tensors.
+
+        Args:
+            input: Input video mask tensor.
+            params: Parameters aligned with the execution sequence.
+            extra_args: Optional per-input-type overrides.
+
+        Returns:
+            Transformed mask tensor in the original video layout.
+        """
+        frame_num: int = input.size(self._temporal_channel)
+        input = self._input_shape_convert_in(input, frame_num)
+
+        input = super().transform_masks(input, params, extra_args=extra_args)
+
+        return self._input_shape_convert_back(input, frame_num)
+
+    def inverse_masks(
+        self, input: torch.Tensor, params: List[ParamItem], extra_args: Optional[Dict[str, Any]] = None
+    ) -> torch.Tensor:
+        """Apply inverse sequence transforms to video masks.
+
+        Args:
+            input: Augmented video mask tensor.
+            params: Parameters used during forward execution.
+            extra_args: Optional per-input-type overrides.
+
+        Returns:
+            Inverse-transformed mask tensor in the original layout.
+        """
+        frame_num: int = input.size(self._temporal_channel)
+        input = self._input_shape_convert_in(input, frame_num)
+
+        input = super().inverse_masks(input, params, extra_args=extra_args)
+
+        return self._input_shape_convert_back(input, frame_num)
+
+    def transform_boxes(
+        self, input: Union[torch.Tensor, Boxes], params: List[ParamItem], extra_args: Optional[Dict[str, Any]] = None
+    ) -> Union[torch.Tensor, Boxes]:
+        """Transform bounding boxes.
+
+        Args:
+            input: torch.Tensor with shape ``(B, T, N, 4, 2)``.
+                If input is a `Keypoints` type, the internal shape is ``(B * T, N, 4, 2)``.
+            params: params for the sequence.
+            extra_args: Optional dictionary of extra arguments with specific options for different input types.
+        """
+        if isinstance(input, torch.Tensor):
+            batchsize, frame_num = input.size(0), input.size(1)
+            input = Boxes.from_tensor(
+                input.reshape(batchsize * frame_num, input.size(2), input.size(3), input.size(4)), mode="vertices_plus"
+            )
+            input = super().transform_boxes(input, params, extra_args=extra_args)
+            input = input.data.reshape(batchsize, frame_num, input.data.size(1), 4, 2)
+        elif isinstance(input, VideoBoxes):
+            frames = super().transform_boxes(_frame_boxes(input), params, extra_args=extra_args)
+            input = _video_boxes(frames, input.temporal_channel_size)
+        else:
+            input = super().transform_boxes(input, params, extra_args=extra_args)
+        return input
+
+    def inverse_boxes(
+        self, input: Union[torch.Tensor, Boxes], params: List[ParamItem], extra_args: Optional[Dict[str, Any]] = None
+    ) -> Union[torch.Tensor, Boxes]:
+        """Transform bounding boxes.
+
+        Args:
+            input: torch.Tensor with shape ``(B, T, N, 4, 2)``.
+                If input is a `Keypoints` type, the internal shape is ``(B * T, N, 4, 2)``.
+            params: params for the sequence.
+            extra_args: Optional dictionary of extra arguments with specific options for different input types.
+        """
+        if isinstance(input, torch.Tensor):
+            batchsize, frame_num = input.size(0), input.size(1)
+            input = Boxes.from_tensor(
+                input.reshape(batchsize * frame_num, input.size(2), input.size(3), input.size(4)), mode="vertices_plus"
+            )
+            input = super().inverse_boxes(input, params, extra_args=extra_args)
+            input = input.data.reshape(batchsize, frame_num, input.data.size(1), 4, 2)
+        elif isinstance(input, VideoBoxes):
+            frames = super().inverse_boxes(_frame_boxes(input), params, extra_args=extra_args)
+            input = _video_boxes(frames, input.temporal_channel_size)
+        else:
+            input = super().inverse_boxes(input, params, extra_args=extra_args)
+        return input
+
+    def transform_keypoints(
+        self,
+        input: Union[torch.Tensor, Keypoints],
+        params: List[ParamItem],
+        extra_args: Optional[Dict[str, Any]] = None,
+    ) -> Union[torch.Tensor, Keypoints]:
+        """Transform bounding boxes.
+
+        Args:
+            input: torch.Tensor with shape ``(B, T, N, 2)``.
+                If input is a `Keypoints` type, the internal shape is ``(B * T, N, 2)``.
+            params: params for the sequence.
+            extra_args: Optional dictionary of extra arguments with specific options for different input types.
+        """
+        if isinstance(input, torch.Tensor):
+            batchsize, frame_num = input.size(0), input.size(1)
+            input = Keypoints(input.reshape(batchsize * frame_num, input.size(2), input.size(3)))
+            input = super().transform_keypoints(input, params, extra_args=extra_args)
+            input = input.data.reshape(batchsize, frame_num, input.data.size(1), 2)
+        elif isinstance(input, VideoKeypoints):
+            # The children index frames; VideoKeypoints indexes videos (#6375).
+            frames = super().transform_keypoints(_frame_keypoints(input), params, extra_args=extra_args)
+            input = _video_keypoints(frames, input.temporal_channel_size)
+        else:
+            input = super().transform_keypoints(input, params, extra_args=extra_args)
+        return input
+
+    def inverse_keypoints(
+        self,
+        input: Union[torch.Tensor, Keypoints],
+        params: List[ParamItem],
+        extra_args: Optional[Dict[str, Any]] = None,
+    ) -> Union[torch.Tensor, Keypoints]:
+        """Transform bounding boxes.
+
+        Args:
+            input: torch.Tensor with shape ``(B, T, N, 2)``.
+                If input is a `Keypoints` type, the internal shape is ``(B * T, N, 2)``.
+            params: params for the sequence.
+            extra_args: Optional dictionary of extra arguments with specific options for different input types.
+        """
+        if isinstance(input, torch.Tensor):
+            batchsize, frame_num = input.size(0), input.size(1)
+            input = Keypoints(input.reshape(batchsize * frame_num, input.size(2), input.size(3)))
+            input = super().inverse_keypoints(input, params, extra_args=extra_args)
+            input = input.data.reshape(batchsize, frame_num, input.data.size(1), 2)
+        elif isinstance(input, VideoKeypoints):
+            frames = super().inverse_keypoints(_frame_keypoints(input), params, extra_args=extra_args)
+            input = _video_keypoints(frames, input.temporal_channel_size)
+        else:
+            input = super().inverse_keypoints(input, params, extra_args=extra_args)
+        return input
+
+    def inverse(
+        self, input: torch.Tensor, params: Optional[List[ParamItem]] = None, extra_args: Optional[Dict[str, Any]] = None
+    ) -> torch.Tensor:
+        """Inverse transformation.
+
+        Used to inverse a torch.Tensor according to the performed transformation by a forward pass, or with respect to
+        provided parameters.
+        """
+        if params is None:
+            if self._params is not None:
+                params = self._params
+            else:
+                raise RuntimeError("No valid params to inverse the transformation.")
+
+        return self.inverse_inputs(input, params, extra_args=extra_args)
+
+    def forward(
+        self, input: torch.Tensor, params: Optional[List[ParamItem]] = None, extra_args: Optional[Dict[str, Any]] = None
+    ) -> torch.Tensor:
+        """Define the video computation performed."""
+        if len(input.shape) != 5:
+            _raise_input_rank_error(input.shape, "(" + ", ".join(self.data_format) + ")")
+
+        if params is None:
+            self._params = self.forward_parameters(input.shape)
+            params = self._params
+
+        return self.transform_inputs(input, params, extra_args=extra_args)

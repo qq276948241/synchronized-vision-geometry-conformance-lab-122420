@@ -1,0 +1,37 @@
+# To get started with Dependabot version updates, you'll need to specify which
+# package ecosystems to update and where the package manifests are located.
+# Please see the documentation for all configuration options:
+# https://help.github.com/github/administering-a-repository/configuration-options-for-dependency-updates
+
+version: 2
+updates:
+  # Python packages
+  - package-ecosystem: "pip"
+    directory: "/"
+    open-pull-requests-limit: 10
+    # Setting labels replaces Dependabot's defaults, so keep "dependencies".
+    # Dependency bumps are internal: no-changelog satisfies the changelog check.
+    labels:
+      - "dependencies"
+      - "no-changelog"
+    schedule:
+      interval: weekly
+      day: sunday
+
+  # GitHub Actions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    commit-message:
+      prefix: ⬆️
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "github_actions"
+      - "no-changelog"
+    # this will group all dependencies together into single PRs for all github-actions
+    groups:
+      github-actions:
+        patterns:
+          - "*"

@@ -1,0 +1,239 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from __future__ import annotations
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+
+class ConvNormAct(nn.Sequential):
+    """Apply a sequence of Convolution, Normalization, and Activation layers.
+
+    The convolution has no bias and is followed by :class:`nn.BatchNorm2d`. Its padding follows from ``kernel_size``:
+    ``(kernel_size - 1) // 2`` on each side for an odd kernel, and for an even kernel a zero padding with one more
+    pixel at the bottom and right, as in PaddlePaddle.
+
+    Args:
+        in_channels: Number of input channels.
+        out_channels: Number of output channels.
+        kernel_size: Size of the convolution kernel.
+        stride: Stride of the convolution. Default: 1.
+        act: Activation, ``"relu"``, ``"silu"`` or ``"none"`` (identity). Default: ``"relu"``.
+        groups: Number of blocked connections from input to output. Default: 1.
+        conv_naming: Attribute name of the convolution, which sets its parameter names. Default: ``"conv"``.
+        norm_naming: Attribute name of the normalization layer. Default: ``"norm"``.
+        act_naming: Attribute name of the activation. Default: ``"act"``.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int = 1,
+        act: str = "relu",
+        groups: int = 1,
+        conv_naming: str = "conv",
+        norm_naming: str = "norm",
+        act_naming: str = "act",
+    ) -> None:
+        super().__init__()
+        if kernel_size % 2 == 0:
+            # even kernel_size -> asymmetric padding
+            # PPHGNetV2 (for RT-DETR) uses kernel 2
+            # follow TensorFlow/PaddlePaddle: bottom/right side is padded 1 more than top/left
+            # NOTE: this does not account for stride=2
+            p1 = (kernel_size - 1) // 2
+            p2 = kernel_size - 1 - p1
+            self.pad = nn.ZeroPad2d((p1, p2, p1, p2))
+            padding = 0
+        else:
+            padding = (kernel_size - 1) // 2
+        conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, 1, groups, False)
+        norm = nn.BatchNorm2d(out_channels)
+        activation = {"relu": nn.ReLU, "silu": nn.SiLU, "none": nn.Identity}[act](inplace=True)
+
+        self.__setattr__(conv_naming, conv)
+        self.__setattr__(norm_naming, norm)
+        self.__setattr__(act_naming, activation)
+
+
+# Lightly adapted from
+# https://github.com/facebookresearch/MaskFormer/blob/main/mask_former/modeling/transformer/transformer_predictor.py
+class MLP(nn.Module):
+    """Implement a Multi-Layer Perceptron (MLP) for feature projection.
+
+    Args:
+        input_dim: The number of input features.
+        hidden_dim: The number of features in hidden layers.
+        output_dim: The number of output features.
+        num_layers: The total number of layers.
+        sigmoid_output: Whether to apply a sigmoid to the final output. Default: False.
+    """
+
+    def __init__(
+        self, input_dim: int, hidden_dim: int, output_dim: int, num_layers: int, sigmoid_output: bool = False
+    ) -> None:
+        super().__init__()
+        self.num_layers = num_layers
+        h = [hidden_dim] * (num_layers - 1)
+        self.layers = nn.ModuleList(nn.Linear(n, k) for n, k in zip([input_dim, *h], [*h, output_dim]))
+        self.sigmoid_output = sigmoid_output
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the configured MLP to the last tensor dimension.
+
+        Args:
+            x: Input tensor whose last dimension equals ``input_dim``.
+
+        Returns:
+            Tensor with the same leading dimensions as ``x`` and final
+            dimension ``output_dim``. If ``sigmoid_output`` is enabled, the
+            final values are passed through a sigmoid.
+        """
+        for i, layer in enumerate(self.layers):
+            x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
+        if self.sigmoid_output:
+            x = F.sigmoid(x)
+        return x
+
+
+# Adapted from timm
+# https://github.com/huggingface/pytorch-image-models/blob/v0.9.2/timm/layers/drop.py#L137
+class DropPath(nn.Module):
+    """Drop paths (Stochastic Depth) per sample  (when applied in main path of residual blocks)."""
+
+    def __init__(self, drop_prob: float = 0.0, scale_by_keep: bool = True) -> None:
+        super().__init__()
+        self.drop_prob = drop_prob
+        self.scale_by_keep = scale_by_keep
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply stochastic depth to a residual branch.
+
+        Args:
+            x: Residual-branch tensor with arbitrary shape. The first dimension
+                is treated as the batch dimension.
+
+        Returns:
+            Tensor with the same shape as ``x``. During training, complete
+            samples may be dropped and optionally scaled by the keep
+            probability; during evaluation the input is returned unchanged.
+        """
+        if self.drop_prob == 0.0 or not self.training:
+            return x
+        keep_prob = 1 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)  # work with diff dim tensors, not just 2D ConvNets
+        random_tensor = x.new_empty(shape).bernoulli_(keep_prob)
+        if keep_prob > 0.0 and self.scale_by_keep:
+            random_tensor.div_(keep_prob)
+        return x * random_tensor
+
+
+# From https://github.com/facebookresearch/detectron2/blob/main/detectron2/layers/batch_norm.py
+# Itself from https://github.com/facebookresearch/ConvNeXt/blob/d1fa8f6fef0a165b27399986cc2bdacc92777e40/models/convnext.py#L119
+class LayerNorm2d(nn.Module):
+    """Apply Layer Normalization over a 4D input tensor (NCHW).
+
+    A float16 or bfloat16 input is normalised in float32, and the result is cast to the promoted dtype of the input and
+    the weight (a float16 input with float32 weights gives float32). In float16, the squared deviations overflow once a
+    value is more than 255.9 from its channel mean, and the variance becomes ``inf``, which leaves only the bias.
+    MobileSAM's neck reaches about 560, and a float16 variance there gives empty masks.
+    """
+
+    def __init__(self, num_channels: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(num_channels))
+        self.bias = nn.Parameter(torch.zeros(num_channels))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply channel-wise layer normalization to an NCHW tensor.
+
+        Args:
+            x: Tensor with shape ``(B, C, H, W)``, where :math:`B` is batch
+                size, :math:`C` is channel count, :math:`H` is height, and
+                :math:`W` is width.
+
+        Returns:
+            Tensor with the same shape as ``x`` after normalizing across the
+            channel dimension and applying learned affine parameters.
+        """
+        if x.dtype in (torch.float16, torch.bfloat16):
+            out_dtype = torch.promote_types(x.dtype, self.weight.dtype)
+            return self._normalize(x.float(), self.weight.float(), self.bias.float()).to(out_dtype)
+        return self._normalize(x, self.weight, self.bias)
+
+    def _normalize(self, x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+        u = x.mean(1, keepdim=True)
+        s = (x - u).pow(2).mean(1, keepdim=True)
+        x = (x - u) / (s + self.eps).sqrt()
+        return weight[:, None, None] * x + bias[:, None, None]
+
+
+def window_partition(x: torch.Tensor, window_size: int) -> tuple[torch.Tensor, tuple[int, int]]:
+    """Partition into non-overlapping windows with padding if needed.
+
+    Args:
+        x: input tokens with [B, H, W, C].
+        window_size: window size.
+
+    Returns:
+        windows: windows after partition with [B * num_windows, window_size, window_size, C].
+        (Hp, Wp): padded height and width before partition
+
+    """
+    B, H, W, C = x.shape
+
+    pad_h = (window_size - H % window_size) % window_size
+    pad_w = (window_size - W % window_size) % window_size
+    if pad_h > 0 or pad_w > 0:
+        x = F.pad(x, (0, 0, 0, pad_w, 0, pad_h))
+    Hp, Wp = H + pad_h, W + pad_w
+
+    x = x.view(B, Hp // window_size, window_size, Wp // window_size, window_size, C)
+    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().flatten(0, 2)
+    return windows, (Hp, Wp)
+
+
+def window_unpartition(
+    windows: torch.Tensor, window_size: int, pad_hw: tuple[int, int], hw: tuple[int, int]
+) -> torch.Tensor:
+    """Window unpartition into original sequences and removing padding.
+
+    Args:
+        windows: input tokens with [B * num_windows, window_size, window_size, C].
+        window_size: window size.
+        pad_hw: padded height and width (Hp, Wp).
+        hw: original height and width (H, W) before padding.
+
+    Returns:
+        x: unpartitioned sequences with [B, H, W, C].
+
+    """
+    Hp, Wp = pad_hw
+    H, W = hw
+    B = windows.shape[0] // (Hp * Wp // window_size // window_size)
+    C = windows.shape[-1]
+    x = windows.view(B, Hp // window_size, Wp // window_size, window_size, window_size, C)
+    x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, Hp, Wp, C)
+
+    if Hp > H or Wp > W:
+        x = x[:, :H, :W, :].contiguous()
+    return x

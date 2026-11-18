@@ -1,0 +1,92 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from typing import Any, Dict, Optional
+
+import torch
+
+from kornia.augmentation import random_generator as rg
+from kornia.augmentation._2d.intensity.base import IntensityAugmentationBase2D
+from kornia.core.utils import _to_device_nonblocking
+
+
+class RandomChannelShuffle(IntensityAugmentationBase2D):
+    r"""Randomly permute the channels of images, applied per sample with probability ``p`` (default 0.5).
+
+    ``output = RandomChannelShuffle(...)(input)`` reorders the channels of every selected image ``(B, C, H, W)``
+    without changing its values.
+
+    .. image:: _static/img/RandomChannelShuffle.png
+
+    .. note::
+        Unlike torchvision's ``RandomChannelPermutation``, which permutes the channels of every image, this class
+        permutes the channels of each sample with probability ``p``, 0.5 by default; with ``same_on_batch=True`` one
+        draw decides for the whole batch. Pass ``p=1.0`` to permute every sample.
+
+    See the Convention block on :class:`~kornia.augmentation.IntensityAugmentationBase2D`.
+
+    Args:
+        same_on_batch: apply the same transformation across the batch.
+        p: probability of applying the transformation to each sample.
+        keepdim: whether to keep the output shape the same as input ``True`` or broadcast it
+          to the batch form ``False``.
+
+    Convention:
+        - this operation is range-independent: it does not clamp the input into ``[0, 1]``.
+        - the drawn ``channels`` index the source, not the destination: output channel ``c`` of sample
+          ``b`` is input channel ``channels[b][c]``.
+        - the permutation is drawn independently per sample; ``same_on_batch=True`` shares one
+          permutation across the batch.
+        - values are only reordered, never recomputed, so the input's value range is carried through.
+
+    See Also:
+        - :class:`RandomChannelDropout`: replaces channels instead of permuting them.
+
+    Examples:
+        >>> rng = torch.manual_seed(0)
+        >>> img = torch.arange(1*2*2*2.).view(1,2,2,2)
+        >>> RandomChannelShuffle()(img)
+        tensor([[[[4., 5.],
+                  [6., 7.]],
+        <BLANKLINE>
+                 [[0., 1.],
+                  [2., 3.]]]])
+
+    To apply the exact augmenation again, you may take the advantage of the previous parameter state:
+        >>> input = torch.randn(1, 3, 32, 32)
+        >>> aug = RandomChannelShuffle(p=1.)
+        >>> (aug(input) == aug(input, params=aug._params)).all()
+        tensor(True)
+
+    """
+
+    def __init__(self, same_on_batch: bool = False, p: float = 0.5, keepdim: bool = False) -> None:
+        super().__init__(p=p, same_on_batch=same_on_batch, p_batch=1.0, keepdim=keepdim)
+        self._param_generator = rg.ChannelShuffleGenerator()
+
+    def apply_transform(
+        self,
+        input: torch.Tensor,
+        params: Dict[str, torch.Tensor],
+        flags: Dict[str, Any],
+        transform: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        # Gather the per-sample channel permutation in one vectorised advanced-index instead of
+        # a Python loop over the batch (which launched a kernel per sample and blocked
+        # torch.compile). `channels` is (B, C); indexing input[(B,1), (B,C)] gives (B, C, H, W).
+        batch_index = torch.arange(input.shape[0], device=input.device).view(-1, 1)
+        return input[batch_index, _to_device_nonblocking(params["channels"], input.device)]

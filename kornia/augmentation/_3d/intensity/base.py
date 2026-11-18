@@ -1,0 +1,47 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from kornia.augmentation._3d.base import RigidAffineAugmentationBase3D
+
+
+class IntensityAugmentationBase3D(RigidAffineAugmentationBase3D):
+    r"""Build a 3D value augmentation, applied per sample with probability ``p`` (default 0.5).
+
+    ``output = MyAugmentation(...)(input)`` changes voxel values while retaining their coordinates once a
+    subclass implements ``apply_transform`` and ``compute_transformation``. Unlike the 2D intensity base, this
+    base requires the subclass to return an identity ``(B, 4, 4)`` matrix from ``compute_transformation``.
+    Use :class:`GeometricAugmentationBase3D` for an operation that warps the volume.
+
+    See the Convention block on :class:`~kornia.augmentation.AugmentationBase3D`.
+
+    Args:
+        p: probability for applying an augmentation. This param controls the augmentation probabilities
+          element-wise for a batch.
+        p_batch: probability for applying an augmentation to a batch. This param controls the augmentation
+          probabilities batch-wise.
+        same_on_batch: apply the same transformation across the batch.
+        keepdim: whether to keep the output shape the same as input ``True`` or broadcast it to the batch
+          form ``False``.
+
+    Convention:
+        - these augmentations leave voxel coordinates in place: they record an identity ``(B, 4, 4)`` matrix,
+          and a container skips them on its inverse path.
+
+    See Also:
+        - :class:`GeometricAugmentationBase3D`: base class for 3D coordinate transformations.
+
+    """

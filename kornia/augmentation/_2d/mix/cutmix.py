@@ -1,0 +1,197 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+import warnings
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+import torch
+
+from kornia.augmentation import random_generator as rg
+from kornia.augmentation._2d.mix.base import MixAugmentationBaseV2
+from kornia.constants import DataKey, DType
+from kornia.core.utils import _to_device_nonblocking
+from kornia.geometry.bbox import bbox_to_mask, infer_bbox_shape
+
+
+class RandomCutMixV2(MixAugmentationBaseV2):
+    r"""Mix rectangular image regions and labels, applied to a batch with probability ``p`` (default 1.0).
+
+    ``images, labels = RandomCutMixV2(data_keys=["input", "class"])(input, label)`` mixes image patches and
+    returns label pairs with their coefficients. Use :class:`RandomMixUpV2` to blend complete images instead.
+
+    Args:
+        p: probability for applying an augmentation to a batch. This param controls the augmentation
+                   probabilities batch-wisely.
+        num_mix: cut mix times.
+        beta: hyperparameter for generating cut size from beta distribution.
+            Beta cannot be set to 0 after torch 1.8.0. If None, it will be set to 1.
+        cut_size: the ``[min, max]`` clamp, within [0, 1], applied to the Beta-sampled mixing coefficient
+            ``lambda``, not the fraction of the image to cut. The cut side is ``floor(sqrt(1 - lambda) * side)``,
+            so a larger ``cut_size`` gives a *smaller* cut, and a minimum of 1 is rejected because it would cut
+            nothing. If None, it will be set to [0, 1], which means no restriction.
+        same_on_batch: apply the same transformation across the batch.
+            This flag will not maintain permutation order.
+        keepdim: whether to keep the output shape the same as input (True) or broadcast it
+                        to the batch form (False).
+        data_keys: list of keys to apply the mix augmentation to.
+        use_correct_lambda: if True, compute lambda according to the CutMix paper
+            (`lam = 1 - area_ratio`). Defaults to False (`lam = area_ratio`) for backward compatibility,
+            but will raise a deprecation warning when False.
+
+    Inputs:
+        - Input image tensors, shape of ``(B, C, H, W)``.
+        - Raw labels, shape of ``(B)``.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]:
+        - Adjusted image, shape of ``(B, C, H, W)``.
+        - Raw labels, permuted labels and lambdas for each mix, shape ``(num_mix, B, 3)``.
+
+    Convention:
+        - With ``data_keys=["input", "class"]``, the class output is ``(num_mix, B, 3)``. Its last axis holds
+          the original label, the label selected by that mix's permutation, and the area fraction returned as
+          lambda. Labels must be one-dimensional and are returned as floating values in the image dtype, except that
+          a ``float16`` or ``bfloat16`` image yields ``float32`` labels so integer class ids up to
+          ``2 ** 24`` stay exact.
+          ``use_correct_lambda=True`` returns ``1 - cut_area / image_area``;
+          the compatibility default returns ``cut_area / image_area`` and emits a deprecation warning.
+        - ``p`` is a batch-wide gate applied once, unlike the per-sample ``p`` of :class:`RandomJigsaw`:
+          ``_params["batch_prob"]`` is all ones or all zeros,
+          and every row and mix of a selected batch receives a cut, though self-pairing or a zero-sized cut can
+          leave a row unchanged. With ``same_on_batch=False`` each row and mix draws its own cut size and placement;
+          ``same_on_batch=True`` shares each mix's cut size and placement across rows; each mix still draws its own
+          pairing and geometry. At ``p=0`` the image is unchanged and each class row contains the original label twice
+          with lambda zero.
+
+    .. image:: _static/img/RandomCutMixV2.png
+
+    Implementation for `CutMix: Regularization Strategy to Train Strong Classifiers with
+    Localizable Features` :cite:`yun2019cutmix`.
+
+    The implementation referred to the following repository: `https://github.com/clovaai/CutMix-PyTorch
+    <https://github.com/clovaai/CutMix-PyTorch>`_.
+
+    See the Convention block on :class:`~kornia.augmentation.MixAugmentationBaseV2`.
+
+    See Also:
+        - :class:`RandomMixUpV2`: blends complete paired images instead of rectangular patches.
+
+    Examples:
+        >>> rng = torch.manual_seed(3)
+        >>> input = torch.rand(2, 1, 3, 3)
+        >>> input[0] = torch.ones((1, 3, 3))
+        >>> label = torch.tensor([0, 1])
+        >>> cutmix = RandomCutMixV2(data_keys=["input", "class"], use_correct_lambda=True)
+        >>> cutmix(input, label)
+        [tensor([[[[1.0000, 1.0000, 1.0000],
+                  [0.1498, 0.4015, 1.0000],
+                  [0.4594, 0.1756, 1.0000]]],
+        <BLANKLINE>
+        <BLANKLINE>
+                [[[0.8879, 1.0000, 1.0000],
+                  [0.1498, 1.0000, 1.0000],
+                  [0.4594, 0.1756, 0.9492]]]]), tensor([[[0.0000, 1.0000, 0.5556],
+                 [1.0000, 0.0000, 0.5556]]])]
+
+    """
+
+    def __init__(
+        self,
+        num_mix: int = 1,
+        cut_size: Optional[Union[torch.Tensor, Tuple[float, float]]] = None,
+        beta: Optional[Union[torch.Tensor, float]] = None,
+        same_on_batch: bool = False,
+        p: float = 1.0,
+        keepdim: bool = False,
+        data_keys: Optional[List[Union[str, int, DataKey]]] = None,
+        use_correct_lambda: bool = False,
+    ) -> None:
+        super().__init__(p=1.0, p_batch=p, same_on_batch=same_on_batch, keepdim=keepdim, data_keys=data_keys)
+        self._param_generator: rg.CutmixGenerator = rg.CutmixGenerator(cut_size, beta, num_mix, p=1.0)
+
+        self.use_correct_lambda = use_correct_lambda
+        if not self.use_correct_lambda:
+            warnings.warn(
+                "RandomCutMixV2 currently uses the old (inconsistent) lambda computation. "
+                "Set `use_correct_lambda=True` to align with the original CutMix paper. "
+                "This default will change in a future release.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
+    def apply_transform_class(
+        self, input: torch.Tensor, params: Dict[str, torch.Tensor], flags: Dict[str, Any]
+    ) -> torch.Tensor:
+        height, width = params["image_shape"]
+
+        out_labels = []
+        image_dtype = DType.to_torch(int(params["dtype"].item()))
+        calc_dtype = image_dtype if image_dtype in (torch.float32, torch.float64) else torch.float32
+        for pair, crop in zip(params["mix_pairs"], params["crop_src"]):
+            labels_permute = input.index_select(dim=0, index=_to_device_nonblocking(pair, input.device))
+            w, h = infer_bbox_shape(crop)
+
+            lam_val = w.to(calc_dtype) * h.to(calc_dtype) / (width * height)
+            lam = 1 - lam_val if self.use_correct_lambda else lam_val
+
+            out_labels.append(
+                torch.stack(
+                    [
+                        input.to(device=input.device, dtype=calc_dtype),
+                        labels_permute.to(device=input.device, dtype=calc_dtype),
+                        _to_device_nonblocking(lam, input.device, calc_dtype),
+                    ],
+                    1,
+                )
+            )
+
+        return torch.stack(out_labels, 0)
+
+    def apply_non_transform_class(
+        self, input: torch.Tensor, params: Dict[str, torch.Tensor], flags: Optional[Dict[str, Any]] = None
+    ) -> torch.Tensor:
+        out_labels = []
+        image_dtype = DType.to_torch(int(params["dtype"].item()))
+        calc_dtype = image_dtype if image_dtype in (torch.float32, torch.float64) else torch.float32
+        lam = torch.zeros((len(input)), device=input.device, dtype=calc_dtype)
+        for _ in range(self._param_generator.num_mix):
+            out_labels.append(
+                torch.stack(
+                    [
+                        input.to(device=input.device, dtype=calc_dtype),
+                        input.to(device=input.device, dtype=calc_dtype),
+                        lam,
+                    ],
+                    1,
+                )
+            )
+
+        return torch.stack(out_labels, 0)
+
+    def apply_transform(
+        self, input: torch.Tensor, params: Dict[str, torch.Tensor], maybe_flags: Optional[Dict[str, Any]] = None
+    ) -> torch.Tensor:
+        height, width = input.size(2), input.size(3)
+
+        out_inputs = input.clone()
+        for pair, crop in zip(params["mix_pairs"], params["crop_src"]):
+            input_permute = input.index_select(dim=0, index=_to_device_nonblocking(pair, input.device))
+            # compute mask to match input shape
+            mask = bbox_to_mask(crop, size=(height, width)).bool().unsqueeze(dim=1).repeat(1, input.size(1), 1, 1)
+            out_inputs[mask] = input_permute[mask]
+
+        return out_inputs

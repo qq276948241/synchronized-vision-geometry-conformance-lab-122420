@@ -1,0 +1,120 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from __future__ import annotations
+
+from typing import Any, Optional
+
+import torch
+from torch import Tensor
+
+from kornia.augmentation._2d.intensity.base import IntensityAugmentationBase2D
+from kornia.augmentation.utils.helpers import _exact_in_float64, _float_numbers
+from kornia.enhance import normalize
+
+
+class Normalize(IntensityAugmentationBase2D):
+    r"""Normalize image channels with supplied mean and standard deviation.
+
+    ``output = Normalize(mean, std)(input)`` returns ``(input - mean) / std``.
+
+    See the Convention block on :class:`~kornia.augmentation.IntensityAugmentationBase2D`.
+
+    .. math::
+        \text{input[channel] = (input[channel] - mean[channel]) / std[channel]}
+
+    Where `mean` is :math:`(M_1, \ldots, M_n)` and `std` :math:`(S_1, \ldots, S_n)` for `n` channels,
+
+    Args:
+        mean: Mean for each channel.
+        std: Standard deviations for each channel.
+        p: probability of applying the transformation.
+        keepdim: whether to keep the output shape the same as input (True) or broadcast it
+                 to the batch form (False).
+
+    Return:
+        Normalised tensor with same size as input ``(*, C, H, W)``.
+
+    Convention:
+        - this operation is range-independent: it does not clamp the input into ``[0, 1]``.
+        - ``mean`` and ``std`` accept a float, a per-channel sequence or tensor, or a per-sample ``(B, C)``
+          tensor; a length that is neither ``1`` nor the channel count raises.
+        - ``p`` gates the whole batch rather than each sample: the constructor hard-codes ``same_on_batch=True``
+          and takes no ``same_on_batch`` argument.
+        - the statistics live in ``flags`` rather than in a buffer: ``state_dict()`` is empty and
+          ``Module.to(...)`` does not move them; they are cast to the input's device and dtype on each call.
+          A float64 input uses a ``mean`` or ``std`` given as numbers exactly, rather than the float32 rounding
+          held in ``flags``, unless that entry has been changed since construction.
+        - :class:`Denormalize` built with the same ``mean`` and nonzero ``std`` inverts this class, up to
+          floating-point rounding, when both transforms apply and their intermediate values remain finite.
+        - the result is not clamped: moving an image out of ``[0, 1]`` is what this class is for.
+
+    .. note::
+        This function internally uses :func:`kornia.enhance.normalize`.
+
+    See Also:
+        - :class:`Denormalize`: reverses this operation when both use the same statistics and apply.
+        - :class:`RandomAutoContrast`: derives a rescaling from each image rather than supplied statistics.
+
+    Examples:
+        >>> norm = Normalize(mean=torch.zeros(4), std=torch.ones(4))
+        >>> x = torch.rand(1, 4, 3, 3)
+        >>> out = norm(x)
+        >>> out.shape
+        torch.Size([1, 4, 3, 3])
+
+    """
+
+    def __init__(
+        self,
+        mean: Tensor | tuple[float, ...] | list[float] | float,
+        std: Tensor | tuple[float, ...] | list[float] | float,
+        p: float = 1.0,
+        keepdim: bool = False,
+    ) -> None:
+        super().__init__(p=p, same_on_batch=True, keepdim=keepdim)
+        # The numbers themselves, for a float64 image: the flags hold them rounded to float32.
+        self._mean_numbers = _float_numbers(mean)
+        self._std_numbers = _float_numbers(std)
+        if isinstance(mean, (int, float)):
+            mean = torch.tensor([mean])
+
+        if isinstance(std, (int, float)):
+            std = torch.tensor([std])
+
+        if isinstance(mean, (tuple, list)):
+            mean = torch.tensor(mean)
+
+        if isinstance(std, (tuple, list)):
+            std = torch.tensor(std)
+
+        self.flags = {"mean": mean, "std": std}
+
+    def apply_transform(
+        self, input: Tensor, params: dict[str, Tensor], flags: dict[str, Any], transform: Optional[Tensor] = None
+    ) -> Tensor:
+        mean: Tensor = flags["mean"]
+        std: Tensor = flags["std"]
+        if input.dtype == torch.float64:  # the numbers are absent from an older pickle
+            mean = _exact_in_float64(mean, self.__dict__.get("_mean_numbers"), input.device)
+            std = _exact_in_float64(std, self.__dict__.get("_std_numbers"), input.device)
+        if torch.onnx.is_in_onnx_export():
+            if mean.dim() == 1:
+                mean = mean.view(1, -1)
+            if std.dim() == 1:
+                std = std.view(1, -1)
+        return normalize(input, mean, std)

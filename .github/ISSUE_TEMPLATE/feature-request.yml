@@ -1,0 +1,42 @@
+name: 🚀 Feature Request
+description: Suggest an idea or new feature
+title: "[Feature]: "
+labels: ["feature request"]
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion! Please search existing issues first.
+
+        Two notes that may help:
+
+        - If you want to implement the idea, sharing the shape of it here before doing a
+          large amount of work may reveal design or compatibility concerns early.
+        - Kornia currently focuses on hardening its differentiable geometry / CV core rather
+          than growing breadth — new model integrations are mostly frozen. Proposals in the
+          core areas are closest to the current project direction.
+
+  - type: textarea
+    id: what-and-why
+    attributes:
+      label: What, and why?
+      description: What should kornia do, and what problem does it solve for you?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed-solution
+    attributes:
+      label: Sketch of the API or approach (optional)
+      description: If you have an idea how it could look — a function signature, a reference implementation or paper — put it here.
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Anything else?
+      description: Alternatives you considered, use cases, references, mockups.
+    validations:
+      required: false

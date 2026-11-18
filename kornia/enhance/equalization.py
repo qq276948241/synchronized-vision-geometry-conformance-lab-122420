@@ -1,0 +1,611 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+"""In this module several equalization methods are exposed: he, ahe, clahe."""
+
+import math
+from typing import Tuple, Union
+
+import torch
+import torch.nn.functional as F
+
+from kornia.core.check import _check_async
+from kornia.core.utils import _normalize_to_float32_or_float64, _to_device_nonblocking
+from kornia.image.utils import perform_keep_shape_image
+
+from .adjust import _check_floating_image, _level_scale
+from .histogram import histogram
+
+
+def _compute_tiles(
+    imgs: torch.Tensor, grid_size: Tuple[int, int], even_tile_size: bool = False
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Compute tiles on an image according to a grid size.
+
+    Note that padding can be added to the image in order to crop properly the image.
+    So, the grid_size (GH, GW) x tile_size (TH, TW) >= image_size (H, W)
+
+    Args:
+        imgs: batch of 2D images with shape (B, C, H, W) or (C, H, W).
+        grid_size: number of tiles to be cropped in each direction (GH, GW)
+        even_tile_size: Determine if the width and height of the tiles must be even.
+
+    Returns:
+        tensor with tiles (B, GH, GW, C, TH, TW). B = 1 in case of a single image is provided.
+        tensor with the padded batch of 2D imageswith shape (B, C, H', W').
+
+    """
+    batch: torch.Tensor = imgs  # B x C x H x W
+
+    # compute stride and kernel size
+    h, w = batch.shape[-2:]
+    if even_tile_size and (h <= grid_size[0] or w <= grid_size[1]):
+        raise ValueError(
+            "Cannot compute tiles on the image according to the given grid size. "
+            f"Got image size ({h}, {w}) and grid size {tuple(grid_size)}. "
+            f"The smallest image this grid admits is ({grid_size[0] + 1}, {grid_size[1] + 1})."
+        )
+
+    kernel_vert: int = math.ceil(h / grid_size[0])
+    kernel_horz: int = math.ceil(w / grid_size[1])
+
+    if even_tile_size:
+        kernel_vert += 1 if kernel_vert % 2 else 0
+        kernel_horz += 1 if kernel_horz % 2 else 0
+
+    # add padding (with that kernel size we could need some extra cols and rows...)
+    pad_vert = kernel_vert * grid_size[0] - h
+    pad_horz = kernel_horz * grid_size[1] - w
+
+    # add the padding in the last coluns and rows
+    # reflect padding needs the pad strictly below the axis it reflects, so >= is the bound: an
+    # 8 x 8 image on an 8 x 8 grid pads by 8 on an axis of 8 and fails inside F.pad otherwise.
+    if pad_vert >= batch.shape[-2] or pad_horz >= batch.shape[-1]:
+        # An even tile has to cover more than one grid cell, so the axis must exceed the grid;
+        # an odd one only has to exceed half of it.
+        min_vert = grid_size[0] + 1 if even_tile_size else grid_size[0] // 2 + 1
+        min_horz = grid_size[1] + 1 if even_tile_size else grid_size[1] // 2 + 1
+        raise ValueError(
+            "Cannot compute tiles on the image according to the given grid size. "
+            f"Got image size ({h}, {w}) and grid size {tuple(grid_size)}, which needs "
+            f"({pad_vert}, {pad_horz}) of reflect padding, more than the image has to reflect. "
+            f"The smallest image this grid admits is ({min_vert}, {min_horz})."
+        )
+
+    if pad_vert > 0 or pad_horz > 0:
+        batch = F.pad(batch, [0, pad_horz, 0, pad_vert], mode="reflect")  # B x C x H' x W'
+
+    # compute tiles
+    c: int = batch.shape[-3]
+    tiles: torch.Tensor = (
+        batch.unfold(1, c, c)  # unfold(dimension, size, step)
+        .unfold(2, kernel_vert, kernel_vert)
+        .unfold(3, kernel_horz, kernel_horz)
+        .squeeze(1)
+    ).contiguous()  # GH x GW x C x TH x TW
+
+    if tiles.shape[-5] != grid_size[0]:
+        raise AssertionError
+
+    if tiles.shape[-4] != grid_size[1]:
+        raise AssertionError
+
+    return tiles, batch
+
+
+def _compute_interpolation_tiles(padded_imgs: torch.Tensor, tile_size: Tuple[int, int]) -> torch.Tensor:
+    r"""Compute interpolation tiles on a properly padded set of images.
+
+    Note that images must be padded. So, the tile_size (TH, TW) * grid_size (GH, GW) = image_size (H, W)
+
+    Args:
+        padded_imgs: batch of 2D images with shape (B, C, H, W) already padded to extract tiles
+                                    of size (TH, TW).
+        tile_size: shape of the current tiles (TH, TW).
+
+    Returns:
+        tensor with the interpolation tiles (B, 2GH, 2GW, C, TH/2, TW/2).
+
+    """
+    if padded_imgs.dim() != 4:
+        raise AssertionError("Images Tensor must be 4D.")
+
+    if padded_imgs.shape[-2] % tile_size[0] != 0:
+        raise AssertionError("Images are not correctly padded.")
+
+    if padded_imgs.shape[-1] % tile_size[1] != 0:
+        raise AssertionError("Images are not correctly padded.")
+
+    # tiles to be interpolated are built by dividing in 4 each already existing
+    interp_kernel_vert: int = tile_size[0] // 2
+    interp_kernel_horz: int = tile_size[1] // 2
+
+    c: int = padded_imgs.shape[-3]
+    interp_tiles: torch.Tensor = (
+        padded_imgs.unfold(1, c, c)
+        .unfold(2, interp_kernel_vert, interp_kernel_vert)
+        .unfold(3, interp_kernel_horz, interp_kernel_horz)
+        .squeeze(1)
+    ).contiguous()  # 2GH x 2GW x C x TH/2 x TW/2
+
+    if interp_tiles.shape[-3] != c:
+        raise AssertionError
+
+    if interp_tiles.shape[-2] != tile_size[0] / 2:
+        raise AssertionError
+
+    if interp_tiles.shape[-1] != tile_size[1] / 2:
+        raise AssertionError
+
+    return interp_tiles
+
+
+def _tiles_histc(tiles: torch.Tensor, bins: int) -> torch.Tensor:
+    r"""Histogram every tile over ``[0, 1]`` in one pass, on the index its lookup table is read with.
+
+    A value ``x`` is counted in bin ``(x * _level_scale(x.dtype, bins - 1)).long()``, computed in the dtype of
+    ``tiles`` as the tile lookups compute ``(x * _level_scale(x.dtype)).long()``, so every pixel is counted in the
+    entry it reads, as OpenCV counts and reads one 8-bit level; ``torch.histc``'s ``floor(x * bins)`` would put
+    every value in ``[k/256, k/255)`` one bin above that entry. One ``scatter_add_`` counts all
+    tiles, instead of one ``histc`` launch per tile, and keeps a static output shape so the function stays
+    a single dynamo graph. Values outside ``[0, 1]`` and NaN are not counted, which the CPU ``histc`` also
+    skips; they go to one extra overflow column per tile that is dropped.
+
+    Args:
+        tiles: flattened tiles. (T, P)
+        bins: number of bins.
+
+    Returns:
+        Per-tile counts in float32, or float64 for float64 ``tiles``. (T, bins)
+
+    """
+    num_tiles = tiles.shape[0]
+    # The index is computed in the dtype of ``tiles``, as the lookups compute theirs; only the counts are wider.
+    idx = (tiles * _level_scale(tiles.dtype, bins - 1)).long().clamp_(0, bins - 1)
+    x = tiles.to(_normalize_to_float32_or_float64(tiles.dtype))
+    # clamp keeps [0, 1] unchanged and NaN as NaN, so the comparison is False exactly where histc skips.
+    in_range = x.clamp(0, 1) == x
+    # this mask is what drops out-of-range values; without it they land in the first or last bin
+    idx = torch.where(in_range, idx, bins)
+    counts = torch.zeros(num_tiles, bins + 1, dtype=x.dtype, device=x.device)
+    counts.scatter_add_(1, idx, torch.ones_like(x))
+    return counts[:, :bins]
+
+
+def _spread_residual(residual: torch.Tensor, num_bins: int) -> torch.Tensor:
+    r"""Spread the residual of the clipped pixels over the histogram bins the way OpenCV does.
+
+    ``residual`` is the part of the clipped mass of each tile that is left after every bin took the same whole
+    share, so it is below ``num_bins``. OpenCV adds one count to every ``step``-th bin starting at bin 0, with
+    ``step = max(num_bins // residual, 1)``, until the residual is spent. Writing it into the first ``residual``
+    bins instead piles it onto the darkest levels and lifts the whole lookup table, which brightens small tiles
+    by tens of levels.
+
+    Args:
+        residual: residual per tile, shape ``(T,)``, below ``num_bins``.
+        num_bins: number of histogram bins.
+
+    Returns:
+        the counts to add, 0 or 1 per bin, shape :math:`(T, num_bins)` in the dtype of ``residual``.
+
+    """
+    bins: torch.Tensor = torch.arange(num_bins, device=residual.device)
+    step: torch.Tensor = torch.div(num_bins, residual.clamp(min=1), rounding_mode="floor").clamp(min=1).unsqueeze(1)
+    hit: torch.Tensor = (torch.remainder(bins, step) == 0) & (
+        torch.div(bins, step, rounding_mode="floor") < residual.unsqueeze(1)
+    )
+    return hit.to(residual.dtype)
+
+
+def _compute_luts(
+    tiles_x_im: torch.Tensor, num_bins: int = 256, clip: Union[float, torch.Tensor] = 40.0, diff: bool = False
+) -> torch.Tensor:
+    r"""Compute luts for a batched set of tiles.
+
+    Same approach as in OpenCV (https://github.com/opencv/opencv/blob/master/modules/imgproc/src/clahe.cpp)
+
+    Args:
+        tiles_x_im: set of tiles per image to apply the lut. (B, GH, GW, C, TH, TW)
+        num_bins: number of bins. default: 256
+        clip: threshold value for contrast limiting. If it is 0 then the clipping is disabled.
+        diff: denote if the differentiable histagram will be used. Default: False
+
+    Returns:
+        Lut for each tile (B, GH, GW, C, 256).
+
+    """
+    if tiles_x_im.dim() != 6:
+        raise AssertionError("Tensor must be 6D.")
+
+    b, gh, gw, c, th, tw = tiles_x_im.shape
+    pixels: int = th * tw
+    tiles: torch.Tensor = tiles_x_im.view(-1, pixels)  # test with view  # T x (THxTW)
+    if not diff:
+        # Counted, clipped and accumulated in float32 (float64 for float64 tiles); only the finished LUT is cast back.
+        # In float16 the clipped total of a 256 x 256 tile overflows to inf, and bfloat16 rounds counts above 256.
+        histos = _tiles_histc(tiles, num_bins)
+    else:
+        # The centres and bandwidth follow float64 tiles; every other dtype stays float32 because histogram
+        # evaluates half-precision kernels in float32.
+        centre_dtype = torch.promote_types(tiles.dtype, torch.float32)
+        bins: torch.Tensor = torch.linspace(0, 1, num_bins, device=tiles.device, dtype=centre_dtype)
+        # histogram already returns (T, num_bins); squeeze() dropped the tile axis for a single tile
+        histos = histogram(tiles, bins, torch.tensor(0.001, dtype=centre_dtype))
+        histos *= pixels
+
+    if isinstance(clip, torch.Tensor):
+        # Match Python scalar arithmetic before rounding each image's threshold, then broadcast
+        # over its tiles and channels. Keeping the limits in tensors avoids compile guards on draws.
+        # MPS cannot store doubles; compute its thresholds on CPU before copying them with the LUTs. Move first,
+        # then cast: a single clip.to("cpu", torch.float64) from MPS raises on torch 2.5.1 and returns zeros on 2.14.
+        limits = clip.cpu().double() if clip.device.type == "mps" else clip.double()
+        max_vals = (limits * pixels).div(num_bins, rounding_mode="floor").clamp(min=1)
+        max_vals = (
+            _to_device_nonblocking(max_vals, histos.device, histos.dtype)
+            .view(b, 1)
+            .expand(b, gh * gw * c)
+            .reshape(-1, 1)
+        )
+        limited = histos.clamp(max=max_vals)
+        clipped_tensor = torch.relu(histos - max_vals).sum(1) if diff else pixels - limited.sum(1)
+        residual_tensor = torch.remainder(clipped_tensor, num_bins)
+        limited = limited + ((clipped_tensor - residual_tensor) / num_bins).unsqueeze(1)
+        limited = limited + _spread_residual(residual_tensor, num_bins)
+        enabled = _to_device_nonblocking(clip > 0, histos.device).view(b, 1).expand(b, gh * gw * c).reshape(-1, 1)
+        histos = torch.where(enabled, limited, histos)
+    elif clip > 0.0:
+        max_val: float = max(clip * pixels // num_bins, 1)
+        if diff:
+            clipped: torch.Tensor = torch.relu(histos - max_val).sum(1)
+        histos.clamp_(max=max_val)
+        if not diff:
+            clipped = pixels - histos.sum(1)
+        residual: torch.Tensor = torch.remainder(clipped, num_bins)
+        redist: torch.Tensor = (clipped - residual).div(num_bins)
+        histos += redist[None].transpose(0, 1)
+        histos += _spread_residual(residual, num_bins)
+
+    lut_scale: float = (num_bins - 1) / pixels
+    luts: torch.Tensor = torch.cumsum(histos, 1) * lut_scale
+    luts = luts.clamp(0, num_bins - 1)
+    if not diff:
+        # match OpenCV's round-to-nearest LUT quantization; the integers 0..255 are exact in every float dtype
+        luts = luts.round().to(tiles_x_im.dtype)
+    return luts.view((b, gh, gw, c, num_bins))
+
+
+def _map_luts(interp_tiles: torch.Tensor, luts: torch.Tensor) -> torch.Tensor:
+    r"""Assign the required luts to each tile.
+
+    Args:
+        interp_tiles: set of interpolation tiles. (B, 2GH, 2GW, C, TH/2, TW/2)
+        luts: luts for each one of the original tiles. (B, GH, GW, C, 256)
+
+    Returns:
+         mapped luts (B, 2GH, 2GW, 4, C, 256)
+
+    """
+    if interp_tiles.dim() != 6:
+        raise AssertionError("interp_tiles tensor must be 6D.")
+
+    if luts.dim() != 5:
+        raise AssertionError("luts tensor must be 5D.")
+
+    # gh, gw -> 2x the number of tiles used to compute the histograms
+    # th, tw -> /2 the sizes of the tiles used to compute the histograms
+    num_imgs, gh, gw, c, _, _ = interp_tiles.shape
+
+    # precompute idxs for non corner regions (doing it in cpu seems slightly faster)
+    j_idxs = torch.empty(0, 4, dtype=torch.long)
+    if gh > 2:
+        j_floor = torch.arange(1, gh - 1).view(gh - 2, 1).div(2, rounding_mode="trunc")
+        j_idxs = torch.tensor([[0, 0, 1, 1], [-1, -1, 0, 0]] * ((gh - 2) // 2))  # reminder + j_idxs[:, 0:2] -= 1
+        j_idxs += j_floor
+
+    i_idxs = torch.empty(0, 4, dtype=torch.long)
+    if gw > 2:
+        i_floor = torch.arange(1, gw - 1).view(gw - 2, 1).div(2, rounding_mode="trunc")
+        i_idxs = torch.tensor([[0, 1, 0, 1], [-1, 0, -1, 0]] * ((gw - 2) // 2))  # reminder + i_idxs[:, [0, 2]] -= 1
+        i_idxs += i_floor
+
+    # The index tensors are built on the CPU; indexing CUDA LUTs with them would copy them with a blocking transfer.
+    j_idxs = _to_device_nonblocking(j_idxs, luts.device)
+    i_idxs = _to_device_nonblocking(i_idxs, luts.device)
+
+    # selection of luts to interpolate each patch
+    # create a tensor with dims: interp_patches height and width x 4 x num channels x bins in the histograms
+    # the tensor is init to -1 to denote non init hists
+    luts_x_interp_tiles: torch.Tensor = torch.full(  # B x GH x GW x 4 x C x 256
+        (num_imgs, gh, gw, 4, c, luts.shape[-1]), -1, dtype=interp_tiles.dtype, device=interp_tiles.device
+    )
+    # corner regions
+    luts_x_interp_tiles[:, 0 :: gh - 1, 0 :: gw - 1, 0] = luts[:, 0 :: max(gh // 2 - 1, 1), 0 :: max(gw // 2 - 1, 1)]
+    # border region (h)
+    luts_x_interp_tiles[:, 1:-1, 0 :: gw - 1, 0] = luts[:, j_idxs[:, 0], 0 :: max(gw // 2 - 1, 1)]
+    luts_x_interp_tiles[:, 1:-1, 0 :: gw - 1, 1] = luts[:, j_idxs[:, 2], 0 :: max(gw // 2 - 1, 1)]
+    # border region (w)
+    luts_x_interp_tiles[:, 0 :: gh - 1, 1:-1, 0] = luts[:, 0 :: max(gh // 2 - 1, 1), i_idxs[:, 0]]
+    luts_x_interp_tiles[:, 0 :: gh - 1, 1:-1, 1] = luts[:, 0 :: max(gh // 2 - 1, 1), i_idxs[:, 1]]
+    # internal region
+    luts_x_interp_tiles[:, 1:-1, 1:-1, :] = luts[
+        :, j_idxs.repeat(max(gw - 2, 1), 1, 1).permute(1, 0, 2), i_idxs.repeat(max(gh - 2, 1), 1, 1)
+    ]
+
+    return luts_x_interp_tiles
+
+
+def _compute_equalized_tiles(interp_tiles: torch.Tensor, luts: torch.Tensor) -> torch.Tensor:
+    r"""Equalize the tiles.
+
+    Args:
+        interp_tiles: set of interpolation tiles, values must be in the range [0, 1].
+          (B, 2GH, 2GW, C, TH/2, TW/2)
+        luts: luts for each one of the original tiles. (B, GH, GW, C, 256)
+
+    Returns:
+        equalized tiles (B, 2GH, 2GW, C, TH/2, TW/2)
+
+    """
+    if interp_tiles.dim() != 6:
+        raise AssertionError("interp_tiles tensor must be 6D.")
+
+    if luts.dim() != 5:
+        raise AssertionError("luts tensor must be 5D.")
+
+    mapped_luts: torch.Tensor = _map_luts(interp_tiles, luts)  # Bx2GHx2GWx4xCx256
+
+    # gh, gw -> 2x the number of tiles used to compute the histograms
+    # th, tw -> /2 the sizes of the tiles used to compute the histograms
+    num_imgs, gh, gw, c, th, tw = interp_tiles.shape
+
+    # equalize tiles
+    # The 8-bit level each pixel reads; ``_level_scale`` keeps ``k / 255`` rounded a unit low at level ``k``.
+    # B x GH x GW x 4 x C x (THxTW)
+    flatten_interp_tiles: torch.Tensor = (interp_tiles * _level_scale(interp_tiles.dtype)).long().flatten(-2, -1)
+    flatten_interp_tiles = flatten_interp_tiles.unsqueeze(-3).expand(num_imgs, gh, gw, 4, c, th * tw)
+    preinterp_tiles_equalized = (
+        torch.gather(mapped_luts, 5, flatten_interp_tiles)  # B x GH x GW x 4 x C x TH x TW
+        .to(interp_tiles)
+        .reshape(num_imgs, gh, gw, 4, c, th, tw)
+    )
+
+    # interp tiles
+    tiles_equalized: torch.Tensor = torch.zeros_like(interp_tiles)
+
+    # compute the interpolation weights (shapes are 2 x TH x TW because they must be applied to 2 interp tiles)
+    # A tile's centre is at (tile_size - 1) / 2 relative to its first pixel. Each half-tile pair
+    # starts half a pixel past a centre, so the left/top weight is 1 - (k + 0.5) / tile_size.
+    # This keeps the 1 / tile_size step and, unlike OpenCV's half-pixel-later phase, preserves flip symmetry.
+    ih = (
+        torch.arange(2 * th, 0, -1, dtype=interp_tiles.dtype, device=interp_tiles.device)
+        .sub(0.5)
+        .div(2.0 * th)[None]
+        .transpose(-2, -1)
+        .expand(2 * th, tw)
+    )
+    ih = ih.unfold(0, th, th).unfold(1, tw, tw)  # 2 x 1 x TH x TW
+    iw = (
+        torch.arange(2 * tw, 0, -1, dtype=interp_tiles.dtype, device=interp_tiles.device)
+        .sub(0.5)
+        .div(2.0 * tw)
+        .expand(th, 2 * tw)
+    )
+    iw = iw.unfold(0, th, th).unfold(1, tw, tw)  # 1 x 2 x TH x TW
+
+    # compute row and column interpolation weights
+    tiw = iw.expand((gw - 2) // 2, 2, th, tw).reshape(gw - 2, 1, th, tw).unsqueeze(0)  # 1 x GW-2 x 1 x TH x TW
+    tih = ih.repeat((gh - 2) // 2, 1, 1, 1).unsqueeze(1)  # GH-2 x 1 x 1 x TH x TW
+
+    # internal regions
+    tl, tr, bl, br = preinterp_tiles_equalized[:, 1:-1, 1:-1].unbind(3)
+    t = torch.addcmul(tr, tiw, torch.sub(tl, tr))
+    b = torch.addcmul(br, tiw, torch.sub(bl, br))
+    tiles_equalized[:, 1:-1, 1:-1] = torch.addcmul(b, tih, torch.sub(t, b))
+
+    # corner regions
+    tiles_equalized[:, 0 :: gh - 1, 0 :: gw - 1] = preinterp_tiles_equalized[:, 0 :: gh - 1, 0 :: gw - 1, 0]
+
+    # border region (h)
+    t, b, _, _ = preinterp_tiles_equalized[:, 1:-1, 0].unbind(2)
+    tiles_equalized[:, 1:-1, 0] = torch.addcmul(b, tih.squeeze(1), torch.sub(t, b))
+    t, b, _, _ = preinterp_tiles_equalized[:, 1:-1, gw - 1].unbind(2)
+    tiles_equalized[:, 1:-1, gw - 1] = torch.addcmul(b, tih.squeeze(1), torch.sub(t, b))
+
+    # border region (w)
+    left, right, _, _ = preinterp_tiles_equalized[:, 0, 1:-1].unbind(2)
+    tiles_equalized[:, 0, 1:-1] = torch.addcmul(right, tiw, torch.sub(left, right))
+    left, right, _, _ = preinterp_tiles_equalized[:, gh - 1, 1:-1].unbind(2)
+    tiles_equalized[:, gh - 1, 1:-1] = torch.addcmul(right, tiw, torch.sub(left, right))
+
+    # same type as the input
+    return tiles_equalized.div(255.0)
+
+
+def _equalize_clahe_odd_tiles(imgs: torch.Tensor, luts: torch.Tensor, tile_size: Tuple[int, int]) -> torch.Tensor:
+    """Equalize odd-sized CLAHE tiles by interpolating LUTs at tile centres."""
+    batch_size, channels, height, width = imgs.shape
+    grid_h, grid_w = luts.shape[1:3]
+    tile_h, tile_w = tile_size
+
+    coord_dtype = torch.float64 if imgs.dtype == torch.float64 else torch.float32
+    y = (torch.arange(height, device=imgs.device, dtype=coord_dtype) - (tile_h - 1) / 2) / tile_h
+    x = (torch.arange(width, device=imgs.device, dtype=coord_dtype) - (tile_w - 1) / 2) / tile_w
+
+    y_floor = y.floor()
+    x_floor = x.floor()
+    y0 = y_floor.long().clamp(0, grid_h - 1)
+    y1 = (y_floor.long() + 1).clamp(0, grid_h - 1)
+    x0 = x_floor.long().clamp(0, grid_w - 1)
+    x1 = (x_floor.long() + 1).clamp(0, grid_w - 1)
+
+    wy = (y - y_floor).clamp(0, 1)
+    wx = (x - x_floor).clamp(0, 1)
+    wy = torch.where((y < 0) | (y > grid_h - 1), 0, wy).to(imgs.dtype)
+    wx = torch.where((x < 0) | (x > grid_w - 1), 0, wx).to(imgs.dtype)
+
+    luts = luts.to(imgs.dtype)
+    pixel_bins = (imgs * _level_scale(imgs.dtype)).long()
+    batch_idx = torch.arange(batch_size, device=imgs.device).view(batch_size, 1, 1, 1)
+    channel_idx = torch.arange(channels, device=imgs.device).view(1, channels, 1, 1)
+    rows0, rows1 = y0.view(1, 1, height, 1), y1.view(1, 1, height, 1)
+    cols0, cols1 = x0.view(1, 1, 1, width), x1.view(1, 1, 1, width)
+
+    top_left = luts[batch_idx, rows0, cols0, channel_idx, pixel_bins]
+    top_right = luts[batch_idx, rows0, cols1, channel_idx, pixel_bins]
+    bottom_left = luts[batch_idx, rows1, cols0, channel_idx, pixel_bins]
+    bottom_right = luts[batch_idx, rows1, cols1, channel_idx, pixel_bins]
+
+    wy = wy.view(1, 1, height, 1)
+    wx = wx.view(1, 1, 1, width)
+
+    top = top_right + (top_left - top_right) * (1 - wx)
+    bottom = bottom_right + (bottom_left - bottom_right) * (1 - wx)
+    return (top + (bottom - top) * wy) / 255.0
+
+
+@perform_keep_shape_image
+def equalize_clahe(
+    input: torch.Tensor,
+    clip_limit: float = 40.0,
+    grid_size: Tuple[int, int] = (8, 8),
+    slow_and_differentiable: bool = False,
+) -> torch.Tensor:
+    """Equalize an image tile by tile with a clipped histogram (CLAHE).
+
+    ``out = equalize_clahe(input, clip_limit, grid_size)`` equalizes each channel of an image in :math:`[0, 1]` in every
+    tile of a ``grid_size`` grid and blends the tiles' lookup tables where they meet. Clipping the histogram at
+    ``clip_limit`` limits the local contrast gain.
+
+    .. image:: _static/img/equalize_clahe.png
+
+    Convention:
+        - The tiles are ``ceil(H / grid_size[0])`` by ``ceil(W / grid_size[1])`` pixels, and an axis the grid does not
+          divide is reflect-padded at its end. OpenCV uses the same tiles when the grid divides both axes or neither;
+          when it divides one, OpenCV also pads that axis by one pixel per tile and Kornia does not.
+        - Lookup tables are blended with weights anchored at each tile's centre, ``(p + 0.5) / tile_size - 0.5`` for
+          pixel ``p``, which keeps flip symmetry on unpadded grids. This is half a pixel from the phase of OpenCV and
+          scikit-image, a blending-weight difference of at most ``0.5 / tile_size`` per axis, so the output differs
+          from ``cv2.createCLAHE`` even for the same lookup tables. The output is not rounded to 8-bit levels.
+        - The default path rounds the lookup tables to nearest like OpenCV; ``slow_and_differentiable=True`` does not.
+
+    Args:
+        input: image with values in :math:`[0, 1]` and shape ``(*, C, H, W)``.
+        clip_limit: caps each bin at ``max(clip_limit * tile_pixels // 256, 1)`` counts and spreads the excess over all
+            bins. ``0.0`` disables clipping. A ``float``; an ``int`` raises ``TypeError``.
+        grid_size: number of tiles ``(GH, GW)`` along H and W, a tuple of ``int``. Each image axis must be larger than
+            its grid size; the ``ValueError`` otherwise names the smallest image the grid admits.
+        slow_and_differentiable: count with a soft histogram, so gradients reach ``input``; the default path has none.
+            It is slower and, without the lookup-table rounding, its values differ from the default path's.
+
+    Returns:
+        Equalized image with the shape of ``input``.
+
+    .. note::
+       An integer or boolean image raises :exc:`~kornia.core.exceptions.TypeCheckError` (a :exc:`TypeError`), and values
+       whose level before truncation lies outside ``(-1, 256)`` raise a ``RuntimeError`` naming the range, as for
+       :func:`equalize`. That function also describes the 8-bit level the lookup reads and when the range error
+       surfaces on CUDA and MPS.
+
+    See Also:
+        - :func:`equalize`: equalizes the whole channel with one histogram.
+        - :class:`~kornia.augmentation.RandomClahe`: applies it with random parameters per image.
+
+    Examples:
+        >>> img = torch.rand(1, 10, 20)
+        >>> res = equalize_clahe(img)
+        >>> res.shape
+        torch.Size([1, 10, 20])
+
+        >>> img = torch.rand(2, 3, 10, 20)
+        >>> res = equalize_clahe(img)
+        >>> res.shape
+        torch.Size([2, 3, 10, 20])
+
+    """
+    _check_floating_image(input, "equalize_clahe")
+    if not isinstance(clip_limit, float):
+        raise TypeError(f"Input clip_limit type is not float. Got {type(clip_limit)}")
+
+    return _equalize_clahe(input, clip_limit, grid_size, slow_and_differentiable)
+
+
+def _equalize_clahe(
+    input: torch.Tensor,
+    clip_limit: Union[float, torch.Tensor],
+    grid_size: Tuple[int, int],
+    slow_and_differentiable: bool,
+) -> torch.Tensor:
+    """Equalize a BCHW tensor using a scalar or one tensor clip limit per image."""
+    if not isinstance(grid_size, tuple):
+        raise TypeError(f"Input grid_size type is not Tuple. Got {type(grid_size)}")
+
+    if len(grid_size) != 2:
+        raise TypeError(f"Input grid_size is not a Tuple with 2 elements. Got {len(grid_size)}")
+
+    if isinstance(grid_size[0], float) or isinstance(grid_size[1], float):
+        raise TypeError("Input grid_size type is not valid, must be a Tuple[int, int].")
+
+    if grid_size[0] <= 0 or grid_size[1] <= 0:
+        raise ValueError(f"Input grid_size elements must be positive. Got {grid_size}")
+
+    # The tile LUTs are gathered below with ``(x * _level_scale(x.dtype)).long()``, which is in bounds
+    # only while that product is in (-1, 256). Check that domain without ``.item()``, so there is no
+    # device sync and fullgraph still compiles; on MPS before torch 2.13 it costs one host sync instead
+    # (see ``_check_async``). Inputs the lookup can index are unchanged. The check keeps the index in
+    # bounds, so it runs with checks disabled too: a compiled CPU gather out of range terminates the process.
+    levels = input * _level_scale(input.dtype)
+    _check_async(
+        ((levels > -1.0) & (levels < 256.0)).all(),
+        "equalize_clahe expects input values in [0, 1]. Scale the image into that range first, "
+        "for example image / 255.0 for 8-bit data.",
+        guard=True,
+    )
+
+    imgs: torch.Tensor = input  # B x C x H x W
+
+    height, width = imgs.shape[-2:]
+    grid_h, grid_w = grid_size
+    if height <= grid_h or width <= grid_w:
+        raise ValueError(
+            "Cannot compute tiles on the image according to the given grid size. "
+            f"Got image size ({height}, {width}) and grid size {tuple(grid_size)}. "
+            f"The smallest image this grid admits is ({grid_h + 1}, {grid_w + 1})."
+        )
+
+    natural_tile_h = -(-height // grid_h)
+    natural_tile_w = -(-width // grid_w)
+    use_odd_tiles = natural_tile_h % 2 == 1 or natural_tile_w % 2 == 1
+
+    hist_tiles, img_padded = _compute_tiles(imgs, grid_size, not use_odd_tiles)
+    tile_size: Tuple[int, int] = (hist_tiles.shape[-2], hist_tiles.shape[-1])
+    luts: torch.Tensor = _compute_luts(hist_tiles, clip=clip_limit, diff=slow_and_differentiable)
+
+    if use_odd_tiles:
+        eq_imgs = _equalize_clahe_odd_tiles(img_padded, luts, tile_size)
+    else:
+        interp_tiles = _compute_interpolation_tiles(img_padded, tile_size)
+        equalized_tiles = _compute_equalized_tiles(interp_tiles, luts)
+        eq_imgs = equalized_tiles.permute(0, 3, 1, 4, 2, 5).reshape_as(img_padded)
+
+    h, w = imgs.shape[-2:]
+    eq_imgs = eq_imgs[..., :h, :w]
+
+    # remove batch if the input was not in batch form
+    if input.dim() != eq_imgs.dim():
+        eq_imgs = eq_imgs.squeeze(0)
+
+    return eq_imgs

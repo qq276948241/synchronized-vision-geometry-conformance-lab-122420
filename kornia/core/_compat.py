@@ -1,0 +1,380 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+
+import sys
+import warnings
+from functools import wraps
+from inspect import isclass, isfunction
+from typing import Any, Callable, Optional, Tuple, cast
+
+import torch
+import torch.nn.functional as F
+
+
+def torch_version() -> str:
+    """Parse the PyTorch version string and remove build metadata.
+
+    Extracts the clean version number from `torch.__version__` by removing any
+    build suffixes like "+cu118" (CUDA builds) or "+cpu" (CPU builds).
+
+    Returns:
+        The clean version string (e.g., "2.0.1" from "2.0.1+cu118").
+    """
+    return torch.__version__.partition("+")[0]
+
+
+def _parse_torch_version(v: str) -> Tuple[int, int, int]:
+    """Parse ``torch.__version__`` into a ``(major, minor, patch)`` int tuple.
+
+    Build metadata (``+cu118``) and any pre-release/dev suffix on a component
+    (``2.4.0rc1``) are dropped, so the result orders identically to the release
+    versions Kornia compares against. Computed once at import time so the
+    ``torch_version_*`` comparators never run a string method — those are the
+    calls ``torch.compile``'s dynamo tracer cannot lower, and reaching them on a
+    hot path (e.g. ``is_autocast_enabled`` in the augmentation base) breaks the
+    whole graph.
+    """
+    base = v.partition("+")[0]
+    parts = base.split(".")
+    nums = []
+    for part in parts[:3]:
+        digits = ""
+        for ch in part:
+            if not ch.isdigit():
+                break
+            digits += ch
+        nums.append(int(digits) if digits else 0)
+    while len(nums) < 3:
+        nums.append(0)
+    return (nums[0], nums[1], nums[2])
+
+
+# Parsed once at import: subsequent comparisons are pure integer-tuple compares,
+# which dynamo constant-folds cleanly (unlike ``partition``/``packaging.version``).
+_TORCH_VERSION: Tuple[int, int, int] = _parse_torch_version(torch.__version__)
+
+
+def torch_version_lt(major: int, minor: int, patch: int) -> bool:
+    """Check if the current PyTorch version is less than the specified version.
+
+    Args:
+        major: Major version number (e.g., 2 for version 2.x.x).
+        minor: Minor version number (e.g., 0 for version x.0.x).
+        patch: Patch version number (e.g., 1 for version x.x.1).
+
+    Returns:
+        True if the current PyTorch version is strictly less than the specified version,
+        False otherwise.
+
+    """
+    return _TORCH_VERSION < (major, minor, patch)
+
+
+def torch_version_le(major: int, minor: int, patch: int) -> bool:
+    """Check if the current PyTorch version is less than or equal to the specified version.
+
+    Args:
+        major: Major version number (e.g., 2 for version 2.x.x).
+        minor: Minor version number (e.g., 0 for version x.0.x).
+        patch: Patch version number (e.g., 1 for version x.x.1).
+
+    Returns:
+        True if the current PyTorch version is less than or equal to the specified version,
+        False otherwise.
+
+    """
+    return _TORCH_VERSION <= (major, minor, patch)
+
+
+def torch_version_ge(major: int, minor: int, patch: Optional[int] = None) -> bool:
+    """Check if the current PyTorch version is greater than or equal to the specified version.
+
+    This function is useful for implementing version-specific behavior or compatibility checks.
+    When `patch` is None, only major and minor versions are compared.
+
+    Args:
+        major: Major version number (e.g., 2 for version 2.x.x).
+        minor: Minor version number (e.g., 0 for version x.0.x).
+        patch: Optional patch version number (e.g., 1 for version x.x.1).
+            If None, only major.minor version is compared.
+
+    Returns:
+        True if the current PyTorch version is greater than or equal to the specified version,
+        False otherwise.
+
+    Example:
+        >>> torch_version_ge(2, 0, 0)  # True if PyTorch >= 2.0.0
+        True
+        >>> torch_version_ge(2, 4)  # True if PyTorch >= 2.4.0 (any patch)
+        True
+        >>> torch_version_ge(3, 0, 0)  # True if PyTorch >= 3.0.0
+        False
+    """
+    if patch is None:
+        return _TORCH_VERSION[:2] >= (major, minor)
+    return _TORCH_VERSION >= (major, minor, patch)
+
+
+# The fused CPU SDPA kernel of torch 2.5.1 on Windows returns NaNs or wrong finite values for valid 4-D float64
+# inputs, depending on size and host (#5992). The fault was seen on windows-2022 only; 2.6.0 (one job) and 2.9.1 are
+# clean there, and so is 2.15.0 on windows-latest. No PyTorch issue or fixing commit was found, and 2.5.1 gets no
+# backport. Cost, on this path only: the math kernel is 2-4x slower and took 279 MiB against 13 MiB at 6 heads x
+# 1370 tokens (Linux, torch 2.5.1). Remove when the torch floor reaches 2.6, after the checks in #6614.
+_SDPA_FLOAT64_CPU_KERNEL_IS_FAULTY: bool = sys.platform == "win32" and torch_version_lt(2, 6, 0)
+
+
+def scaled_dot_product_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: Optional[torch.Tensor] = None,
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+    scale: Optional[float] = None,
+    kernel_is_faulty: bool = _SDPA_FLOAT64_CPU_KERNEL_IS_FAULTY,
+) -> torch.Tensor:
+    """Compute scaled dot-product attention around the faulty float64 kernel of torch 2.5 on Windows.
+
+    Takes the arguments of :func:`torch.nn.functional.scaled_dot_product_attention` and returns its result. Kornia calls
+    this instead of the torch function, which ``tests/core/test_compat.py`` enforces. On Windows with torch older than
+    2.6, a 4-D float64 query on the CPU would select a fused kernel that returns NaNs or wrong finite values, so it gets
+    a singleton leading dimension: that kernel accepts only 4-D inputs, so torch takes its math implementation, without
+    a process-wide backend flag or a context manager, which torch 2.5 cannot compile. The mask broadcasts as before.
+    Every other input goes straight to the torch function.
+
+    Args:
+        query: Query tensor with shape ``(..., N_q, D)``.
+        key: Key tensor with shape ``(..., N_k, D)``.
+        value: Value tensor with shape ``(..., N_k, D_v)``.
+        attn_mask: Optional mask broadcastable to ``(..., N_q, N_k)``.
+        dropout_p: Dropout probability of the attention weights.
+        is_causal: Whether to apply a causal mask, in which case ``attn_mask`` must be ``None``.
+        scale: Scale of the scores, ``1 / sqrt(D)`` if ``None``.
+        kernel_is_faulty: Whether this platform has the faulty kernel. A default argument and not a global read, because
+            TorchScript cannot read a Python global. Leave the default.
+
+    Returns:
+        Attention output with shape ``(..., N_q, D_v)``.
+
+    See Also:
+        :func:`torch.nn.functional.scaled_dot_product_attention`: the function this calls, for the full contract.
+    """
+    if kernel_is_faulty and query.ndim == 4 and query.dtype == torch.float64 and query.device.type == "cpu":
+        return F.scaled_dot_product_attention(
+            query.unsqueeze(0),
+            key.unsqueeze(0),
+            value.unsqueeze(0),
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+            is_causal=is_causal,
+            scale=scale,
+        ).squeeze(0)
+    return F.scaled_dot_product_attention(
+        query, key, value, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale
+    )
+
+
+def _emit_deprecation_warning(
+    name: str, replace_with: Optional[str], version: Optional[str], extra_reason: Optional[str], stacklevel: int = 3
+) -> None:
+    """Emit a deprecation warning with the given parameters.
+
+    ``extra_reason`` is joined to the sentence with exactly one space, whatever whitespace it starts or ends with.
+    ``stacklevel`` counts from this function, so the default 3 names the line that called its caller.
+
+    Nothing is emitted while ``torch.compile`` or ``torch.export`` captures a graph: dynamo cannot trace
+    ``warnings.warn``, so warning there would break ``fullgraph=True`` for any code that calls a deprecated name.
+    Eager calls still warn on every call.
+    """
+    # ``torch.compiler.is_compiling`` rather than ``kornia.core.utils.is_compiling``: kornia.core.check imports this
+    # module, and kornia.core.utils imports kornia.core.check. Every supported torch has the public helper.
+    if torch.compiler.is_compiling():
+        return
+    beginning = f"Since kornia {version} the " if version is not None else ""
+    extra_reason = extra_reason.strip() if extra_reason else ""
+    extra = f" {extra_reason}" if extra_reason else ""
+
+    if replace_with is not None:
+        msg = f"{beginning}`{name}` is deprecated in favor of `{replace_with}`.{extra}"
+    else:
+        msg = f"{beginning}`{name}` is deprecated and will be removed in the future versions.{extra}"
+    warnings.warn(
+        msg,
+        category=DeprecationWarning,
+        stacklevel=stacklevel,
+    )
+
+
+def _bind_init(raw_init: Any, instance: Any) -> Any:
+    """Bind a class's stored ``__init__`` to ``instance`` the way ``type.__call__`` does.
+
+    ``type.__call__`` binds the attribute through the descriptor protocol against the instance's type, so a
+    ``staticmethod`` gets no instance, a ``classmethod`` gets the class being instantiated and a callable without
+    ``__get__`` is called as stored.
+    """
+    get = getattr(type(raw_init), "__get__", None)
+    return raw_init if get is None else get(raw_init, instance, type(instance))
+
+
+def deprecated(
+    replace_with: Optional[str] = None, version: Optional[str] = None, extra_reason: Optional[str] = None
+) -> Any:
+    """Mark functions or classes as deprecated with a warning.
+
+    This decorator emits a :class:`DeprecationWarning` when the decorated function is called or the decorated class is
+    instantiated. It provides information about when the deprecation was introduced and what should be used instead.
+
+    Args:
+        replace_with: The name of the replacement function/class that should be used instead.
+            If provided, the warning message will suggest using this replacement.
+        version: The kornia version when the deprecation was introduced (e.g., "0.8.3").
+            If provided, the warning message will include "Since kornia {version}".
+        extra_reason: Additional context or reason for the deprecation. This will be appended
+            to the warning message after a single space; leading and trailing whitespace is ignored.
+
+    Returns:
+        A decorator that wraps the function, or the ``__init__`` of the class, with deprecation warnings. A decorated
+        class stays the same class, so ``isinstance``, subclassing, class attributes and classmethods keep working. A
+        subclass whose ``__init__`` reaches the decorated class's warns as well, naming the decorated class.
+
+    Note:
+        The class is modified in place and returned, so ``Old = deprecated(...)(New)`` deprecates ``New`` itself; to
+        deprecate a separate name, decorate a subclass of ``New``.
+
+        The warning points at the line that calls the class; for a subclass, at its ``super().__init__()`` line. It
+        points one frame short when a Python frame, such as a generic alias call (``Old[int](...)``) or a Python
+        metaclass ``__call__``, sits between the caller and the class.
+
+        A subclass whose ``__init__`` does not call ``super().__init__()`` does not warn, and neither does a class
+        whose metaclass skips ``__init__``: calling an ``Enum`` or looking up a member never warns. A decorated
+        memberless ``Enum`` base warns once for each member a subclass defines, when the subclass is created.
+
+        For an ordinary class (no ``__new__`` of its own, no Python metaclass ``__call__``), ``inspect.signature``
+        is unchanged if the decorated class has an ``__init__`` of its own, and is
+        ``(*args: Any, **kwargs: Any) -> None`` if it has none, because under multiple inheritance another
+        ``__init__`` may run; a subclass of a builtin such as ``dict``, ``int``, ``str`` or ``Exception``, for which
+        ``inspect`` finds no signature, reports the same instead of raising ``ValueError``.
+
+        Put ``@deprecated`` above ``@dataclass`` and any other decorator that generates ``__init__``. In the other
+        order the dataclass keeps the decorator's ``__init__`` (``slots=True`` copies it into the new class), so the
+        class raises ``TypeError`` when called with arguments and no field is ever set; a field with a plain default
+        can still be read from the class, except with ``slots=True``.
+
+    Example:
+        Basic usage without replacement:
+        ```python
+        @deprecated(version="0.8.3")
+        def old_function():
+            pass
+        ```
+
+        With replacement suggestion:
+        ```python
+        @deprecated(replace_with="new_function", version="0.8.3")
+        def old_function():
+            pass
+        ```
+
+        With additional context:
+        ```python
+        @deprecated(
+            replace_with="new_function",
+            version="0.8.3",
+            extra_reason="The old implementation has performance issues."
+        )
+        def old_function():
+            pass
+        ```
+
+        Works with classes too:
+        ```python
+        @deprecated(replace_with="NewClass", version="0.8.3")
+        class OldClass:
+            pass
+        ```
+    """
+
+    def _deprecated(func: Callable[..., Any]) -> Any:
+        # Get the name - use __name__ for both functions and classes
+        name = getattr(func, "__name__", "unknown")
+
+        if isclass(func):
+            # Keep the class itself (so isinstance, subclassing, class attributes and classmethods keep working) and
+            # warn from its ``__init__``, which ``type.__call__`` runs on every instantiation but which copy and
+            # pickle do not run.
+            cls = cast("type[Any]", func)
+            orig_init = cls.__init__
+            has_own_init = "__init__" in cls.__dict__
+            # ``orig_init`` went through descriptor lookup on ``cls``; call the stored attribute bound to the instance
+            # instead, so a ``staticmethod`` or ``classmethod`` ``__init__`` gets the arguments it gets undecorated.
+            raw_init = next(k.__dict__["__init__"] for k in cls.__mro__ if "__init__" in k.__dict__)
+
+            def class_init(self: Any, *args: Any, **kwargs: Any) -> None:
+                _emit_deprecation_warning(name, replace_with, version, extra_reason)
+                if has_own_init:
+                    _bind_init(raw_init, self)(*args, **kwargs)
+                    return
+                # No ``__init__`` of its own: continue with the next one along the instance's MRO, as
+                # ``super(owner, self).__init__`` does, because under multiple inheritance that is not necessarily
+                # the one ``cls`` inherits. ``owner`` is the class that carries this wrapper, found by identity
+                # because a decorator above ``@deprecated`` may have re-created the class.
+                mro = type(self).__mro__
+                position = next((i for i, k in enumerate(mro) if k.__dict__.get("__init__") is class_init), None)
+                if position is None and cls in mro:
+                    # Something replaced the wrapper in the class dict after the decoration (a second decoration, or
+                    # a decorator above this one that wraps ``__init__``) and still calls it.
+                    position = mro.index(cls)
+                if position is None:  # called on an object that is not an instance of ``cls``
+                    _bind_init(raw_init, self)(*args, **kwargs)
+                    return
+                next_class = next(k for k in mro[position + 1 :] if "__init__" in k.__dict__)
+                if next_class is not object:
+                    super(mro[position], self).__init__(*args, **kwargs)
+                # ``object.__init__`` rejects any argument once ``__init__`` is replaced, and ``object.__new__`` no
+                # longer does. Reproduce what the undecorated class does: reject arguments unless the class
+                # customises ``__new__`` (``tuple`` subclasses and the like).
+                elif (args or kwargs) and type(self).__new__ is object.__new__:
+                    raise TypeError(f"{type(self).__name__}() takes no arguments")
+
+            if has_own_init:
+                # Copies the name, module and docstring of the original ``__init__``; ``__wrapped__`` points at it,
+                # which is the ``__init__`` that runs for the class and for every subclass that inherits it.
+                wraps(orig_init)(class_init)
+            else:
+                # Named like the ``__init__`` the class had before, but with no ``__wrapped__`` for ``inspect`` to
+                # follow: which ``__init__`` runs depends on the MRO of the instance.
+                class_init.__name__ = "__init__"
+                class_init.__doc__ = orig_init.__doc__
+                if isfunction(orig_init):
+                    class_init.__module__ = orig_init.__module__
+                    class_init.__qualname__ = orig_init.__qualname__
+                else:  # a C-level ``__init__`` such as ``object.__init__``
+                    class_init.__module__ = cls.__module__
+                    class_init.__qualname__ = f"{cls.__qualname__}.__init__"
+            cls.__init__ = class_init
+            return cls
+
+        # For functions, use @wraps normally
+        @wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            _emit_deprecation_warning(name, replace_with, version, extra_reason)
+            return func(*args, **kwargs)
+
+        return wrapper
+
+    return _deprecated

@@ -1,0 +1,85 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from typing import Union
+
+import torch
+
+
+class AverageMeter:
+    """Keep the running average of a metric over batches.
+
+    ``stats = AverageMeter()`` starts empty; ``stats.update(val, n)`` adds a value that stands for ``n`` samples, and
+    ``stats.avg`` returns their ``n``-weighted mean as a Python float.
+
+    Convention:
+        - ``update(val, n)`` adds ``val * n`` to ``sum`` and ``n`` to ``count``, so ``avg`` is the mean over
+          samples when every ``val`` is a batch mean and ``n`` its batch size. ``val`` keeps the last value passed,
+          unweighted.
+        - Values are not rescaled: :func:`~kornia.metrics.accuracy` percentages average to a percentage. A tensor
+          ``val`` keeps ``sum`` a tensor that holds its autograd graph; pass a detached tensor or a Python number to
+          avoid keeping it.
+        - Float16 and bfloat16 values are weighted and accumulated in float32. Later updates can promote the
+          accumulator to a wider dtype; ``val`` always retains the original value and dtype.
+
+    See Also:
+        - :func:`~kornia.metrics.accuracy`: a batch metric to feed it, as a percentage.
+
+    Example:
+        >>> stats = AverageMeter()
+        >>> acc1 = torch.tensor(99.0)  # top-1 accuracy of a batch in percent, as in K.metrics.accuracy(...)[0]
+        >>> stats.update(acc1, n=1)  # where n is batch size usually
+        >>> round(stats.avg, 2)
+        99.0
+
+    """
+
+    val: Union[float, bool, torch.Tensor]
+    _avg: Union[float, torch.Tensor]
+    sum: Union[float, torch.Tensor]
+    count: int
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        """Reset the current value, accumulated sum, count, and average."""
+        self.val = 0
+        self._avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val: Union[float, bool, torch.Tensor], n: int = 1) -> None:
+        """Add a new value to the running average.
+
+        Args:
+            val: New scalar value or scalar tensor to accumulate.
+            n: Weight for ``val``. This is usually the batch size represented
+                by the value.
+        """
+        self.val = val
+        value = val.float() if isinstance(val, torch.Tensor) and val.dtype in (torch.float16, torch.bfloat16) else val
+        self.sum = self.sum + value * n
+        self.count += n
+        self._avg = self.sum / self.count
+
+    @property
+    def avg(self) -> float:
+        """Return the accumulated average as a Python float."""
+        if isinstance(self._avg, torch.Tensor):
+            return float(self._avg.item())
+        return self._avg

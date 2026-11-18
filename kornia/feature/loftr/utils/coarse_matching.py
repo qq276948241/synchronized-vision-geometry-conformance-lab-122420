@@ -1,0 +1,365 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from typing import Any, Dict, Optional, Union
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+INF = 1e9
+
+
+def _masked_similarity(dtype: torch.dtype) -> float:
+    """Similarity given to masked pairs: ``-INF``, or the lowest finite value of ``dtype`` when ``INF`` overflows it.
+
+    float16 holds at most 65504. The value stays finite, so a row or column that is masked entirely still gets a
+    uniform softmax, where ``-inf`` would give ``-inf - (-inf) = nan``.
+    """
+    return -min(INF, torch.finfo(dtype).max)
+
+
+def mask_border(m: torch.Tensor, b: int, v: Union[torch.Tensor, float, bool]) -> None:
+    """Mask borders with value.
+
+    Args:
+        m (torch.Tensor): [N, H0, W0, H1, W1]
+        b (int): border size.
+        v (m.dtype): border value.
+    """
+    if b <= 0:
+        return
+
+    m[:, :b] = v
+    m[:, :, :b] = v
+    m[:, :, :, :b] = v
+    m[:, :, :, :, :b] = v
+    m[:, -b:] = v
+    m[:, :, -b:] = v
+    m[:, :, :, -b:] = v
+    m[:, :, :, :, -b:] = v
+
+
+def mask_border_with_padding(
+    m: torch.Tensor, bd: int, v: Union[torch.Tensor, float, bool], p_m0: torch.Tensor, p_m1: torch.Tensor
+) -> None:
+    """Apply masking to a padded boarder."""
+    if bd <= 0:
+        return
+
+    m[:, :bd] = v
+    m[:, :, :bd] = v
+    m[:, :, :, :bd] = v
+    m[:, :, :, :, :bd] = v
+
+    h0s, w0s = p_m0.sum(1).max(-1)[0].int(), p_m0.sum(-1).max(-1)[0].int()
+    h1s, w1s = p_m1.sum(1).max(-1)[0].int(), p_m1.sum(-1).max(-1)[0].int()
+    for b_idx, (h0, w0, h1, w1) in enumerate(zip(h0s, w0s, h1s, w1s)):
+        m[b_idx, h0 - bd :] = v
+        m[b_idx, :, w0 - bd :] = v
+        m[b_idx, :, :, h1 - bd :] = v
+        m[b_idx, :, :, :, w1 - bd :] = v
+
+
+def _off_border(n: int, h: int, w: int, b: int, device: torch.device, pad_mask: Optional[torch.Tensor]) -> torch.Tensor:
+    """``(n, h * w)`` cells that :func:`mask_border` (or, with ``pad_mask``, :func:`mask_border_with_padding`) keeps."""
+    rows = torch.arange(h, device=device)[None, :, None]
+    cols = torch.arange(w, device=device)[None, None, :]
+    if pad_mask is None:
+        h_end = torch.full((n, 1, 1), h, device=device)
+        w_end = torch.full((n, 1, 1), w, device=device)
+    else:
+        # the valid extent of each sample, read from its padding mask as mask_border_with_padding does
+        h_end = pad_mask.sum(1).max(-1)[0].int().view(n, 1, 1)
+        w_end = pad_mask.sum(-1).max(-1)[0].int().view(n, 1, 1)
+    keep = (rows >= b) & (cols >= b) & (rows < h_end - b) & (cols < w_end - b) if b > 0 else rows >= 0
+    return keep.expand(n, h, w).reshape(n, h * w)
+
+
+def compute_max_candidates(p_m0: torch.Tensor, p_m1: torch.Tensor) -> torch.Tensor:
+    """Compute the max candidates of all pairs within a batch.
+
+    Args:
+        p_m0: padded mask 0
+        p_m1: padded mask 1
+
+    """
+    h0s, w0s = p_m0.sum(1).max(-1)[0], p_m0.sum(-1).max(-1)[0]
+    h1s, w1s = p_m1.sum(1).max(-1)[0], p_m1.sum(-1).max(-1)[0]
+    return torch.sum(torch.min(torch.stack([h0s * w0s, h1s * w1s], -1), -1)[0])
+
+
+class CoarseMatching(nn.Module):
+    """Perform coarse-level matching between two sets of feature maps.
+
+    This module calculates the confidence matrix and produces coarse matches
+    using an optimal transport layer or a dual-softmax operator.
+
+    Args:
+        config: A dictionary containing configuration parameters for the matching.
+    """
+
+    def __init__(self, config: Dict[str, Any]) -> None:
+        super().__init__()
+        self.config = config
+        # general config
+        self.thr = config["thr"]
+        self.border_rm = config["border_rm"]
+        # -- # for training fine-level LoFTR
+        self.train_coarse_percent = config["train_coarse_percent"]
+        self.train_pad_num_gt_min = config["train_pad_num_gt_min"]
+
+        # we provide 2 options for differentiable matching
+        self.match_type = config["match_type"]
+        if self.match_type == "dual_softmax":
+            self.temperature = config["dsmax_temperature"]
+        elif self.match_type == "sinkhorn":
+            try:
+                from .superglue import log_optimal_transport
+            except ImportError:
+                raise ImportError("download superglue.py first!") from None
+            self.log_optimal_transport = log_optimal_transport
+            self.bin_score = nn.Parameter(torch.tensor(config["skh_init_bin_score"], requires_grad=True))
+            self.skh_iters = config["skh_iters"]
+            self.skh_prefilter = config["skh_prefilter"]
+        else:
+            raise NotImplementedError
+
+    def forward(
+        self,
+        feat_c0: torch.Tensor,
+        feat_c1: torch.Tensor,
+        data: Dict[str, torch.Tensor],
+        mask_c0: Optional[torch.Tensor] = None,
+        mask_c1: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Run forward.
+
+        Args:
+            feat_c0 (torch.Tensor): [N, L, C]
+            feat_c1 (torch.Tensor): [N, S, C]
+            data (dict)
+            mask_c0 (torch.Tensor): [N, L] (optional)
+            mask_c1 (torch.Tensor): [N, S] (optional)
+        Update:
+            data (dict): {
+                'b_ids' (torch.Tensor): [M'],
+                'i_ids' (torch.Tensor): [M'],
+                'j_ids' (torch.Tensor): [M'],
+                'gt_mask' (torch.Tensor): [M'],
+                'mkpts0_c' (torch.Tensor): [M, 2],
+                'mkpts1_c' (torch.Tensor): [M, 2],
+                'mconf' (torch.Tensor): [M]}
+            NOTE: M' != M during training.
+
+        """
+        _, L, S, _ = feat_c0.size(0), feat_c0.size(1), feat_c1.size(1), feat_c0.size(2)
+
+        # F.normalize
+        feat_c0, feat_c1 = (feat / feat.shape[-1] ** 0.5 for feat in [feat_c0, feat_c1])
+
+        # Each coarse mask is independently optional; an absent mask means all cells are valid.
+        invalid = None
+        if mask_c0 is not None:
+            invalid = ~mask_c0.bool()[..., None]
+        if mask_c1 is not None:
+            invalid_c1 = ~mask_c1.bool()[:, None]
+            invalid = invalid_c1 if invalid is None else invalid | invalid_c1
+
+        if self.match_type == "dual_softmax":
+            # Scale after contraction: scaling an operand can overflow float16, including when autocast converts
+            # float32 features for the einsum. In-place division avoids another similarity-sized allocation.
+            sim_matrix = torch.einsum("nlc,nsc->nls", feat_c0, feat_c1).div_(self.temperature)
+            if invalid is not None:
+                sim_matrix.masked_fill_(invalid, _masked_similarity(sim_matrix.dtype))
+            if sim_matrix.dtype == torch.float16:
+                # Native softmax normalizes without returning the column sum in float16, where long columns can
+                # overflow. Check the similarity dtype as autocast can produce float16 from float32 features.
+                conf_matrix = F.softmax(sim_matrix, 1) * F.softmax(sim_matrix, 2)
+            else:
+                # softmax(dim=1) as exp(sim - column max) / column sum: PyTorch's dim-1 softmax kernel is several
+                # times slower on (L, S) similarity matrices than these contiguous passes.
+                conf_matrix = F.softmax(sim_matrix, 2)
+                if sim_matrix.requires_grad:
+                    col_exp = torch.exp(sim_matrix - sim_matrix.amax(dim=1, keepdim=True))
+                    conf_matrix = col_exp / col_exp.sum(dim=1, keepdim=True) * conf_matrix
+                else:
+                    # Without autograd, in place: two (L, S) matrices alive instead of four, which also keeps the
+                    # CUDA caching allocator from re-reserving them for every new pair of image sizes.
+                    col_exp = sim_matrix.sub_(sim_matrix.amax(dim=1, keepdim=True)).exp_()
+                    conf_matrix.mul_(col_exp.div_(col_exp.sum(dim=1, keepdim=True)))
+            # Fully masked rows/columns can still receive softmax mass; masked cells are never valid matches.
+            if invalid is not None:
+                conf_matrix.masked_fill_(invalid, 0.0)
+
+        elif self.match_type == "sinkhorn":
+            # sinkhorn, dustbin included
+            sim_matrix = torch.einsum("nlc,nsc->nls", feat_c0, feat_c1)
+            if invalid is not None:
+                sim_matrix[:, :L, :S].masked_fill_(invalid, _masked_similarity(sim_matrix.dtype))
+
+            # build uniform prior & use sinkhorn
+            log_assign_matrix = self.log_optimal_transport(sim_matrix, self.bin_score, self.skh_iters)
+            assign_matrix = log_assign_matrix.exp()
+            conf_matrix = assign_matrix[:, :-1, :-1]
+
+            # filter prediction with dustbin score (only in evaluation mode)
+            if not self.training and self.skh_prefilter:
+                filter0 = (assign_matrix.max(dim=2)[1] == S)[:, :-1]  # [N, L]
+                filter1 = (assign_matrix.max(dim=1)[1] == L)[:, :-1]  # [N, S]
+                conf_matrix[filter0[..., None].repeat(1, 1, S)] = 0
+                conf_matrix[filter1[:, None].repeat(1, L, 1)] = 0
+
+            if self.config["sparse_spvs"]:
+                data.update({"conf_matrix_with_bin": assign_matrix.clone()})
+
+            if invalid is not None:
+                # A transport solver may assign a tiny probability to an invalid cell despite its finite logit. Out of
+                # place: `conf_matrix` is a view of the `exp` output, which autograd saves for the backward pass.
+                conf_matrix = conf_matrix.masked_fill(invalid, 0.0)
+
+        data.update({"conf_matrix": conf_matrix})
+
+        # predict coarse matches from conf_matrix
+        data.update(**self.get_coarse_match(conf_matrix, data))
+
+    @torch.no_grad()
+    def get_coarse_match(self, conf_matrix: torch.Tensor, data: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Get corase matching.
+
+        Args:
+            conf_matrix (torch.Tensor): [N, L, S]
+            data (dict): with keys ['hw0_c', 'hw1_c', 'stride_c'], ``stride_c`` being the pixel stride of the coarse
+                feature maps (8 by default)
+
+        Returns:
+            coarse_matches (dict): {
+                'b_ids' (torch.Tensor): [M'],
+                'i_ids' (torch.Tensor): [M'],
+                'j_ids' (torch.Tensor): [M'],
+                'gt_mask' (torch.Tensor): [M'],
+                'm_bids' (torch.Tensor): [M],
+                'mkpts0_c' (torch.Tensor): [M, 2],
+                'mkpts1_c' (torch.Tensor): [M, 2],
+                'mconf' (torch.Tensor): [M]}
+
+        """
+        axes_lengths = {
+            "h0c": data["hw0_c"][0],
+            "w0c": data["hw0_c"][1],
+            "h1c": data["hw1_c"][0],
+            "w1c": data["hw1_c"][1],
+        }
+        _device = conf_matrix.device
+        # A cell i of image 0 and the first column j of its row maximum are a match when the confidence exceeds the
+        # threshold (a zero confidence never does, even for a negative `thr`: `mconf == 0` marks the training
+        # ground-truth pads below and is dropped from the keypoints, but not from `b_ids`), both cells are off the
+        # border, and the confidence is also the maximum of column j (mutual nearest neighbour). This is the first
+        # column satisfying all four conditions unless the row maximum is tied exactly, without materialising
+        # (N, L, S) boolean masks.
+        N = conf_matrix.shape[0]
+        mconf_rows, all_j_ids = conf_matrix.max(dim=2)
+        col_max = conf_matrix.amax(dim=1)
+        # mask_border_with_padding (both padding masks) when the data carries mask0, mask_border otherwise
+        pad0, pad1 = (data["mask0"], data["mask1"]) if "mask0" in data else (None, None)
+        border0 = _off_border(N, axes_lengths["h0c"], axes_lengths["w0c"], self.border_rm, _device, pad0)
+        border1 = _off_border(N, axes_lengths["h1c"], axes_lengths["w1c"], self.border_rm, _device, pad1)
+        mask_v = (
+            (mconf_rows > max(self.thr, 0.0))
+            & (torch.gather(col_max, 1, all_j_ids) == mconf_rows)
+            & border0
+            & torch.gather(border1, 1, all_j_ids)
+        )
+        b_ids, i_ids = torch.where(mask_v)
+        j_ids = all_j_ids[b_ids, i_ids]
+        mconf = mconf_rows[b_ids, i_ids]
+
+        # 4. Random sampling of training samples for fine-level LoFTR
+        # (optional) F.pad samples with gt coarse-level matches
+        if self.training:
+            # NOTE:
+            # The sampling is performed across all pairs in a batch without manually balancing
+            # #samples for fine-level increases w.r.t. batch_size
+            if "mask0" not in data:
+                num_candidates_max = conf_matrix.size(0) * max(conf_matrix.size(1), conf_matrix.size(2))
+            else:
+                num_candidates_max = compute_max_candidates(data["mask0"], data["mask1"])
+            num_matches_train = num_candidates_max * self.train_coarse_percent
+            num_matches_train = int(num_matches_train)
+            num_matches_pred = len(b_ids)
+            if self.train_pad_num_gt_min >= num_matches_train:
+                msg = "min-num-gt-F.pad should be less than num-train-matches"
+                raise ValueError(msg)
+
+            # pred_indices is to select from prediction
+            if num_matches_pred <= num_matches_train - self.train_pad_num_gt_min:
+                pred_indices = torch.arange(num_matches_pred, device=_device)
+            else:
+                pred_indices = torch.randint(
+                    num_matches_pred, (num_matches_train - self.train_pad_num_gt_min,), device=_device
+                )
+
+            # gt_pad_indices is to select from gt padding. e.g. max(3787-4800, 200)
+            gt_pad_indices = torch.randint(
+                len(data["spv_b_ids"]),
+                (max(num_matches_train - num_matches_pred, self.train_pad_num_gt_min),),
+                device=_device,
+            )
+            # set conf of gt paddings to all zero, in mconf's own dtype -- mconf can be
+            # float16/bfloat16 under autocast, and defaulting this to float32 would
+            # silently upcast the padded mconf below via torch.cat's type promotion.
+            mconf_gt = torch.zeros(len(data["spv_b_ids"]), device=_device, dtype=mconf.dtype)
+
+            b_ids, i_ids, j_ids, mconf = (
+                torch.cat([x[pred_indices], y[gt_pad_indices]], dim=0)
+                for x, y in zip(
+                    [b_ids, i_ids, j_ids, mconf],
+                    [data["spv_b_ids"], data["spv_i_ids"], data["spv_j_ids"], mconf_gt],
+                )
+            )
+
+        # These matches select patches that feed into fine-level network
+        coarse_matches = {"b_ids": b_ids, "i_ids": i_ids, "j_ids": j_ids}
+
+        # 4. Update with matches in original image resolution: coarse cell (x, y) of either image sits on pixel
+        # (stride_c * x, stride_c * y) for any image size. The keypoints are built in at least float32 before any
+        # scaling: bfloat16 holds no odd integer above 256 and float16 none above 2048.
+        coord_dtype = torch.promote_types(conf_matrix.dtype, torch.float32)
+        scale = data["stride_c"]
+        scale0 = scale * data["scale0"][b_ids].to(coord_dtype) if "scale0" in data else scale
+        scale1 = scale * data["scale1"][b_ids].to(coord_dtype) if "scale1" in data else scale
+        mkpts0_c = torch.stack([i_ids % data["hw0_c"][1], i_ids // data["hw0_c"][1]], dim=1).to(coord_dtype) * scale0
+        mkpts1_c = torch.stack([j_ids % data["hw1_c"][1], j_ids // data["hw1_c"][1]], dim=1).to(coord_dtype) * scale1
+
+        # These matches is the current prediction (for visualization). Only training pads with ground-truth matches,
+        # which have mconf == 0; otherwise every match scored above max(thr, 0) and a filter would keep them all, at the
+        # cost of reading the device. Training filters with one read, then gathers.
+        predicted = [b_ids, mkpts0_c, mkpts1_c, mconf]
+        if self.training:
+            keep = torch.nonzero(mconf != 0).squeeze(-1)
+            predicted = [t[keep] for t in predicted]
+        coarse_matches.update(
+            {
+                "gt_mask": mconf == 0,
+                "m_bids": predicted[0],  # mconf == 0 => gt matches
+                "mkpts0_c": predicted[1],
+                "mkpts1_c": predicted[2],
+                "mconf": predicted[3],
+            }
+        )
+
+        return coarse_matches

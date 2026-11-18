@@ -1,0 +1,92 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from typing import Any, Dict, Optional
+
+import torch
+
+from kornia.augmentation import random_generator as rg
+from kornia.augmentation._2d.intensity.base import IntensityAugmentationBase2D
+from kornia.core.utils import _to_device_nonblocking
+
+
+class RandomGaussianNoise(IntensityAugmentationBase2D):
+    r"""Add sampled Gaussian noise without clipping the result, per sample with probability ``p`` (default 0.5).
+
+    ``output = RandomGaussianNoise(mean, std)(input)`` adds a sampled noise field to each selected image; with
+    ``same_on_batch=True``, the field is shared across the batch.
+
+    .. image:: _static/img/RandomGaussianNoise.png
+
+    .. note::
+        Unlike torchvision's ``GaussianNoise``, which adds noise to every image, this class adds noise to each sample
+        with probability ``p``, 0.5 by default; with ``same_on_batch=True`` one draw decides for the whole batch. Pass
+        ``p=1.0`` to add noise to every sample.
+
+    See the Convention block on :class:`~kornia.augmentation.IntensityAugmentationBase2D`.
+
+    Args:
+        mean: The mean of the gaussian distribution.
+        std: The standard deviation of the gaussian distribution.
+        same_on_batch: apply the same transformation across the batch.
+        p: probability of applying the transformation to each sample.
+        keepdim: whether to keep the output shape the same as input (True) or broadcast it
+                 to the batch form (False).
+
+    Convention:
+        - this operation is range-independent: it does not clamp the input into ``[0, 1]``.
+        - the noise is additive and recorded in full: the output is the input plus ``_params["gaussian_noise"]``,
+          so ``mean`` offsets the image rather than naming the mean the output should have.
+        - nothing is clamped, so an input already inside ``[0, 1]`` can leave it in either direction.
+
+    See Also:
+        - :class:`RandomSaltAndPepperNoise`: replaces a sparse set of pixels with salt or pepper values.
+        - :class:`RandomGaussianIllumination`: adds a smooth spatial illumination field instead of noise.
+
+    Examples:
+        >>> rng = torch.manual_seed(0)
+        >>> img = torch.ones(1, 1, 2, 2)
+        >>> RandomGaussianNoise(mean=0., std=1., p=1.)(img)
+        tensor([[[[ 2.5410,  0.7066],
+                  [-1.1788,  1.5684]]]])
+
+    To apply the exact augmenation again, you may take the advantage of the previous parameter state:
+        >>> input = torch.randn(1, 3, 32, 32)
+        >>> aug = RandomGaussianNoise(mean=0., std=1., p=1.)
+        >>> (aug(input) == aug(input, params=aug._params)).all()
+        tensor(True)
+
+    """
+
+    def __init__(
+        self, mean: float = 0.0, std: float = 1.0, same_on_batch: bool = False, p: float = 0.5, keepdim: bool = False
+    ) -> None:
+        super().__init__(p=p, same_on_batch=same_on_batch, p_batch=1.0, keepdim=keepdim)
+        self._param_generator = rg.GaussianNoiseGenerator(mean, std)
+
+    def apply_transform(
+        self,
+        input: torch.Tensor,
+        params: Dict[str, torch.Tensor],
+        flags: Dict[str, Any],
+        transform: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        gaussian_noise = _to_device_nonblocking(params["gaussian_noise"], input.device, input.dtype)
+        # When same_on_batch=True the generator produces shape (1, C, H, W); expand to full batch.
+        if gaussian_noise.shape[0] != input.shape[0]:
+            gaussian_noise = gaussian_noise.expand_as(input)
+        return input + gaussian_noise

@@ -1,0 +1,179 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from typing import Any, Dict, List, Optional, Tuple, Union, cast
+
+import torch
+
+from kornia.augmentation import random_generator as rg
+from kornia.augmentation._2d.intensity.base import IntensityAugmentationBase2D
+from kornia.augmentation.utils import _check_filter_min_size
+from kornia.constants import BorderType, Resample
+from kornia.filters import motion_blur
+
+
+class RandomMotionBlur(IntensityAugmentationBase2D):
+    r"""Blur images with a random motion-blur kernel, applied per sample with probability ``p`` (default 0.5).
+
+    ``output = RandomMotionBlur(kernel_size, angle, direction, ...)(input)`` convolves selected ``(B, C, H, W)``
+    images with a sampled directional kernel.
+
+    .. image:: _static/img/RandomMotionBlur.png
+
+    See the Convention block on :class:`~kornia.augmentation.IntensityAugmentationBase2D`.
+
+    Args:
+        p: probability of applying the transformation to each sample.
+        kernel_size: motion kernel size (odd and positive).
+            If int, the kernel will have a fixed size.
+            If Tuple[int, int] or a two-element list, it will randomly generate one odd value from the closed
+            range for the whole batch.
+        angle: angle of the motion blur in degrees (anti-clockwise rotation).
+            If float, it will generate the value from (-angle, angle).
+        direction: forward/backward direction of the motion blur.
+            Lower values towards -1.0 will point the motion blur towards the back (with angle provided via angle),
+            while higher values towards 1.0 will point the motion blur forward. A value of 0.0 leads to a
+            uniformly (but still angled) motion blur.
+            If float, it will generate the value from (-direction, direction).
+            If Tuple[int, int], it will randomly generate the value from the range.
+        border_type: the padding mode to be applied before convolving.
+            CONSTANT = 0, REFLECT = 1, REPLICATE = 2, CIRCULAR = 3.
+        resample: the interpolation mode.
+        same_on_batch: apply the same angle and direction across the batch. The kernel size is always shared.
+        keepdim: whether to keep the output shape the same as input (True) or broadcast it
+                 to the batch form (False).
+
+    Shape:
+        - Input: ``(C, H, W)`` or ``(B, C, H, W)``, Optional: ``(B, 3, 3)``
+        - Output: ``(B, C, H, W)``
+
+    Convention:
+        - this operation is range-independent: it does not clamp the input into ``[0, 1]``.
+        - a positive ``angle`` turns the blur line counter-clockwise as the image is displayed, as in
+          :func:`kornia.filters.motion_blur` and :func:`kornia.filters.get_motion_kernel2d`.
+        - ``direction`` re-weights the kernel along that line before it is rotated: ``0`` spreads the weight evenly, and
+          ``-1`` and ``+1`` pile it at opposite ends. The rotation then resamples the kernel with ``resample``:
+          ``"nearest"`` can drop or duplicate taps, so the line's length and end weights change with ``angle``, and
+          ``"bilinear"`` or ``"bicubic"`` also spread weight off the line.
+        - the default ``resample="nearest"`` is the function's own default. The default ``border_type="constant"``
+          is not: the class zero-pads by its own default, while :func:`kornia.filters.motion_blur` defaults to
+          ``"reflect"``. Pass ``border_type="reflect"`` to match the function.
+        - a ranged ``kernel_size`` is drawn once per call and repeated into ``_params["ksize_factor"]`` with
+          shape ``(B,)``, so every sample uses that size even with ``same_on_batch=False``; angle and direction
+          are drawn per sample unless ``same_on_batch=True``. A tuple range draws each odd size inside it with
+          equal probability, bounds included, so ``(3, 20)`` draws ``3, 5, ..., 19``. A range that holds no odd
+          size is rounded up out of the requested range, so ``(4, 4)`` draws ``5``; a reversed one such as
+          ``(20, 3)`` raises at construction, and a drawn size below ``3`` raises on the forward pass.
+        - the output is not clamped. At the default ``border_type="constant"`` the padding is zeros, so a border
+          pixel is pulled toward ``0``. With ``border_type="reflect"`` the result stays between the input's
+          extremes, up to rounding, at ``resample="nearest"`` or ``"bilinear"``; a ``"bicubic"`` rotation gives
+          the kernel negative weights, and the result can overshoot both extremes.
+        - an image smaller than the kernel is accepted, down to ``1 x 1``, at the default
+          ``border_type="constant"`` and at ``"replicate"``. ``"reflect"`` needs each spatial axis longer than
+          the kernel radius along it, and ``"circular"`` at least that long; below that both raise a
+          ``ValueError`` naming the class, the drawn kernel and the input shape, as :class:`RandomBoxBlur` and
+          :class:`RandomGaussianBlur` do.
+
+    Note:
+        This function accepts another transformation torch.Tensor (``(B, 3, 3)``), then the
+        applied transformation will be merged int to the input transformation torch.Tensor and returned.
+
+        Please set ``resample`` to ``'bilinear'`` if more meaningful gradients wanted.
+
+    .. note::
+        This function internally uses :func:`kornia.filters.motion_blur`.
+
+    See Also:
+        - :class:`RandomMotionBlur3D`: applies a directional kernel to volumes.
+        - :class:`RandomGaussianBlur`: applies isotropic Gaussian smoothing.
+        - :class:`RandomBoxBlur`: applies uniform, non-directional smoothing.
+
+    Examples:
+        >>> rng = torch.manual_seed(0)
+        >>> input = torch.ones(1, 1, 5, 5)
+        >>> motion_blur = RandomMotionBlur(3, 35., 0.5, p=1.)
+        >>> motion_blur(input)
+        tensor([[[[0.5773, 1.0000, 1.0000, 1.0000, 0.7561],
+                  [0.5773, 1.0000, 1.0000, 1.0000, 0.7561],
+                  [0.5773, 1.0000, 1.0000, 1.0000, 0.7561],
+                  [0.5773, 1.0000, 1.0000, 1.0000, 0.7561],
+                  [0.5773, 1.0000, 1.0000, 1.0000, 0.7561]]]])
+
+    To apply the exact augmenation again, you may take the advantage of the previous parameter state:
+        >>> input = torch.randn(1, 3, 32, 32)
+        >>> aug = RandomMotionBlur(3, 35., 0.5, p=1.)
+        >>> (aug(input) == aug(input, params=aug._params)).all()
+        tensor(True)
+
+    """
+
+    def __init__(
+        self,
+        kernel_size: Union[int, Tuple[int, int], List[int]],
+        angle: Union[torch.Tensor, float, Tuple[float, float]],
+        direction: Union[torch.Tensor, float, Tuple[float, float]],
+        border_type: Union[int, str, BorderType] = BorderType.CONSTANT.name,
+        resample: Union[str, int, Resample] = Resample.NEAREST.name,
+        same_on_batch: bool = False,
+        p: float = 0.5,
+        keepdim: bool = False,
+    ) -> None:
+        super().__init__(p=p, same_on_batch=same_on_batch, keepdim=keepdim)
+        self._param_generator = rg.MotionBlurGenerator(kernel_size, angle, direction)
+        self.flags = {"border_type": BorderType.get(border_type), "resample": Resample.get(resample)}
+        # A fixed (int) kernel_size lets us skip the data-dependent kernel-size selection in
+        # apply_transform, keeping that path torch.compile fullgraph-safe.
+        self._fixed_kernel_size: Optional[int] = kernel_size if isinstance(kernel_size, int) else None
+
+    def generate_parameters(self, batch_shape: Tuple[int, ...]) -> Dict[str, torch.Tensor]:
+        params = super().generate_parameters(batch_shape)
+        params["idx"] = torch.zeros(1, dtype=torch.long) if batch_shape[0] == 0 else torch.randint(batch_shape[0], (1,))
+        return params
+
+    def apply_transform(
+        self,
+        input: torch.Tensor,
+        params: Dict[str, torch.Tensor],
+        flags: Dict[str, Any],
+        transform: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        kernel_size: int
+        if self._fixed_kernel_size is not None:
+            # Fixed kernel size: static value, no data-dependent indexing -> stays fullgraph.
+            kernel_size = self._fixed_kernel_size
+        else:
+            # Generated sizes are shared. Retain indexed selection for replay of older parameters
+            # that contain differing sizes, using one selected size for the whole batch.
+            # (`VideoSequential` flattens the first two dims and repeats that index, so all
+            # entries are equal and taking the first is legit.) This branch is inherently
+            # data-dependent and not fullgraph-compilable.
+            kernel_size_list: List[int] = params["ksize_factor"].tolist()
+            if not kernel_size_list and input.shape[0] == 0:
+                # An empty batch draws no kernel size and has nothing to blur; motion blur keeps the shape (#4429).
+                return input.clone()
+            idx: int = cast(int, params["idx"][0])
+            kernel_size = kernel_size_list[idx]
+        border_type = flags["border_type"].name.lower()
+        _check_filter_min_size("RandomMotionBlur", input, kernel_size, border_type=border_type)
+        return motion_blur(
+            input,
+            kernel_size=kernel_size,
+            angle=params["angle_factor"],
+            direction=params["direction_factor"],
+            border_type=border_type,
+            mode=flags["resample"].name.lower(),
+        )

@@ -1,0 +1,46 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+import pytest
+import torch
+
+from kornia.models.vit_mobile import MobileViT
+
+from testing.base import BaseTester
+
+
+class TestMobileViT(BaseTester):
+    # The modes differ in widths and expansion only, and the batch passes through every mode's unfolding alike: each
+    # batch size runs with some mode rather than with every one.
+    @pytest.mark.parametrize(("mode", "B"), [("xxs", 2), ("xs", 1), ("s", 2)])
+    @pytest.mark.parametrize("image_size", [(128, 128)])
+    @pytest.mark.parametrize("patch_size", [(2, 2)])
+    def test_smoke(self, device, dtype, B, image_size, mode, patch_size):
+        ih, iw = image_size
+        channel = {"xxs": 320, "xs": 384, "s": 640}
+
+        img = torch.rand(B, 3, ih, iw, device=device, dtype=dtype)
+        mvit = MobileViT(mode=mode, patch_size=patch_size).to(device, dtype)
+
+        out = mvit(img)
+        assert isinstance(out, torch.Tensor)
+        assert out.shape == (B, channel[mode], 4, 4)
+
+    @pytest.mark.device_agnostic
+    def test_unknown_mode_raises(self):
+        with pytest.raises(ValueError, match="'xxs', 'xs' or 's'"):
+            MobileViT(mode="m")

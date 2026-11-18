@@ -1,0 +1,121 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from typing import Any, Dict, Optional, Tuple
+
+import torch
+
+from kornia.augmentation import random_generator as rg
+from kornia.augmentation._2d.intensity.base import IntensityAugmentationBase2D
+from kornia.augmentation.utils.param_validation import _learnable_range_bound, _load_unowned_learnable_range
+from kornia.core.utils import _clamp_unit_range, _to_device_nonblocking
+from kornia.enhance.adjust import adjust_contrast
+
+
+class RandomContrast(IntensityAugmentationBase2D):
+    r"""Scale pixel values by a random contrast factor.
+
+    ``output = RandomContrast(contrast)(input)`` computes ``input * factor`` for each selected image using a sampled
+    contrast factor, with clamping enabled by default. Use :class:`ColorJitter` for torchvision-compatible contrast,
+    which blends the image with its grayscale mean, ``factor * input + (1 - factor) * mean``.
+
+    .. image:: _static/img/RandomContrast.png
+
+    See the Convention block on :class:`~kornia.augmentation.IntensityAugmentationBase2D`.
+
+    Args:
+        contrast: the contrast factor to apply.
+        clip_output: if true clip output.
+        same_on_batch: apply the same transformation across the batch.
+        p: probability of applying the transformation.
+        keepdim: whether to keep the output shape the same as input (True) or broadcast it
+                 to the batch form (False).
+    Shape:
+        - Input: ``(C, H, W)`` or ``(B, C, H, W)``, Optional: ``(B, 3, 3)``
+        - Output: ``(B, C, H, W)``
+
+    Convention:
+        - with ``clip_output=True``, input values are clamped into ``[0, 1]`` before the operation
+          as well as afterwards. With ``clip_output=False``, the arithmetic is range-independent:
+          neither input nor output is clamped.
+        - the drawn factor reaches :func:`kornia.enhance.adjust_contrast` unchanged -- it is not re-based the way
+          :class:`RandomBrightness` re-bases its own -- so ``1.0`` is the identity: for any input with
+          ``clip_output=False``, and for an input in ``[0, 1]`` at the default.
+        - at the default ``clip_output=True`` the result is clamped into ``[0, 1]``; with ``clip_output=False``
+          the raw product is returned.
+
+    .. note::
+        This function internally uses :func:`kornia.enhance.adjust_contrast`
+
+    See Also:
+        - :class:`RandomBrightness`: adds an offset instead of scaling values.
+        - :class:`ColorJiggle`: combines this raw-value scaling with color adjustments.
+        - :class:`ColorJitter`: blends with the grayscale mean as torchvision does.
+
+    Examples:
+        >>> rng = torch.manual_seed(0)
+        >>> inputs = torch.rand(1, 3, 3, 3)
+        >>> aug = RandomContrast(contrast = (0.5, 2.), p = 1.)
+        >>> aug(inputs)
+        tensor([[[[0.2750, 0.4258, 0.0490],
+                  [0.0732, 0.1704, 0.3514],
+                  [0.2716, 0.4969, 0.2525]],
+        <BLANKLINE>
+                 [[0.3505, 0.1934, 0.2227],
+                  [0.0124, 0.0936, 0.1629],
+                  [0.2874, 0.3867, 0.4434]],
+        <BLANKLINE>
+                 [[0.0893, 0.1564, 0.3778],
+                  [0.5072, 0.2201, 0.4845],
+                  [0.2325, 0.3064, 0.5281]]]])
+
+    To apply the exact augmenation again, you may take the advantage of the previous parameter state:
+
+        >>> input = torch.rand(1, 3, 32, 32)
+        >>> aug = RandomContrast((0.8,1.2), p=1.)
+        >>> (aug(input) == aug(input, params=aug._params)).all()
+        tensor(True)
+
+    """
+
+    def __init__(
+        self,
+        contrast: Tuple[float, float] = (1.0, 1.0),
+        clip_output: bool = True,
+        same_on_batch: bool = False,
+        p: float = 1.0,
+        keepdim: bool = False,
+    ) -> None:
+        super().__init__(p=p, same_on_batch=same_on_batch, keepdim=keepdim)
+        factor, center, bounds = _learnable_range_bound(contrast, "contrast", center=1.0)
+        self.contrast: torch.Tensor = factor
+        self._param_generator = rg.PlainUniformGenerator((self.contrast, "contrast_factor", center, bounds))
+        _load_unowned_learnable_range(self, "contrast", center)
+
+        self.clip_output = clip_output
+
+    def apply_transform(
+        self,
+        input: torch.Tensor,
+        params: Dict[str, torch.Tensor],
+        flags: Dict[str, Any],
+        transform: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if self.clip_output:
+            input = _clamp_unit_range(input)
+        contrast_factor = _to_device_nonblocking(params["contrast_factor"], input.device, input.dtype)
+        return adjust_contrast(input, contrast_factor, self.clip_output)

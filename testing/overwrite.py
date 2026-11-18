@@ -1,0 +1,34 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from __future__ import annotations
+
+from copy import deepcopy
+from typing import Any, Optional
+
+
+def default_with_one_parameter_changed(*, default: Optional[dict[str, Any]] = None, **possible_parameters: Any) -> Any:
+    if default is None:
+        default = {}
+    if not isinstance(default, dict):
+        raise AssertionError(f"default should be a dict not a {type(default)}")
+
+    for parameter_name, possible_values in possible_parameters.items():
+        for v in possible_values:
+            param_set = deepcopy(default)
+            param_set[parameter_name] = v
+            yield param_set

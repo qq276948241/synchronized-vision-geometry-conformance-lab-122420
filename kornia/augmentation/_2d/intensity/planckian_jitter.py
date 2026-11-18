@@ -1,0 +1,232 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from typing import Any, Dict, List, Optional, Union
+
+import torch
+
+from kornia.augmentation import random_generator as rg
+from kornia.augmentation._2d.intensity.base import IntensityAugmentationBase2D
+from kornia.core.check import KORNIA_CHECK_SHAPE
+from kornia.core.utils import _clamp_unit_range, _to_device_nonblocking
+
+
+def get_planckian_coeffs(mode: str) -> torch.Tensor:
+    if mode.lower() == "blackbody":
+        coefs = torch.tensor(
+            [
+                [0.6743, 0.4029, 0.0013],
+                [0.6281, 0.4241, 0.1665],
+                [0.5919, 0.4372, 0.2513],
+                [0.5623, 0.4457, 0.3154],
+                [0.5376, 0.4515, 0.3672],
+                [0.5163, 0.4555, 0.4103],
+                [0.4979, 0.4584, 0.4468],
+                [0.4816, 0.4604, 0.4782],
+                [0.4672, 0.4619, 0.5053],
+                [0.4542, 0.4630, 0.5289],
+                [0.4426, 0.4638, 0.5497],
+                [0.4320, 0.4644, 0.5681],
+                [0.4223, 0.4648, 0.5844],
+                [0.4135, 0.4651, 0.5990],
+                [0.4054, 0.4653, 0.6121],
+                [0.3980, 0.4654, 0.6239],
+                [0.3911, 0.4655, 0.6346],
+                [0.3847, 0.4656, 0.6444],
+                [0.3787, 0.4656, 0.6532],
+                [0.3732, 0.4656, 0.6613],
+                [0.3680, 0.4655, 0.6688],
+                [0.3632, 0.4655, 0.6756],
+                [0.3586, 0.4655, 0.6820],
+                [0.3544, 0.4654, 0.6878],
+                [0.3503, 0.4653, 0.6933],
+            ]
+        )
+
+    elif mode.upper() == "CIED":
+        coefs = torch.tensor(
+            [
+                [0.5829, 0.4421, 0.2288],
+                [0.5510, 0.4514, 0.2948],
+                [0.5246, 0.4576, 0.3488],
+                [0.5021, 0.4618, 0.3941],
+                [0.4826, 0.4646, 0.4325],
+                [0.4654, 0.4667, 0.4654],
+                [0.4502, 0.4681, 0.4938],
+                [0.4364, 0.4692, 0.5186],
+                [0.4240, 0.4700, 0.5403],
+                [0.4127, 0.4705, 0.5594],
+                [0.4023, 0.4709, 0.5763],
+                [0.3928, 0.4713, 0.5914],
+                [0.3839, 0.4715, 0.6049],
+                [0.3757, 0.4716, 0.6171],
+                [0.3681, 0.4717, 0.6281],
+                [0.3609, 0.4718, 0.6380],
+                [0.3543, 0.4719, 0.6472],
+                [0.3480, 0.4719, 0.6555],
+                [0.3421, 0.4719, 0.6631],
+                [0.3365, 0.4719, 0.6702],
+                [0.3313, 0.4719, 0.6766],
+                [0.3263, 0.4719, 0.6826],
+                [0.3217, 0.4719, 0.6882],
+            ]
+        )
+    else:
+        raise RuntimeError(f"Unexpected mode. Got {mode}")
+
+    return torch.stack((coefs[:, 0] / coefs[:, 1], coefs[:, 2] / coefs[:, 1]), 1)
+
+
+class RandomPlanckianJitter(IntensityAugmentationBase2D):
+    r"""Shift the illuminant color (Planckian jitter), applied per sample with probability ``p`` (default 0.5).
+
+    ``output = RandomPlanckianJitter(...)(input)`` changes the illumination of selected RGB images ``(B, 3, H, W)``
+    along its color-temperature model.
+
+    .. image:: _static/img/RandomPlanckianJitter.png
+
+    See the Convention block on :class:`~kornia.augmentation.IntensityAugmentationBase2D`.
+
+    This is physics based color augmentation, that creates realistic
+    variations in chromaticity, this can simulate the illumination
+    changes in the scene.
+
+    See :cite:`zini2022planckian` for more details.
+
+    Args:
+        mode: 'blackbody' or 'CIED'.
+        select_from: choose a list of jitters to apply from. `blackbody` range [0-24], `CIED` range [0-22].
+          The entries index the table like a Python sequence: one past the end raises at construction, and a
+          negative one counts from the end.
+        same_on_batch: apply the same transformation across the batch.
+        p: probability of applying the transformation to each sample.
+        keepdim: whether to keep the output shape the same as input (True) or broadcast it
+            to the batch form (False).
+
+    Shape:
+        - Input: ``(C, H, W)`` or ``(B, C, H, W)``
+        - Output: ``(B, C, H, W)``
+
+    Convention:
+        - input values are clamped into ``[0, 1]`` before the operation, and the result is clamped
+          into the same range. This applies only to samples selected by the probability gate.
+        - the red and blue channels are scaled by the selected row of the illuminant table and the green
+          channel is not scaled. Both input and output are clamped into ``[0, 1]``, including green.
+        - ``mode`` selects the illuminant lookup table, held in the persistent buffer ``pl``, and
+          ``select_from`` narrows that table to the listed rows. The input must have three channels.
+
+    .. warning::
+        ``pl``'s shape depends on ``mode``, so a ``state_dict`` saved by an instance built with one mode
+        does not load into an instance built with the other. Tracked in
+        `#4428 <https://github.com/kornia/kornia/issues/4428>`_.
+
+    See Also:
+        - :class:`ColorJiggle`: samples general color adjustments instead of illuminant coefficients.
+
+    Examples:
+        To apply planckian jitter based on mode
+
+        >>> rng = torch.manual_seed(0)
+        >>> input = torch.rand(1, 3, 2, 2)
+        >>> aug = RandomPlanckianJitter(mode='CIED', p=1.0)
+        >>> aug(input)
+        tensor([[[[0.6543, 1.0000],
+                  [0.1167, 0.1741]],
+        <BLANKLINE>
+                 [[0.3074, 0.6341],
+                  [0.4901, 0.8964]],
+        <BLANKLINE>
+                 [[0.2358, 0.3272],
+                  [0.1806, 0.2079]]]])
+
+        To apply planckian jitter on image(s) from list of interested jitters
+
+        >>> rng = torch.manual_seed(0)
+        >>> input = torch.rand(2, 3, 2, 2)
+        >>> aug = RandomPlanckianJitter(mode='blackbody', select_from=[23, 24, 1, 2], p=1.0)
+        >>> aug(input)
+        tensor([[[[0.3736, 0.5784],
+                  [0.0666, 0.0994]],
+        <BLANKLINE>
+                 [[0.3074, 0.6341],
+                  [0.4901, 0.8964]],
+        <BLANKLINE>
+                 [[0.6789, 0.9421],
+                  [0.5199, 0.5986]]],
+        <BLANKLINE>
+        <BLANKLINE>
+                [[[0.0331, 0.2501],
+                  [0.4353, 0.7679]],
+        <BLANKLINE>
+                 [[0.6977, 0.8000],
+                  [0.1610, 0.2823]],
+        <BLANKLINE>
+                 [[0.2676, 0.3593],
+                  [0.1559, 0.3432]]]])
+
+    """
+
+    def __init__(
+        self,
+        mode: str = "blackbody",
+        select_from: Optional[Union[int, List[int]]] = None,
+        same_on_batch: bool = False,
+        p: float = 0.5,
+        keepdim: bool = False,
+    ) -> None:
+        super().__init__(p=p, same_on_batch=same_on_batch, keepdim=keepdim)
+
+        if isinstance(select_from, int):
+            select_from = [select_from]
+
+        _pl = get_planckian_coeffs(mode)
+        if select_from is not None:
+            _pl = _pl[select_from]
+        self.register_buffer("pl", _pl)
+        self.pl: torch.Tensor
+
+        # the range of the sampling parameters
+        _param_min: float = 0.0
+        _param_max: float = float(self.pl.shape[0])
+
+        self._param_generator = rg.PlanckianJitterGenerator([_param_min, _param_max])
+
+    def apply_transform(
+        self,
+        input: torch.Tensor,
+        params: Dict[str, torch.Tensor],
+        flags: Dict[str, Any],
+        transform: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        input = _clamp_unit_range(input)
+        KORNIA_CHECK_SHAPE(input, ["*", "3", "H", "W"])
+        # Index with the tensor itself: `.tolist()` reads the data, which graph capture cannot do. Cast the
+        # buffer to the input so both device and dtype follow the input for the channel-wise multiplication.
+        coeffs = _to_device_nonblocking(self.pl, input.device, input.dtype)[
+            _to_device_nonblocking(params["idx"].long(), input.device)
+        ]
+
+        r_w = coeffs[:, 0][..., None, None]
+        b_w = coeffs[:, 1][..., None, None]
+
+        r = input[..., 0, :, :] * r_w
+        g = input[..., 1, :, :]
+        b = input[..., 2, :, :] * b_w
+
+        output = torch.stack([r, g, b], -3)
+
+        return _clamp_unit_range(output)

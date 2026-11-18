@@ -1,0 +1,146 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+import torch
+from torch import Tensor, nn
+
+from kornia.core.check import KORNIA_CHECK, KORNIA_CHECK_IS_TENSOR, KORNIA_CHECK_SHAPE
+
+
+def aepe(input: torch.Tensor, target: torch.Tensor, reduction: str = "mean") -> torch.Tensor:
+    r"""Compute the average endpoint error (AEPE) between two flow maps.
+
+    ``epe = aepe(input, target)`` takes two channel-last flows ``(*, 2)``, such as ``(B, H, W, 2)``, and returns the
+    mean Euclidean distance between their vectors, in the units of the flow. For an ``h x w`` flow the AEPE is:
+
+    .. math::
+
+        \text{AEPE}=\frac{1}{hw}\sum_{i=1, j=1}^{h, w}\sqrt{(I_{i,j,1}-T_{i,j,1})^{2}+(I_{i,j,2}-T_{i,j,2})^{2}}
+
+    Convention:
+        - A channel-first ``(B, 2, H, W)`` flow must be permuted to ``(B, H, W, 2)`` first: it raises unless
+          :math:`W = 2`, where it is read wrongly. :ref:`Losses and metrics <losses-metrics-conventions>` ports
+          RAFT's endpoint error.
+        - The distance is symmetric in ``input`` and ``target`` and not normalized by the image size.
+          ``reduction='mean'`` averages it over every position of every sample at once and ``'sum'`` adds it up,
+          both into a 0-d tensor; ``'none'`` returns the ``(*)`` map. There is no valid mask: mask sparse ground
+          truth on the ``'none'`` map. An unknown ``reduction`` raises ``NotImplementedError``.
+        - :func:`~kornia.metrics.aepe` and :func:`~kornia.metrics.average_endpoint_error` are the same function.
+        - Float16 and bfloat16 inputs are computed in float32 and the result is returned in their promoted dtype.
+
+    Args:
+        input: the predicted flow with shape ``(*, 2)``.
+        target: the ground-truth flow with the shape of ``input``.
+        reduction: ``'mean'`` (default) averages, ``'sum'`` adds and ``'none'`` keeps the endpoint-error map.
+
+    Returns:
+        a 0-d tensor, or the map of shape ``(*)`` for ``reduction='none'``.
+
+    See Also:
+        - :class:`~kornia.metrics.AEPE`: the module form.
+
+    Examples:
+        >>> ones = torch.ones(4, 4, 2)
+        >>> aepe(ones, 1.2 * ones)
+        tensor(0.2828)
+
+    Reference:
+        https://link.springer.com/content/pdf/10.1007/s11263-010-0390-2.pdf
+
+    """
+    KORNIA_CHECK_IS_TENSOR(input)
+    KORNIA_CHECK_IS_TENSOR(target)
+    KORNIA_CHECK_SHAPE(input, ["*", "2"])
+    KORNIA_CHECK_SHAPE(target, ["*", "2"])
+    KORNIA_CHECK(
+        input.shape == target.shape, f"input and target shapes must be the same. Got: {input.shape} and {target.shape}"
+    )
+
+    output_dtype = torch.promote_types(input.dtype, target.dtype)
+    # The distance can be representable even when its squared components overflow or underflow in half precision.
+    if output_dtype in (torch.float16, torch.bfloat16):
+        input, target = input.float(), target.float()
+
+    sq_dist: Tensor = (input[..., 0] - target[..., 0]) ** 2 + (input[..., 1] - target[..., 1]) ** 2
+    # d sqrt(x)/dx is infinite at 0 and autograd multiplies it by the zero derivative of the squares, so an exact
+    # match would get a NaN gradient (and a mask cannot hide it: NaN * 0 is NaN). Differentiate the sqrt of a safe
+    # positive argument and select 0 at zero distance, the subgradient torch.linalg.vector_norm uses. The value is
+    # unchanged: it is sqrt(sq_dist) wherever sq_dist > 0 and 0 where it is 0.
+    is_match = sq_dist == 0
+    safe_sq_dist = torch.where(is_match, torch.ones_like(sq_dist), sq_dist)
+    epe: Tensor = torch.where(is_match, torch.zeros_like(sq_dist), safe_sq_dist.sqrt())
+
+    if reduction == "mean":
+        epe = epe.mean()
+    elif reduction == "sum":
+        epe = epe.sum()
+    elif reduction == "none":
+        pass
+    else:
+        raise NotImplementedError("Invalid reduction option.")
+
+    return epe.to(output_dtype) if output_dtype in (torch.float16, torch.bfloat16) else epe
+
+
+class AEPE(nn.Module):
+    """Compute the average endpoint error (AEPE) between two flow maps (module form).
+
+    ``criterion = AEPE(reduction)`` stores ``reduction``, and ``epe = criterion(input, target)`` is
+    :func:`~kornia.metrics.aepe` on two ``(*, 2)`` flows.
+
+    Convention:
+        See the Convention block of :func:`~kornia.metrics.aepe`.
+
+    Args:
+        reduction: ``'mean'`` (default), ``'sum'`` or ``'none'``, as in :func:`~kornia.metrics.aepe`.
+
+    Shape:
+        - input: ``(*, 2)``.
+        - target: ``(*, 2)``.
+        - output: ``()`` for ``'mean'`` and ``'sum'``, ``(*)`` for ``'none'``.
+
+    See Also:
+        - :func:`~kornia.metrics.aepe`: the one-call form.
+
+    Examples:
+        >>> input1 = torch.rand(1, 4, 5, 2)
+        >>> input2 = torch.rand(1, 4, 5, 2)
+        >>> epe = AEPE(reduction="mean")
+        >>> epe = epe(input1, input2)
+
+    """
+
+    def __init__(self, reduction: str = "mean") -> None:
+        super().__init__()
+        self.reduction: str = reduction
+
+    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Compute average endpoint error between vector fields.
+
+        Args:
+            input: Predicted vector field with shape ``(B, H, W, 2)``.
+            target: Target vector field with the same shape as ``input``.
+
+        Returns:
+            Endpoint-error tensor reduced according to ``self.reduction``.
+            The endpoint error is the Euclidean distance between predicted and
+            target vectors at each spatial location.
+        """
+        return aepe(input, target, self.reduction)
+
+
+average_endpoint_error = aepe

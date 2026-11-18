@@ -1,0 +1,125 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from typing import Any, Dict, Optional, Tuple
+
+import torch
+
+from kornia.augmentation._2d.base import _input_metadata_only
+from kornia.augmentation._2d.geometric.base import GeometricAugmentationBase2D
+from kornia.core.ops import _device_literal
+from kornia.core.utils import _to_device_nonblocking
+from kornia.geometry.transform import vflip
+
+
+class RandomVerticalFlip(GeometricAugmentationBase2D):
+    r"""Flip images vertically, applied per sample with probability ``p`` (default 0.5).
+
+    ``output = RandomVerticalFlip(...)(input)`` reverses the height axis of selected images of shape
+    ``(B, C, H, W)``.
+
+    Args:
+        p: probability of applying the transformation to each sample.
+        same_on_batch: apply the same transformation across the batch.
+        keepdim: whether to keep the output shape the same as input (True) or broadcast it
+                        to the batch form (False).
+
+    Shape:
+        - Input: ``(C, H, W)`` or ``(B, C, H, W)``, Optional: ``(B, 3, 3)``
+        - Output: ``(B, C, H, W)``
+
+    Convention:
+        A selected flip maps ``(x, y)`` to ``(x, H - 1 - y)`` with the exact discrete
+        :func:`~kornia.geometry.transform.vflip`, without resampling; see
+        :class:`~kornia.augmentation.GeometricAugmentationBase2D` for the shared contract.
+
+    .. note::
+        This function internally uses :func:`kornia.geometry.transform.vflip`.
+
+    .. image:: _static/img/RandomVerticalFlip.png
+
+    See Also:
+        - :class:`RandomVerticalFlip3D`: reverses the height axis of a volume.
+        - :class:`RandomHorizontalFlip`: reflects across the vertical center line.
+
+    Examples:
+        >>> import torch
+        >>> input = torch.tensor([[[[0., 0., 0.],
+        ...                         [0., 0., 0.],
+        ...                         [0., 1., 1.]]]])
+        >>> seq = RandomVerticalFlip(p=1.0)
+        >>> seq(input), seq.transform_matrix
+        (tensor([[[[0., 1., 1.],
+                  [0., 0., 0.],
+                  [0., 0., 0.]]]]), tensor([[[ 1.,  0.,  0.],
+                 [ 0., -1.,  2.],
+                 [ 0.,  0.,  1.]]]))
+        >>> seq.inverse(seq(input)).equal(input)
+        True
+
+    To apply the exact augmenation again, you may take the advantage of the previous parameter state:
+        >>> input = torch.randn(1, 3, 32, 32)
+        >>> seq = RandomVerticalFlip(p=1.0)
+        >>> (seq(input) == seq(input, params=seq._params)).all()
+        tensor(True)
+
+    """
+
+    # apply_transform is a pure flip that ignores the transform matrix, so defer building
+    # it until `.transform_matrix` is read (see RigidAffineAugmentationBase2D).
+    _compute_matrix_lazily = True
+
+    @_input_metadata_only
+    def compute_transformation(
+        self, input: torch.Tensor, params: Dict[str, torch.Tensor], flags: Dict[str, Any]
+    ) -> torch.Tensor:
+        # Build the 3x3 flip matrix as a literal filled on the device plus the (tensor) height, rather than
+        # `int(h)`, which lowers to `.item()` and breaks torch.compile fullgraph, or a `torch.tensor` literal,
+        # which copies from the host and waits for the queued kernels. Entry [1, 2] becomes `-1 + h` in the input
+        # dtype, as before.
+        h = _to_device_nonblocking(params["forward_input_shape"][-2], input.device, input.dtype)
+        flip_mat: torch.Tensor = _device_literal(
+            [[1.0, 0.0, 0.0], [0.0, -1.0, -1.0], [0.0, 0.0, 1.0]], device=input.device, dtype=input.dtype
+        )
+        flip_mat[1, 2] = flip_mat[1, 2] + h
+
+        return flip_mat.expand(input.shape[0], 3, 3)
+
+    def apply_transform(
+        self,
+        input: torch.Tensor,
+        params: Dict[str, torch.Tensor],
+        flags: Dict[str, Any],
+        transform: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return vflip(input)
+
+    def inverse_transform(
+        self,
+        input: torch.Tensor,
+        flags: Dict[str, Any],
+        transform: Optional[torch.Tensor] = None,
+        size: Optional[Tuple[int, int]] = None,
+    ) -> torch.Tensor:
+        if not isinstance(transform, torch.Tensor):
+            raise TypeError(f"Expected the `transform` be a torch.Tensor. Got {type(transform)}.")
+        return self.apply_transform(
+            input,
+            params=self._params,
+            transform=torch.as_tensor(transform, device=input.device, dtype=input.dtype),
+            flags=flags,
+        )

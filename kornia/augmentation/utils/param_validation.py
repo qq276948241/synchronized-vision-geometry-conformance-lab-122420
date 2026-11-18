@@ -1,0 +1,399 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+import threading
+from functools import partial
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+import torch
+
+from kornia.core.ops import _constant_tensor
+from kornia.core.utils import is_compiling
+
+# The device of the sampler rebuild under way in this thread, or ``None``. ``RandomGeneratorBase`` builds the samplers
+# of a learnable range again on the forward path, from a range validated when it was first built. During a rebuild
+# the validators do not read the values of a range, because that would wait for the GPU and break a ``torch.compile``
+# graph on every call, and the helpers below make numbers without a host-device copy. The state belongs to the thread:
+# as a plain module variable, another thread's constructor skipped its validation and another thread's finished rebuild
+# turned the validators back on under a running one. Under ``torch.compile`` it is a plain variable all the same, since
+# Dynamo on torch 2.5 cannot trace a write to a ``threading.local``, and an eager thread never reads that one.
+_thread_rebuild = threading.local()
+_compiling_rebuild_device: Optional[torch.device] = None
+
+
+def _set_rebuild_device(device: Optional[torch.device]) -> None:
+    if is_compiling():
+        global _compiling_rebuild_device  # noqa: PLW0603
+        _compiling_rebuild_device = device
+    else:
+        _thread_rebuild.device = device
+
+
+def _get_rebuild_device() -> Optional[torch.device]:
+    if is_compiling():
+        return _compiling_rebuild_device
+    return getattr(_thread_rebuild, "device", None)
+
+
+def _in_sampler_rebuild() -> bool:
+    return _get_rebuild_device() is not None
+
+
+def _numbers_to_tensor(data: Any, device: Optional[torch.device], dtype: Optional[torch.dtype]) -> torch.Tensor:
+    """Return ``torch.tensor(data, device=device, dtype=dtype)``, without a host-device copy during a rebuild."""
+    if not _in_sampler_rebuild() or dtype is None:
+        return torch.tensor(data, device=device, dtype=dtype)
+    return _constant_tensor(data, device=device, dtype=dtype)
+
+
+def _as_range_tensor(data: Any, device: Optional[torch.device], dtype: torch.dtype) -> torch.Tensor:
+    """Return ``torch.as_tensor(data, device=device, dtype=dtype)``, without a host-device copy during a rebuild."""
+    if not _in_sampler_rebuild() or isinstance(data, torch.Tensor):
+        return torch.as_tensor(data, device=device, dtype=dtype)
+    return _constant_tensor(data, device=device, dtype=dtype)
+
+
+def _check_positive_int_or_traced(value: Any, name: str) -> None:
+    """Assert ``value`` is a non-negative Python int, or accept it as a traced dim.
+
+    Used by random generators to validate ``height``/``width``/``depth`` derived from
+    ``tensor.shape``. Under tracing those are 0-d tensors; we accept them rather than
+    aborting export, since the surrounding ops will fail loudly if the value is
+    actually invalid.
+    """
+    if _is_traced_dim(value):
+        return
+    if not (isinstance(value, int) and value > 0):
+        raise AssertionError(f"`{name}` must be a positive integer. Got {value}.")
+
+
+def _is_traced_dim(value: Any) -> bool:
+    """Return True if ``value`` looks like a shape dim that came from tensor tracing.
+
+    Under torch.onnx.export's TorchScript tracer (and torch.fx), accessing
+    ``tensor.shape[i]`` can yield a 0-d tensor instead of a Python ``int``. The
+    runtime validators in this module are redundant during tracing, the tensor
+    constructors that follow will catch any real shape problem. Treat such
+    "traced ints" as opaque-but-valid so the trace can continue.
+    """
+    return isinstance(value, torch.Tensor) and value.numel() == 1 and value.dim() <= 1
+
+
+def _common_param_check(batch_size: int, same_on_batch: Optional[bool] = None) -> None:
+    """Check valid batch_size and same_on_batch params.
+
+    Skips the integer-type check when ``batch_size`` is a 0-d / 1-element tensor
+    (the shape of a traced tensor), since static configuration is already
+    validated at module construction time.
+    """
+    if _is_traced_dim(batch_size):
+        return
+    if not (isinstance(batch_size, int) and batch_size >= 0):
+        raise AssertionError(f"`batch_size` shall be a positive integer. Got {batch_size}.")
+    if same_on_batch is not None and not isinstance(same_on_batch, bool):
+        raise AssertionError(f"`same_on_batch` shall be boolean. Got {same_on_batch}.")
+
+
+def _range_bound(
+    factor: Union[torch.Tensor, float, Tuple[float, float], List[float]],
+    name: str,
+    center: Optional[float] = 0.0,
+    bounds: Optional[Tuple[float, float]] = (0, float("inf")),
+    check: Optional[str] = "joint",
+    device: Optional[torch.device] = None,
+    dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    r"""Check inputs and compute the corresponding factor bounds.
+
+    A scalar ``factor`` is a magnitude around ``center``: the range is ``[center - factor, center + factor]``
+    with its lower end floored at ``bounds[0]`` (a non-negative parameter reads ``contrast=1.5`` as
+    ``[0, 2.5]``, the way torchvision does), and an upper end past ``bounds[1]`` raises the same
+    ``ValueError`` the explicit range would. The scalar must be finite: ``inf``, ``nan``, and a finite
+    magnitude too large to represent in ``dtype`` (which converts to ``inf``) all raise ``ValueError``,
+    while a negative value reports "must be non negative" from the earlier check. A pair is taken as the
+    range itself, must likewise be finite, and is checked against ``bounds`` with ``check``. Finiteness
+    is required of the range, not of ``bounds``: the domain is legitimately unbounded (the default is
+    ``(0, inf)``), but a draw range that is not finite produces ``NaN`` at forward time.
+
+    During a rebuild of the samplers none of the values are checked (see ``_thread_rebuild``).
+    """
+    rebuild_device = _get_rebuild_device()
+    checked = rebuild_device is None
+    if device is None:
+        # Many generators pass no device and move the result themselves. A copy through the CPU in a rebuild would
+        # wait for the GPU on every forward.
+        device = torch.device("cpu") if rebuild_device is None else rebuild_device
+    if dtype is None:
+        dtype = torch.get_default_dtype()
+    if not isinstance(factor, (torch.Tensor)):
+        factor = _numbers_to_tensor(factor, device, dtype)
+    factor_bound: torch.Tensor
+
+    if factor.dim() == 0:
+        if checked:
+            if factor < 0:
+                raise ValueError(f"If {name} is a single number, it must be non negative. Got {factor}.")
+            if not torch.isfinite(factor):
+                raise ValueError(f"If {name} is a single number, it must be finite. Got {factor}.")
+        if center is None or bounds is None:
+            raise ValueError(f"`center` and `bounds` cannot be None for single number. Got {center}, {bounds}.")
+        factor_bound = factor.repeat(2) * _numbers_to_tensor([-1.0, 1.0], factor.device, factor.dtype) + center
+        # The lower end is floored at the domain floor; the upper end is never clamped, because a
+        # magnitude that overshoots the domain is a mistake the explicit range form already rejects.
+        if checked and factor_bound[1] > bounds[1]:
+            raise ValueError(f"{name} out of bounds. Expected inside {bounds}, got {factor_bound}.")
+        factor_bound = factor_bound.clamp(min=bounds[0]).to(device=device, dtype=dtype)
+    else:
+        factor_bound = torch.as_tensor(factor, device=device, dtype=dtype)
+        # The same finiteness rule as the scalar branch above, for the same reason: this is the
+        # draw range handed to UniformDistribution, and an infinite one yields `inf * 0 -> NaN`
+        # pixels at forward time (#4635). `bounds` is the permitted DOMAIN and stays unbounded —
+        # the default is `(0, inf)` — so the check is on the range, never on the domain.
+        # Without it an `inf` endpoint slipped through exactly when `bounds[1]` was itself `inf`,
+        # since the joint check then compares `inf >= inf`. A `nan` endpoint was already rejected,
+        # but reported as "out of bounds", which named the domain rather than the real problem.
+        if checked and not bool(torch.isfinite(factor_bound).all()):
+            raise ValueError(f"If {name} is a range, it must be finite. Got {factor_bound}.")
+
+    if checked and check is not None:
+        if check == "joint":
+            _joint_range_check(factor_bound, name, bounds)
+        elif check == "singular":
+            _singular_range_check(factor_bound, name, bounds)
+        else:
+            raise NotImplementedError(f"methods '{check}' not implemented.")
+
+    return factor_bound
+
+
+def _learnable_range_bound(
+    factor: Union[torch.Tensor, float, Tuple[float, float], List[float]],
+    name: str,
+    center: Optional[float] = 0.0,
+    bounds: Optional[Tuple[float, float]] = (0, float("inf")),
+) -> Tuple[torch.Tensor, Optional[float], Optional[Tuple[float, float]]]:
+    r"""Check a sampling range like :func:`_range_bound`, keeping a learnable one as the leaf that was passed.
+
+    Returns the range to keep on the module, then the ``center`` and ``bounds`` that ``PlainUniformGenerator`` still
+    has to apply when it builds its samplers. :func:`_range_bound` converts a range to the default device and dtype and
+    derives ``[center - factor, center + factor]`` from a number, which turns an ``nn.Parameter`` into a tensor that the
+    module does not own and a copy cannot take. A parameter is therefore checked on a detached copy and kept as it is:
+    a ``(2,)`` one is the range itself, and the range of a 0-d one is derived in ``make_samplers``, on the generator's
+    device and dtype, from the parameter of whichever module builds the samplers. Any other input returns the
+    :func:`_range_bound` result with no ``center`` or ``bounds`` left to apply.
+    """
+    if not isinstance(factor, torch.nn.Parameter):
+        return _range_bound(factor, name, center=center, bounds=bounds), None, None
+    _range_bound(factor.detach(), name, center=center, bounds=bounds)
+    if factor.dim() == 0:
+        return factor, center, bounds
+    return factor, None, None
+
+
+def _load_unowned_learnable_range(module: torch.nn.Module, name: str, center: Optional[float]) -> None:
+    r"""Let ``module`` strict-load a checkpoint saved when it did not own its learnable range ``name`` yet.
+
+    Use it after :func:`_learnable_range_bound`, with the ``center`` it returned. The colour augmentations used to keep
+    an ``nn.Parameter`` range only when it was a ``(2,)`` CPU tensor in the default dtype. Their other checkpoints hold
+    no ``name`` entry, only the generator's ``<name>_factor``: the range as a ``(2,)`` tensor, and for a 0-d parameter
+    the range derived from it, ``[max(center - f, low), center + f]``. A load pre-hook fills ``name`` from that entry,
+    and for a 0-d parameter recovers ``f`` as the upper end minus ``center``, because the upper end is never clamped.
+    Nothing is registered for a range that is not a parameter, whose checkpoint layout did not change.
+    """
+    if isinstance(module._parameters.get(name), torch.nn.Parameter):
+        module._register_load_state_dict_pre_hook(partial(_fill_unowned_learnable_range, name, center))
+
+
+def _fill_unowned_learnable_range(
+    name: str, center: Optional[float], state_dict: Dict[str, Any], prefix: str, *args: Any
+) -> None:
+    key, factor_key = prefix + name, f"{prefix}_param_generator.{name}_factor"
+    if key in state_dict or factor_key not in state_dict:
+        return
+    saved = state_dict[factor_key]
+    # ``center`` is only returned for a 0-d parameter; a (2,) entry for it is the range the old layout derived.
+    if center is not None and isinstance(saved, torch.Tensor) and saved.shape == (2,):
+        saved = saved.detach()[1] - center
+        state_dict[factor_key] = saved
+    state_dict[key] = saved
+
+
+def _shear_bound(
+    shear: Union[torch.Tensor, float, Tuple[float, float], Tuple[float, float, float, float]],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    r"""Return the x- and y-axis shear ranges as a (2, 2) tensor on ``device`` in ``dtype``.
+
+    A float or an (a, b) pair only shears along the x axis, (a, b, c, d) also gives a y-axis
+    range, and a (2, 2) tensor already holds both ranges.
+    """
+    shear = _as_range_tensor(shear, device, dtype)
+    if shear.shape == torch.Size([2, 2]):
+        shear_x = _range_bound(shear[0], "shear-x", 0, (-360, 360), device=device, dtype=dtype)
+        shear_y = _range_bound(shear[1], "shear-y", 0, (-360, 360), device=device, dtype=dtype)
+        return torch.stack([shear_x, shear_y])
+
+    shear_x = _range_bound(
+        shear if shear.dim() == 0 else shear[:2], "shear-x", 0, (-360, 360), device=device, dtype=dtype
+    )
+    if shear.dim() == 0 or len(shear) == 2:
+        shear_y = torch.zeros(2, device=device, dtype=dtype)
+    else:
+        shear_y = _range_bound(shear[2:], "shear-y", 0, (-360, 360), device=device, dtype=dtype)
+    return torch.stack([shear_x, shear_y])
+
+
+def _joint_range_check(ranged_factor: torch.Tensor, name: str, bounds: Optional[Tuple[float, float]] = None) -> None:
+    """Check if bounds[0] <= ranged_factor[0] <= ranged_factor[1] <= bounds[1]."""
+    if _in_sampler_rebuild():
+        return
+    if bounds is None:
+        bounds = (float("-inf"), float("inf"))
+    if ranged_factor.dim() == 1 and len(ranged_factor) == 2:
+        if not bounds[0] <= ranged_factor[0] or not bounds[1] >= ranged_factor[1]:
+            raise ValueError(f"{name} out of bounds. Expected inside {bounds}, got {ranged_factor}.")
+
+        if not bounds[0] <= ranged_factor[0] <= ranged_factor[1] <= bounds[1]:
+            raise ValueError(f"{name}[0] should be smaller than {name}[1] got {ranged_factor}")
+    else:
+        raise TypeError(
+            f"{name} should be a torch.Tensor with length 2 whose values between {bounds}. Got {ranged_factor}."
+        )
+
+
+def _singular_range_check(
+    ranged_factor: torch.Tensor,
+    name: str,
+    bounds: Optional[Tuple[float, float]] = None,
+    skip_none: bool = False,
+    mode: str = "2d",
+) -> None:
+    """Check if bounds[0] <= ranged_factor[0] <= bounds[1] and bounds[0] <= ranged_factor[1] <= bounds[1]."""
+    if _in_sampler_rebuild():
+        return
+    if mode == "2d":
+        dim_size = 2
+    elif mode == "3d":
+        dim_size = 3
+    else:
+        raise ValueError(f"'mode' shall be either 2d or 3d. Got {mode}")
+
+    if skip_none and ranged_factor is None:
+        return
+    if bounds is None:
+        bounds = (float("-inf"), float("inf"))
+    if ranged_factor.dim() == 1 and len(ranged_factor) == dim_size:
+        for f in ranged_factor:
+            if not bounds[0] <= f <= bounds[1]:
+                raise ValueError(f"{name} out of bounds. Expected inside {bounds}, got {ranged_factor}.")
+    else:
+        raise TypeError(
+            f"{name} should be a float number or a tuple with length {dim_size} whose values between {bounds}."
+            f"Got {ranged_factor}"
+        )
+
+
+def _tuple_range_reader(
+    input_range: Union[torch.Tensor, float, Tuple[Any, ...]],
+    target_size: int,
+    device: Optional[torch.device] = None,
+    dtype: Optional[torch.dtype] = None,
+    name: str = "input_range",
+    bounds: Optional[Tuple[float, float]] = None,
+) -> torch.Tensor:
+    """Given target_size, it will generate the corresponding (target_size, 2) range torch.Tensor.
+
+    This is for element-wise params.
+
+    Every read range is checked against ``bounds``, when given, the way :func:`_range_bound` checks
+    the 2D scalar and explicit forms, so a 3D angle past one turn raises at construction instead of
+    being sampled (#4617). ``name`` only names the parameter in that error.
+
+    Example:
+    >>> degree = torch.tensor([0.2, 0.3])
+    >>> _tuple_range_reader(degree, 3)  # read degree for yaw, pitch and roll.
+    tensor([[0.2000, 0.3000],
+            [0.2000, 0.3000],
+            [0.2000, 0.3000]])
+
+    """
+    target_shape = torch.Size([target_size, 2])
+
+    if isinstance(input_range, torch.Tensor):
+        if (len(input_range.shape) == 0) or (len(input_range.shape) == 1 and len(input_range) == 1):
+            if not _in_sampler_rebuild() and input_range < 0:
+                raise ValueError(f"If input_range is only one number it must be a positive number. Got{input_range}")
+            input_range_tmp = input_range.repeat(2).to(device=device, dtype=dtype) * _numbers_to_tensor(
+                [-1, 1], device, dtype
+            )
+            input_range_tmp = input_range_tmp.repeat(target_shape[0], 1)
+
+        elif len(input_range.shape) == 1 and len(input_range) == 2:
+            input_range_tmp = input_range.repeat(target_shape[0], 1).to(device=device, dtype=dtype)
+
+        elif len(input_range.shape) == 1 and len(input_range) == target_shape[0]:
+            input_range_tmp = input_range.unsqueeze(1).repeat(1, 2).to(device=device, dtype=dtype) * _numbers_to_tensor(
+                [-1, 1], device, dtype
+            )
+
+        elif input_range.shape == target_shape:
+            input_range_tmp = input_range.to(device=device, dtype=dtype)
+
+        else:
+            raise ValueError(
+                f"Degrees must be a {list(target_shape)} torch.tensor for the degree range for independent operation."
+                f"Got {input_range}"
+            )
+    elif isinstance(input_range, (float, int)):
+        if input_range < 0:
+            raise ValueError(f"If input_range is only one number it must be a positive number. Got{input_range}")
+        input_range_tmp = _numbers_to_tensor([-input_range, input_range], device, dtype).repeat(target_shape[0], 1)
+
+    elif (
+        isinstance(input_range, (tuple, list))
+        and len(input_range) == 2
+        and isinstance(input_range[0], (float, int))
+        and isinstance(input_range[1], (float, int))
+    ):
+        input_range_tmp = _numbers_to_tensor(input_range, device, dtype).repeat(target_shape[0], 1)
+
+    elif (
+        isinstance(input_range, (tuple, list))
+        and len(input_range) == target_shape[0]
+        and all(isinstance(x, (float, int)) for x in input_range)
+    ):
+        input_range_tmp = _numbers_to_tensor([(-s, s) for s in input_range], device, dtype)
+
+    elif (
+        isinstance(input_range, (tuple, list))
+        and len(input_range) == target_shape[0]
+        and all(isinstance(x, (tuple, list)) for x in input_range)
+    ):
+        input_range_tmp = _numbers_to_tensor(input_range, device, dtype)
+
+    else:
+        raise TypeError(
+            "If not pass a torch.tensor, it must be float, (float, float) for isotropic operation or a tuple of "
+            f"{target_size} floats or {target_size} (float, float) for independent operation. Got {input_range}."
+        )
+
+    if bounds is not None:
+        for row in input_range_tmp:
+            _joint_range_check(row, name, bounds)
+
+    return input_range_tmp

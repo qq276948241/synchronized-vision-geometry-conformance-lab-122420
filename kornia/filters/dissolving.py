@@ -1,0 +1,317 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from __future__ import annotations
+
+import os
+from typing import Any
+
+import torch
+from torch import nn
+
+from kornia.core import ImageModule
+from kornia.core.external import diffusers
+
+
+class _DissolvingWraper_HF:
+    def __init__(self, model: nn.Module, num_ddim_steps: int = 50, is_sdxl: bool = False) -> None:
+        self.model = model
+        self.num_ddim_steps = num_ddim_steps
+        self.is_sdxl = is_sdxl
+        self.tokenizer = self.model.tokenizer
+        self.model.scheduler.set_timesteps(self.num_ddim_steps)
+        self.total_steps = len(self.model.scheduler.timesteps)  # Total number of sampling steps.
+        self.prompt: str
+        self.context: torch.Tensor
+        self.pooled_embeddings: torch.Tensor | None = None
+        self.add_time_ids: torch.Tensor | None = None
+
+    def predict_start_from_noise(self, noise_pred: torch.Tensor, timestep: int, latent: torch.Tensor) -> torch.Tensor:
+        return (
+            torch.sqrt(1.0 / self.model.scheduler.alphas_cumprod[timestep]) * latent
+            - torch.sqrt(1.0 / self.model.scheduler.alphas_cumprod[timestep] - 1) * noise_pred
+        )
+
+    @torch.no_grad()
+    def init_prompt(self, prompt: str) -> None:
+        if self.is_sdxl:
+            # Handle models with dual text encoders
+            tokenizers = (
+                [self.model.tokenizer, self.model.tokenizer_2]
+                if hasattr(self.model, "tokenizer_2")
+                else [self.model.tokenizer]
+            )
+            text_encoders = (
+                [self.model.text_encoder, self.model.text_encoder_2]
+                if hasattr(self.model, "text_encoder_2")
+                else [self.model.text_encoder]
+            )
+
+            prompt_embeds_list = []
+            pooled_prompt_embeds = None
+
+            for i, (tokenizer, text_encoder) in enumerate(zip(tokenizers, text_encoders)):
+                text_inputs = tokenizer(
+                    [prompt],
+                    padding="max_length",
+                    max_length=tokenizer.model_max_length,
+                    truncation=True,
+                    return_tensors="pt",
+                )
+                text_input_ids = text_inputs.input_ids.to(self.model.device)
+
+                outputs = text_encoder(text_input_ids, output_hidden_states=True)
+                # Extract pooled embeddings from the last text encoder
+                if i == len(tokenizers) - 1:
+                    # Get pooled output from text encoder
+                    pooled_prompt_embeds = (
+                        outputs.pooler_output if hasattr(outputs, "pooler_output") else outputs.text_embeds
+                    )
+                # Get the penultimate hidden state
+                prompt_embeds = outputs.hidden_states[-2]
+                prompt_embeds_list.append(prompt_embeds)
+
+            prompt_embeds = torch.concat(prompt_embeds_list, dim=-1)
+
+            # Get negative (unconditional) embeddings
+            negative_prompt_embeds_list = []
+            negative_pooled_prompt_embeds = None
+
+            for i, (tokenizer, text_encoder) in enumerate(zip(tokenizers, text_encoders)):
+                uncond_inputs = tokenizer(
+                    [""],
+                    padding="max_length",
+                    max_length=tokenizer.model_max_length,
+                    return_tensors="pt",
+                )
+                uncond_input_ids = uncond_inputs.input_ids.to(self.model.device)
+
+                outputs = text_encoder(uncond_input_ids, output_hidden_states=True)
+                # Extract pooled embeddings from the last text encoder
+                if i == len(tokenizers) - 1:
+                    negative_pooled_prompt_embeds = (
+                        outputs.pooler_output if hasattr(outputs, "pooler_output") else outputs.text_embeds
+                    )
+                negative_prompt_embeds = outputs.hidden_states[-2]
+                negative_prompt_embeds_list.append(negative_prompt_embeds)
+
+            negative_prompt_embeds = torch.concat(negative_prompt_embeds_list, dim=-1)
+
+            self.context = torch.cat([negative_prompt_embeds, prompt_embeds])
+            # Type narrowing: these are guaranteed to be set in the loops above when is_sdxl=True
+            if pooled_prompt_embeds is not None and negative_pooled_prompt_embeds is not None:
+                self.pooled_embeddings = torch.cat([negative_pooled_prompt_embeds, pooled_prompt_embeds])
+
+            # Create time_ids for models that require additional conditioning
+            # Format: (original_size, crops_coords_top_left, target_size)
+            add_time_ids = torch.tensor([[1024, 1024, 0, 0, 1024, 1024]], device=self.model.device)
+            self.add_time_ids = torch.cat([add_time_ids, add_time_ids])
+        else:
+            # SD 1.x
+            uncond_input = self.model.tokenizer(
+                [""], padding="max_length", max_length=self.model.tokenizer.model_max_length, return_tensors="pt"
+            )
+            uncond_embeddings = self.model.text_encoder(uncond_input.input_ids.to(self.model.device))[0]
+            text_input = self.model.tokenizer(
+                [prompt],
+                padding="max_length",
+                max_length=self.model.tokenizer.model_max_length,
+                truncation=True,
+                return_tensors="pt",
+            )
+            text_embeddings = self.model.text_encoder(text_input.input_ids.to(self.model.device))[0]
+            self.context = torch.cat([uncond_embeddings, text_embeddings])
+
+        self.prompt = prompt
+
+    # Encode the image to latent using the VAE.
+    @torch.no_grad()
+    def encode_tensor_to_latent(self, image: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            # The VAE weights stay in the pipeline dtype (e.g. float32), so inputs of any
+            # user dtype (e.g. float64) must be cast to it, not only moved to the device.
+            image = (image / 0.5 - 1).to(device=self.model.device, dtype=self.model.vae.dtype)
+            latents = self.model.vae.encode(image)["latent_dist"].sample()
+            return latents * 0.18215
+
+    @torch.no_grad()
+    def decode_tensor_to_latent(self, latents: torch.Tensor) -> torch.Tensor:
+        # Detach from autograd, then match the VAE device/dtype (allocates only on mismatch).
+        latents = latents.detach().to(device=self.model.device, dtype=self.model.vae.dtype)
+        latents = latents * (1.0 / 0.18215)  # Fused division as multiplication (faster)
+        # Reduce attribute lookups by localizing frequently used attributes
+        vae_decode = self.model.vae.decode
+        image = vae_decode(latents)["sample"]
+        # Use in-place arithmetic/clamp for throughput
+        image = image.div_(2).add_(0.5)
+        image.clamp_(0, 1)
+        return image
+
+    @torch.no_grad()
+    def one_step_dissolve(self, latent: torch.Tensor, i: int) -> torch.Tensor:
+        _, cond_embeddings = self.context.chunk(2)
+        latent = latent.clone().detach()
+        # NOTE: This implementation use a reversed timesteps but can reach to
+        # a stable dissolving effect.
+        t = self.num_ddim_steps - self.model.scheduler.timesteps[i]
+        latent = self.model.scheduler.scale_model_input(latent, t)
+        cond_embeddings = cond_embeddings.repeat(latent.size(0), 1, 1)
+
+        if self.is_sdxl:
+            # Pass additional conditioning to models that require it
+            # Type narrowing: these are guaranteed to be set when is_sdxl=True
+            if self.pooled_embeddings is not None and self.add_time_ids is not None:
+                _, pooled_embeds = self.pooled_embeddings.chunk(2)
+                _, add_time_ids = self.add_time_ids.chunk(2)
+
+                # Expand embeddings to match batch size if needed
+                batch_size = latent.size(0)
+                if pooled_embeds.size(0) != batch_size:
+                    pooled_embeds = pooled_embeds.expand(batch_size, -1)
+                if add_time_ids.size(0) != batch_size:
+                    add_time_ids = add_time_ids.expand(batch_size, -1)
+
+                added_cond_kwargs = {
+                    "text_embeds": pooled_embeds,
+                    "time_ids": add_time_ids,
+                }
+                noise_pred = self.model.unet(latent, t, cond_embeddings, added_cond_kwargs=added_cond_kwargs).sample
+        else:
+            noise_pred = self.model.unet(latent, t, cond_embeddings).sample
+
+        return self.predict_start_from_noise(noise_pred, t, latent)
+
+    @torch.no_grad()
+    def dissolve(self, image: torch.Tensor, t: int) -> torch.Tensor:
+        self.init_prompt("")
+        latent = self.encode_tensor_to_latent(image)
+        ddim_latents = self.one_step_dissolve(latent, t)
+        return self.decode_tensor_to_latent(ddim_latents)
+
+
+class StableDiffusionDissolving(ImageModule):
+    r"""Dissolve an image with one reverse-diffusion step of a Stable Diffusion model.
+
+    ``dissolved = StableDiffusionDissolving(version)(input, step_number)`` encodes a ``(B, 3, H, W)`` image with the
+    model's VAE, takes one reverse-diffusion step at ``step_number``, an index into the model's 1000-step schedule from
+    0 to 999, and decodes the result :cite:`shi2024dissolving`. It needs the optional ``diffusers``
+    package, and the constructor loads the checkpoint with ``from_pretrained``.
+
+    .. list-table::
+        :widths: 32 32 32
+        :header-rows: 1
+
+        * - SD 1.4
+          - SD 1.5
+          - SD XL
+        * - .. figure:: https://raw.githubusercontent.com/kornia/data/main/dslv-sd-1.4.png
+          - .. figure:: https://raw.githubusercontent.com/kornia/data/main/dslv-sd-1.5.png
+          - .. figure:: https://raw.githubusercontent.com/kornia/data/main/dslv-sd-xl.png
+
+    Convention:
+        - ``input`` is an image in :math:`[0, 1]`, rescaled to :math:`[-1, 1]` before encoding and not clamped; the
+          result is clamped to :math:`[0, 1]`.
+        - The model runs under ``torch.no_grad()``: the result has no gradient, and it lives on the model's device in
+          the VAE's dtype.
+        - The latent is sampled, so two calls on the same input differ.
+
+    Args:
+        version: the version of the stable diffusion model, ``"1.4"``, ``"1.5"`` or ``"xl"``. SD 1.x removes more
+            detail than SD XL.
+        **kwargs: additional arguments for ``from_pretrained``.
+
+    Raises:
+        NotImplementedError: if ``version`` is none of the three above.
+
+    See Also:
+        - :class:`~kornia.augmentation.RandomDissolving`: clamps the input and applies it to a batch with a
+          sampled step and a probability.
+
+    """
+
+    def __init__(self, version: str = "1.5", **kwargs: Any):
+        super().__init__()
+        DDIMScheduler = diffusers.DDIMScheduler
+
+        # Load the scheduler and model pipeline from diffusers library
+        scheduler = DDIMScheduler(
+            beta_start=0.00085,
+            beta_end=0.012,
+            beta_schedule="scaled_linear",
+            clip_sample=False,
+            set_alpha_to_one=False,
+            steps_offset=1,
+        )
+
+        # Filter out arguments that are not supported by all component models
+        kwargs.pop("offload_state_dict", None)
+
+        # Get HF token from environment if not explicitly provided
+        if "token" not in kwargs:
+            hf_token = os.environ.get("HF_TOKEN")
+            if hf_token:
+                kwargs["token"] = hf_token
+
+        is_sdxl = False
+
+        if version == "1.4":
+            StableDiffusionPipeline = diffusers.StableDiffusionPipeline
+            self._sdm_model = StableDiffusionPipeline.from_pretrained(
+                "CompVis/stable-diffusion-v1-4", scheduler=scheduler, **kwargs
+            )
+        elif version == "1.5":
+            StableDiffusionPipeline = diffusers.StableDiffusionPipeline
+            self._sdm_model = StableDiffusionPipeline.from_pretrained(
+                "runwayml/stable-diffusion-v1-5", scheduler=scheduler, **kwargs
+            )
+        elif version == "xl":
+            StableDiffusionXLPipeline = diffusers.StableDiffusionXLPipeline
+            self._sdm_model = StableDiffusionXLPipeline.from_pretrained(
+                "stabilityai/stable-diffusion-xl-base-1.0", scheduler=scheduler, **kwargs
+            )
+            is_sdxl = True
+        else:
+            raise NotImplementedError(
+                f"Unsupported Stable Diffusion version {version!r}. Supported versions are '1.4', '1.5', and 'xl'."
+            )
+
+        self.model = _DissolvingWraper_HF(self._sdm_model, num_ddim_steps=1000, is_sdxl=is_sdxl)
+
+    def forward(self, input: torch.Tensor, step_number: int) -> torch.Tensor:
+        """Apply one Stable Diffusion dissolving step to an image tensor.
+
+        The wrapped diffusion model progressively removes or weakens image
+        content according to the requested diffusion timestep. Lower and higher
+        ``step_number`` values correspond to different points on the internal
+        denoising schedule configured by the wrapper.
+
+        Args:
+            input: Image tensor passed to the wrapped dissolving model. The
+                expected shape follows the model wrapper, typically
+                ``(B, C, H, W)``, where :math:`B` is the batch size,
+                :math:`C` is the channel count, :math:`H` is the image height,
+                and :math:`W` is the image width.
+            step_number: Integer diffusion timestep used by the dissolving
+                process. It selects how far along the configured DDIM schedule
+                the image is processed.
+
+        Returns:
+            Tensor produced by the diffusion model at ``step_number``. The
+            tensor follows the wrapper's image layout and represents the
+            dissolved version of ``input``.
+        """
+        return self.model.dissolve(input, step_number)

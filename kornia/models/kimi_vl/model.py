@@ -1,0 +1,127 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from __future__ import annotations
+
+from typing import Optional
+
+import torch
+from torch import nn
+
+from .config import KimiVLConfig, KimiVLProjectorConfig
+from .moonvit import MoonViT
+
+__all__ = ["KimiVLModel", "KimiVLProjector"]
+
+
+class KimiVLProjector(nn.Module):
+    """KimiVL projector with patch merging and MLP."""
+
+    def __init__(self, config: KimiVLProjectorConfig) -> None:
+        super().__init__()
+        self.downsample_ratio = 2
+
+        # Pre-norm (applied before patch merging, on the vision encoder output dimension)
+        self.pre_norm = nn.LayerNorm(config.input_dim)
+
+        # Merging each spatial group multiplies the dimension by downsample_ratio**2.
+        mlp_input_dim = config.input_dim * (self.downsample_ratio**2)
+
+        # MLP
+        self.mlp = nn.Sequential(
+            nn.Linear(mlp_input_dim, config.hidden_dim),
+            nn.GELU(),
+            nn.Linear(config.hidden_dim, config.output_dim),
+            nn.Dropout(config.dropout_p),
+        )
+
+    def forward(self, x: torch.Tensor, h: int, w: int) -> torch.Tensor:
+        """Forward pass.
+
+        Args:
+            x: Input features (B, N, D)
+            h: Height in patches
+            w: Width in patches
+
+        Returns:
+            Projected features (B, N/4, output_dim)
+        """
+        B, _N, D = x.shape
+        ratio = self.downsample_ratio
+
+        # Apply pre-norm
+        x = self.pre_norm(x)
+
+        # Reshape the patch grid into spatial groups of ratio x ratio patches.
+        new_height, new_width = h // ratio, w // ratio
+        x = x.view(B, new_height, ratio, new_width, ratio, D)
+
+        # Place the output-grid dimensions before the offsets within each group.
+        x = x.permute(0, 1, 3, 2, 4, 5).contiguous()
+
+        # Flatten the output grid and concatenate each group's patch features.
+        x = x.view(B, new_height * new_width, ratio * ratio * D)
+
+        # MLP
+        return self.mlp(x)
+
+
+class KimiVLModel(nn.Module):
+    """KimiVL Vision-Language Model (Vision Part).
+
+    This model includes the Vision Encoder (MoonViT) and the Projector.
+    It does not include the LLM decoder, as Kornia focuses on the vision components.
+
+    Args:
+        config: KimiVL configuration.
+    """
+
+    def __init__(self, config: KimiVLConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.patch_size = config.vision_config.patch_size
+
+        # Vision Encoder (MoonViT)
+        self.vision_encoder = MoonViT(config.vision_config)
+
+        # Projector
+        self.projector = KimiVLProjector(config.projector_config)
+
+    def forward(self, images: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Forward pass.
+
+        Args:
+            images: (B, C, H, W) image normalized with mean = std = 0.5 per channel, i.e. ``2 * x - 1`` for an image
+                ``x`` in ``[0, 1]``, as the Kimi-VL checkpoint's ``preprocessor_config.json`` specifies. H and W must
+                be multiples of ``2 * patch_size`` (28 for the released checkpoint): sizes that are not multiples of
+                ``patch_size`` are cropped silently, and an odd number of patch rows or columns raises.
+            attention_mask: (B, N), (B, N, N) or (B, 1, N, N) optional boolean mask for the vision encoder over its N
+                patches, ``True`` where a patch may attend to another. A (B, N) mask marks the patches every patch may
+                attend to (padding is ``False``), and a (B, N, N) mask holds one mask per sample; both are shared by
+                the heads (see :class:`~kornia.models.kimi_vl.moonvit.MoonViTAttention`).
+
+        Returns:
+            Projected visual features (B, seq_len, output_dim)
+        """
+        vision_features = self.vision_encoder(images, attention_mask=attention_mask)  # (B, N, D)
+
+        # Calculate patch grid size
+        H, W = images.shape[2], images.shape[3]
+        patch_size = self.patch_size
+        h_patches = H // patch_size
+        w_patches = W // patch_size
+        return self.projector(vision_features, h_patches, w_patches)

@@ -1,0 +1,26 @@
+# Read the Docs configuration file for Sphinx projects
+# See https://docs.readthedocs.io/en/stable/config-file/v2.html for details
+
+# Required
+version: 2
+
+# Set the OS, Python version and other tools you might need
+build:
+  os: ubuntu-22.04
+  tools:
+    python: "3.11"
+
+# Build documentation in the "docs/" directory with Sphinx
+sphinx:
+  configuration: docs/source/conf.py
+  fail_on_warning: true
+
+# Install kornia and its docs extra from uv.lock (`uv sync --extra docs`), the versions that `pixi run build-docs`
+# and the docs workflow use, so that `fail_on_warning` above checks pinned versions rather than the newest release
+# of Sphinx or an extension. Update the docs dependencies by relocking.
+python:
+  install:
+    - method: uv
+      command: sync
+      extras:
+        - docs

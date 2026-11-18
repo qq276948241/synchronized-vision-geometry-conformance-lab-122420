@@ -1,0 +1,260 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from unittest import mock
+
+import pytest
+import torch
+
+import kornia
+
+from testing.base import BaseTester
+
+
+def _lovasz_grad_reference(foreground_sorted):
+    """Berman's lovasz_grad in float64, with the counts kept as Python integers (foreground_sorted holds 0. and 1.)."""
+    total = int(foreground_sorted.sum().item())
+    seen_foreground = seen_background = 0
+    jaccard = []
+    for value in foreground_sorted.tolist():
+        if value:
+            seen_foreground += 1
+        else:
+            seen_background += 1
+        jaccard.append(1.0 - (total - seen_foreground) / (total + seen_background))
+    out = torch.tensor(jaccard, dtype=torch.float64)
+    out[1:] = out[1:] - out[:-1]
+    return out
+
+
+def _lovasz_hinge_reference(logits, labels):
+    """kornia's reduction of Berman's per-image Lovasz hinge, evaluated in float64 one sample at a time."""
+    logits = logits.double()
+    loss = torch.zeros((), dtype=torch.float64)
+    for b in range(logits.shape[0]):
+        target = labels[b].double().flatten()
+        errors = (1.0 - logits[b].flatten() * (2.0 * target - 1.0)).relu()
+        errors_sorted, permutation = errors.sort(descending=True)
+        loss = loss + errors_sorted.dot(_lovasz_grad_reference(target[permutation])) / logits.shape[0]
+    return loss
+
+
+class TestLovaszHingeLoss(BaseTester):
+    @pytest.mark.parametrize("as_module", [False, True])
+    def test_sorted_targets_without_repeated_batch_indices(self, device, dtype, as_module):
+        """Sorting labels needs no pixel-sized repeated batch index."""
+        logits = torch.tensor(
+            [[[[0.3, -0.4, 0.9]]], [[[0.8, 0.1, -0.6]]]], device=device, dtype=dtype, requires_grad=True
+        )
+        labels = torch.tensor([[[1, 0, 0]], [[1, 1, 0]]], device=device)
+        criterion = kornia.losses.LovaszHingeLoss() if as_module else kornia.losses.lovasz_hinge_loss
+
+        with mock.patch.object(torch.Tensor, "repeat", side_effect=AssertionError("batch-index allocation")):
+            actual = criterion(logits, labels)
+
+        # Per-image weights are [1/2, 1/2, 0] and [1/2, 1/6, 1/3] in descending-error order.
+        self.assert_close(actual, torch.tensor(113 / 120, device=device, dtype=dtype))
+        expected_grad = torch.tensor([[[[-1 / 4, 0, 1 / 4]]], [[[-1 / 6, -1 / 4, 1 / 12]]]], device=device, dtype=dtype)
+        self.assert_close(torch.autograd.grad(actual, logits)[0], expected_grad)
+
+    @pytest.mark.parametrize(("pred_batch", "target_batch"), [(1, 2), (2, 1), (2, 3), (3, 2)])
+    @pytest.mark.parametrize("as_module", [False, True])
+    def test_mismatched_batch(self, pred_batch, target_batch, as_module, device, dtype):
+        logits = torch.zeros(pred_batch, 1, 2, 3, device=device, dtype=dtype)
+        labels = torch.zeros(target_batch, 2, 3, device=device, dtype=torch.int64)
+        criterion = kornia.losses.LovaszHingeLoss() if as_module else kornia.losses.lovasz_hinge_loss
+        with pytest.raises(ValueError, match="pred and target shapes must be the same"):
+            criterion(logits, labels)
+
+    @pytest.mark.parametrize("as_module", [False, True])
+    def test_empty_batch_6266(self, as_module, device, dtype):
+        """An empty batch flattens without a -1 to infer; the mean over no pixels is nan, as torch's mean is."""
+        logits = torch.rand(0, 1, 4, 5, device=device, dtype=dtype, requires_grad=True)
+        labels = torch.randint(0, 2, (0, 4, 5), device=device)
+        loss_fn = kornia.losses.LovaszHingeLoss() if as_module else kornia.losses.lovasz_hinge_loss
+        loss = loss_fn(logits, labels)
+        assert loss.shape == ()
+        assert loss.dtype == dtype
+        assert torch.isnan(loss)
+        loss.backward()
+        assert logits.grad.shape == logits.shape
+
+    def test_smoke(self, device, dtype):
+        # One-pixel images, the only ones without a difference of Jaccard weights: each weight is 1, so the loss is the
+        # batch mean of the hinge errors relu(1 - z (2 t - 1)): (0.75 + 1.5 + 0) / 3.
+        logits = torch.tensor([0.25, -0.5, -2.0], device=device, dtype=dtype).view(3, 1, 1, 1)
+        labels = torch.tensor([1, 1, 0], device=device).view(3, 1, 1)
+
+        criterion = kornia.losses.LovaszHingeLoss()
+        self.assert_close(criterion(logits, labels), torch.tensor(0.75, device=device, dtype=dtype))
+
+    def test_exception(self):
+        criterion = kornia.losses.LovaszHingeLoss()
+
+        with pytest.raises(ValueError) as errinfo:
+            criterion(torch.rand(1, 1, 1, 2), torch.rand(1, 1, 1))
+        assert "pred and target shapes must be the same. Got:" in str(errinfo)
+
+        with pytest.raises(ValueError) as errinfo:
+            criterion(torch.rand(1, 1, 1, 1), torch.rand(1, 1, 1, device="meta"))
+        assert "pred and target must be in the same device. Got:" in str(errinfo)
+
+    def test_multi_class(self, device, dtype):
+        num_classes = 5
+        logits = torch.rand(2, num_classes, 3, 2, device=device, dtype=dtype)
+        labels = torch.rand(2, 3, 2) * num_classes
+        labels = labels.to(device).long()
+
+        criterion = kornia.losses.LovaszHingeLoss()
+        with pytest.raises(Exception):
+            criterion(logits, labels)
+
+    def test_output_dtype_follows_the_prediction(self, device, dtype):
+        logits = torch.randn(2, 1, 4, 5, device=device, dtype=dtype)
+        labels = torch.randint(0, 2, (2, 4, 5), device=device)
+        assert kornia.losses.lovasz_hinge_loss(logits, labels).dtype == dtype
+        assert kornia.losses.LovaszHingeLoss()(logits, labels).dtype == dtype
+
+    def test_default_dtype_does_not_change_the_loss(self, device, dtype):
+        logits = torch.randn(2, 1, 4, 5, device=device, dtype=dtype)
+        labels = torch.randint(0, 2, (2, 4, 5), device=device)
+        expected = kornia.losses.lovasz_hinge_loss(logits, labels)
+        original = torch.get_default_dtype()
+        try:
+            torch.set_default_dtype(torch.float32 if original == torch.float64 else torch.float64)
+            loss = kornia.losses.lovasz_hinge_loss(logits, labels)
+        finally:
+            torch.set_default_dtype(original)
+        assert loss.dtype == dtype
+        self.assert_close(loss, expected)
+
+    @pytest.mark.applies_to(when=lambda p: p["device_name"] != "mps", reason="MPS does not support float64")
+    def test_float64_matches_a_float64_reference(self, device):
+        torch.manual_seed(0)
+        logits = torch.randn(2, 1, 16, 24, device=device, dtype=torch.float64, requires_grad=True)
+        labels = torch.randint(0, 2, (2, 16, 24), device=device)
+        reference_logits = logits.detach().cpu().clone().requires_grad_()
+        expected = _lovasz_hinge_reference(reference_logits, labels.cpu())
+        expected_grad = torch.autograd.grad(expected, reference_logits)[0]
+        loss = kornia.losses.lovasz_hinge_loss(logits, labels)
+        # the Jaccard weights are exact in float64: only the summation order differs from the reference
+        self.assert_close(loss, expected.to(device), rtol=1e-12, atol=1e-12)
+        self.assert_close(torch.autograd.grad(loss, logits)[0], expected_grad.to(device), rtol=1e-12, atol=1e-15)
+
+    def test_large_foreground_counts(self, device, dtype):
+        # More than 65504 foreground pixels exceed float16's finite range, and cumulative counts above 256 (bfloat16)
+        # or 2048 (float16) are not exact in half precision.
+        logits = torch.zeros((1, 1, 257, 257), device=device, dtype=dtype, requires_grad=True)
+        labels = torch.ones((1, 257, 257), device=device, dtype=torch.int64)
+        loss = kornia.losses.lovasz_hinge_loss(logits, labels)
+        # every error is 1 and the Jaccard weights sum to the last Jaccard index, 1
+        self.assert_close(loss, torch.tensor(1.0, device=device, dtype=dtype))
+        assert torch.isfinite(torch.autograd.grad(loss, logits)[0]).all()
+
+    @pytest.mark.parametrize(
+        "logits, expected",
+        [
+            # errors 1 - logit * sign: [-1, 0, 1, -2]; sorted labels [0, 0, 1, 1] weigh them by [1/3, 1/6, 1/4, 1/4]
+            ([[2, -1], [0, 3]], 1 / 3),
+            # errors [0, 1, 1, 0]: the two errors of 1 take the weights 1/3 and 1/6
+            ([[True, False], [False, True]], 1 / 2),
+        ],
+    )
+    def test_integer_logits_return_a_float_loss(self, device, logits, expected):
+        logits = torch.tensor([[logits]], device=device)
+        labels = torch.tensor([[[1, 0], [0, 1]]], device=device)
+        loss = kornia.losses.lovasz_hinge_loss(logits, labels)
+        assert loss.dtype == torch.float32
+        self.assert_close(loss, torch.tensor(expected, device=device))
+
+    def test_gradcheck(self, device, dtype):
+        dtype = torch.float64
+        num_classes = 1
+        logits = torch.rand(2, num_classes, 3, 2, device=device, dtype=dtype)
+        labels = torch.randint(0, num_classes, (2, 3, 2), device=device, dtype=dtype)
+
+        self.gradcheck(kornia.losses.lovasz_hinge_loss, (logits, labels))
+
+    def test_dynamo(self, device, dtype, torch_optimizer):
+        # Both labels in each image: an all-background target makes the Jaccard weights trivial.
+        logits = torch.tensor([[[[0.3, -0.4, 0.9]]], [[[0.8, 0.1, -0.6]]]], device=device, dtype=dtype)
+        labels = torch.tensor([[[1, 0, 0]], [[1, 1, 0]]], device=device)
+
+        op = kornia.losses.lovasz_hinge_loss
+        op_optimized = torch_optimizer(op)
+
+        self.assert_close(op(logits, labels), op_optimized(logits, labels))
+
+    def test_module(self, device, dtype):
+        num_classes = 1
+        logits = torch.rand(2, num_classes, 1, 2, device=device, dtype=dtype)
+        labels = torch.rand(2, 1, 2) * num_classes
+        labels = labels.to(device).long()
+
+        op = kornia.losses.lovasz_hinge_loss
+        op_module = kornia.losses.LovaszHingeLoss()
+
+        self.assert_close(op(logits, labels), op_module(logits, labels))
+
+
+class TestConventionsLovaszHingeLoss(BaseTester):
+    """Pins for the batch reduction, value and target handling of :func:`lovasz_hinge_loss`."""
+
+    @staticmethod
+    def _logits_and_labels(device, dtype):
+        g = torch.Generator().manual_seed(0)
+        logits = torch.randn(2, 1, 4, 6, generator=g).to(device=device, dtype=dtype)
+        labels = torch.zeros(2, 4, 6, dtype=torch.long, device=device)
+        labels[0, 1:3, 1:3] = 1  # 4 foreground pixels in image 0, 15 in image 1
+        labels[1, 1:, 1:] = 1
+        return logits, labels
+
+    def test_convention_lovasz_hinge_loss_averages_per_image(self, device, dtype):
+        # One Lovász hinge per image, averaged over the batch (Berman's lovasz_hinge(per_image=True)); the batch
+        # flattened into one image (per_image=False) gives another value
+        logits, labels = self._logits_and_labels(device, dtype)
+        loss = kornia.losses.lovasz_hinge_loss
+        per_image = (loss(logits[:1], labels[:1]) + loss(logits[1:], labels[1:])) / 2
+        self.assert_close(loss(logits, labels), per_image)
+        flattened = loss(torch.cat([logits[0], logits[1]], -1)[None], torch.cat([labels[0], labels[1]], -1)[None])
+        assert (flattened - per_image).abs() > 0.02
+
+    def test_convention_lovasz_hinge_loss_unit_margin_logits_give_twice_the_jaccard_loss(self, device, dtype):
+        # The loss is the Lovász extension of the Jaccard loss at the hinge errors relu(1 - z (2t - 1)), not 1 - IoU:
+        # with logits of magnitude 1 every wrong pixel has error 2, so the loss is 2 (1 - IoU); confidently correct
+        # logits give 0
+        labels = torch.zeros(1, 4, 6, dtype=torch.long, device=device)
+        labels[0, 1:3, 1:5] = 1  # 8 foreground pixels
+        predicted = labels.clone()
+        predicted[0, 1, 1] = 0  # one false negative
+        predicted[0, 3, 4:] = 1  # two false positives
+        iou = (predicted & labels).sum() / (predicted | labels).sum()  # 7 / 10
+        logits = (2.0 * predicted - 1.0)[:, None].to(dtype)
+        loss = kornia.losses.lovasz_hinge_loss(logits, labels)
+        self.assert_close(loss, (2 * (1 - iou)).to(dtype))
+        confident = (10.0 * (2 * labels - 1))[:, None].to(dtype)
+        self.assert_close(kornia.losses.lovasz_hinge_loss(confident, labels), torch.zeros_like(loss))
+
+    def test_convention_lovasz_hinge_loss_does_not_validate_the_target(self, device, dtype):
+        # The target is not checked to be binary and there is no ignore_index: a label of 2 or -100 is accepted, and
+        # -100 (the siblings' ignore_index) enters the hinge as a large negative sign that can make the loss negative,
+        # as it does on this fixture
+        logits, labels = self._logits_and_labels(device, dtype)
+        labels[:, 0, :2] = 2
+        assert kornia.losses.lovasz_hinge_loss(logits, labels).isfinite()
+        labels[:, 0, :2] = -100
+        assert kornia.losses.lovasz_hinge_loss(logits, labels) < 0

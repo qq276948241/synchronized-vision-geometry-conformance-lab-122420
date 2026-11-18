@@ -1,0 +1,940 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+import warnings
+from unittest.mock import patch
+
+import pytest
+import torch
+
+from kornia.augmentation.random_generator import (
+    AffineGenerator3D,
+    CropGenerator3D,
+    MotionBlurGenerator3D,
+    PerspectiveGenerator3D,
+    RotationGenerator3D,
+    center_crop_generator3d,
+)
+from kornia.geometry.bbox import infer_bbox_shape3d
+
+from testing.augmentation.utils import float32_literal_tolerance
+from testing.base import assert_close
+
+
+class RandomGeneratorBaseTests:
+    def test_valid_param_combinations(self):
+        raise NotImplementedError
+
+    def test_invalid_param_combinations(self):
+        raise NotImplementedError
+
+    def test_random_gen(self):
+        raise NotImplementedError
+
+    def test_same_on_batch(self):
+        raise NotImplementedError
+
+
+class TestRandomPerspectiveGen3D(RandomGeneratorBaseTests):
+    @pytest.mark.parametrize("batch_size", [0, 1, 8])
+    @pytest.mark.parametrize("depth,height,width", [(200, 200, 200)])
+    @pytest.mark.parametrize("distortion_scale", [torch.tensor(0.0), torch.tensor(0.5), torch.tensor(1.0)])
+    @pytest.mark.parametrize("same_on_batch", [True, False])
+    def test_valid_param_combinations(
+        self, depth, height, width, distortion_scale, batch_size, same_on_batch, device, dtype
+    ):
+        param_gen = PerspectiveGenerator3D(distortion_scale=distortion_scale.to(device=device, dtype=dtype))
+        param_gen(batch_shape=torch.Size((batch_size, depth, height, width)), same_on_batch=same_on_batch)
+
+    @pytest.mark.parametrize(
+        "depth,height,width,distortion_scale",
+        [
+            # Should be failed if distortion_scale > 1. or distortion_scale < 0.
+            (100, 100, -100, torch.tensor(-0.5)),
+            (100, 100, 100, torch.tensor(1.5)),
+            (100, 100, 100, torch.tensor([0.0, 0.5])),
+        ],
+    )
+    def test_invalid_param_combinations(self, depth, height, width, distortion_scale, device, dtype):
+        with pytest.raises(AssertionError):
+            PerspectiveGenerator3D(distortion_scale=distortion_scale.to(device=device, dtype=dtype))(
+                batch_shape=torch.Size((2, depth, height, width))
+            )
+
+    def test_random_gen(self, device, dtype):
+        tol = float32_literal_tolerance(dtype)
+        torch.manual_seed(42)
+        batch_size = 2
+
+        param_gen = PerspectiveGenerator3D(distortion_scale=torch.tensor(0.5, device=device, dtype=dtype))
+        res = param_gen(batch_shape=torch.Size((batch_size, 200, 200, 200)))
+
+        expected = {
+            "start_points": torch.tensor(
+                [
+                    [
+                        [0.0, 0.0, 0.0],
+                        [199.0, 0.0, 0.0],
+                        [199.0, 199.0, 0.0],
+                        [0.0, 199.0, 0.0],
+                        [0.0, 0.0, 199.0],
+                        [199.0, 0.0, 199.0],
+                        [199.0, 199.0, 199.0],
+                        [0.0, 199.0, 199.0],
+                    ],
+                    [
+                        [0.0, 0.0, 0.0],
+                        [199.0, 0.0, 0.0],
+                        [199.0, 199.0, 0.0],
+                        [0.0, 199.0, 0.0],
+                        [0.0, 0.0, 199.0],
+                        [199.0, 0.0, 199.0],
+                        [199.0, 199.0, 199.0],
+                        [0.0, 199.0, 199.0],
+                    ],
+                ],
+                device=device,
+                dtype=dtype,
+            ),
+            "end_points": torch.tensor(
+                [
+                    [
+                        [44.1135, 45.7502, 19.1432],
+                        [151.0347, 19.5224, 30.0448],
+                        [186.1714, 159.3179, 47.0386],
+                        [6.6593, 152.2701, 29.6790],
+                        [43.4702, 28.3858, 161.9453],
+                        [177.5298, 44.2721, 170.3048],
+                        [185.6710, 167.6275, 185.5184],
+                        [22.0682, 184.1540, 157.4157],
+                    ],
+                    [
+                        [5.2657, 13.4747, 17.9406],
+                        [189.0318, 27.3596, 0.3080],
+                        [151.4223, 195.2367, 44.3007],
+                        [29.1605, 182.1176, 40.4487],
+                        [28.8963, 45.1991, 171.2670],
+                        [181.8843, 31.7171, 180.7795],
+                        [163.4786, 151.6794, 159.5485],
+                        [14.0707, 159.5684, 169.5268],
+                    ],
+                ],
+                device=device,
+                dtype=dtype,
+            ),
+        }
+        assert res.keys() == expected.keys()
+        assert_close(res["start_points"], expected["start_points"], **tol)
+        assert_close(res["end_points"], expected["end_points"], **tol)
+
+    def test_same_on_batch(self, device, dtype):
+        tol = float32_literal_tolerance(dtype)
+        torch.manual_seed(42)
+        batch_size = 2
+
+        param_gen = PerspectiveGenerator3D(distortion_scale=torch.tensor(0.5, device=device, dtype=dtype))
+        res = param_gen(batch_shape=torch.Size((batch_size, 200, 200, 200)), same_on_batch=True)
+
+        expected = {
+            "start_points": torch.tensor(
+                [
+                    [
+                        [0.0, 0.0, 0.0],
+                        [199.0, 0.0, 0.0],
+                        [199.0, 199.0, 0.0],
+                        [0.0, 199.0, 0.0],
+                        [0.0, 0.0, 199.0],
+                        [199.0, 0.0, 199.0],
+                        [199.0, 199.0, 199.0],
+                        [0.0, 199.0, 199.0],
+                    ],
+                    [
+                        [0.0, 0.0, 0.0],
+                        [199.0, 0.0, 0.0],
+                        [199.0, 199.0, 0.0],
+                        [0.0, 199.0, 0.0],
+                        [0.0, 0.0, 199.0],
+                        [199.0, 0.0, 199.0],
+                        [199.0, 199.0, 199.0],
+                        [0.0, 199.0, 199.0],
+                    ],
+                ],
+                device=device,
+                dtype=dtype,
+            ),
+            "end_points": torch.tensor(
+                [
+                    [
+                        [44.1135, 45.7502, 19.1432],
+                        [151.0347, 19.5224, 30.0448],
+                        [186.1714, 159.3179, 47.0386],
+                        [6.6593, 152.2701, 29.6790],
+                        [43.4702, 28.3858, 161.9453],
+                        [177.5298, 44.2721, 170.3048],
+                        [185.6710, 167.6275, 185.5184],
+                        [22.0682, 184.1540, 157.4157],
+                    ],
+                    [
+                        [44.1135, 45.7502, 19.1432],
+                        [151.0347, 19.5224, 30.0448],
+                        [186.1714, 159.3179, 47.0386],
+                        [6.6593, 152.2701, 29.6790],
+                        [43.4702, 28.3858, 161.9453],
+                        [177.5298, 44.2721, 170.3048],
+                        [185.6710, 167.6275, 185.5184],
+                        [22.0682, 184.1540, 157.4157],
+                    ],
+                ],
+                device=device,
+                dtype=dtype,
+            ),
+        }
+        assert res.keys() == expected.keys()
+        assert_close(res["start_points"], expected["start_points"], **tol)
+        assert_close(res["end_points"], expected["end_points"], **tol)
+
+    @pytest.mark.parametrize("depth,height,width", [(1, 4, 4), (4, 1, 4), (4, 4, 1), (1, 1, 1), (2, 3, 5)])
+    @pytest.mark.device_agnostic
+    def test_traced_singleton_axis_5110(self, depth, height, width):
+        # #5110: torch.jit.trace passes the sizes as 0-d tensors, so the size-1 rule of #5071 has to be tensor
+        # arithmetic to reach the graph: a unit source extent and no corner offset along that axis. Every other axis
+        # keeps the eager extent, so the traced parameters equal the eager ones for the same seed.
+        class _Params(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.generator = PerspectiveGenerator3D(torch.tensor(1.0))
+
+            def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+                params = self.generator(x.shape)
+                return params["start_points"], params["end_points"]
+
+        volume = torch.zeros(2, 1, depth, height, width)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            traced = torch.jit.trace(_Params(), volume, check_trace=False)
+        torch.manual_seed(0)
+        start, end = traced(volume)
+        torch.manual_seed(0)
+        eager = PerspectiveGenerator3D(torch.tensor(1.0))(volume.shape)
+
+        x_end, y_end, z_end = max(width - 1, 1), max(height - 1, 1), max(depth - 1, 1)
+        expected = torch.tensor(
+            [
+                [0.0, 0.0, 0.0],
+                [x_end, 0.0, 0.0],
+                [x_end, y_end, 0.0],
+                [0.0, y_end, 0.0],
+                [0.0, 0.0, z_end],
+                [x_end, 0.0, z_end],
+                [x_end, y_end, z_end],
+                [0.0, y_end, z_end],
+            ]
+        ).expand(2, 8, 3)
+        assert torch.equal(start, expected)
+        assert torch.equal(start, eager["start_points"])
+        assert torch.equal(end, eager["end_points"])
+        for axis, size in ((0, width), (1, height), (2, depth)):
+            if size == 1:
+                assert torch.equal(end[..., axis], start[..., axis])
+
+    @pytest.mark.applies_to(dtypes=("float16", "bfloat16"), reason="checks the half-precision rounding")
+    def test_perspective3d_half_corners_round_once(self, device, dtype):
+        scale = torch.tensor(0.37, device=device, dtype=dtype)
+        gen = PerspectiveGenerator3D(scale)
+        gen.set_rng_device_and_dtype(device, dtype)
+        torch.manual_seed(0)
+        res = gen(torch.Size([16, 1, 40, 300, 411]))
+        torch.manual_seed(0)
+        draw = torch.rand(16, 8, 3, device=device, dtype=dtype).float()
+        sign = torch.tensor(
+            [[1, 1, 1], [-1, 1, 1], [-1, -1, 1], [1, -1, 1], [1, 1, -1], [-1, 1, -1], [-1, -1, -1], [1, -1, -1]],
+            device=device,
+            dtype=torch.float32,
+        )
+        start = torch.where(sign > 0, 0.0, torch.tensor([410.0, 299.0, 39.0], device=device))
+        factor = float(scale) * torch.tensor([411.0, 300.0, 40.0], device=device) / 2
+        assert torch.equal(res["end_points"], (start + factor * draw * sign).to(dtype))
+
+    @pytest.mark.applies_to(when=lambda p: p["device_name"] != "mps", reason="MPS does not support float64.")
+    def test_perspective3d_offsets_in_the_sampler_dtype(self, device):
+        # A float64 scale with the default float32 sampler scales in float32, as before the half fix.
+        gen = PerspectiveGenerator3D(torch.tensor(0.3, device=device, dtype=torch.float64))
+        gen.set_rng_device_and_dtype(device, torch.float32)
+        torch.manual_seed(0)
+        res = gen(torch.Size([16, 1, 7, 37, 1001]))
+        torch.manual_seed(0)
+        draw = torch.rand(16, 8, 3, device=device, dtype=torch.float32).double()
+        sampler_scale = torch.tensor(0.3, device=device, dtype=torch.float32)
+        factor = torch.stack([sampler_scale * 1001 / 2, sampler_scale * 37 / 2, sampler_scale * 7 / 2]).double()
+        sign = torch.tensor(
+            [[1, 1, 1], [-1, 1, 1], [-1, -1, 1], [1, -1, 1], [1, 1, -1], [-1, 1, -1], [-1, -1, -1], [1, -1, -1]],
+            device=device,
+            dtype=torch.float64,
+        )
+        start = torch.where(sign > 0, 0.0, torch.tensor([1000.0, 36.0, 6.0], device=device, dtype=torch.float64))
+        assert torch.equal(res["end_points"], start + factor * draw * sign)
+
+
+class TestRandomAffineGen3D(RandomGeneratorBaseTests):
+    @pytest.mark.parametrize("batch_shape", [(0, 200, 300, 400), (1, 200, 300, 400), (8, 200, 300, 400)])
+    @pytest.mark.parametrize("degrees", [torch.tensor([(0.0, 30.0), (0.0, 30.0), (0.0, 30.0)])])
+    @pytest.mark.parametrize("translate", [None, torch.tensor([0.1, 0.1, 0.1])])
+    @pytest.mark.parametrize(
+        "scale", [None, torch.tensor([[0.7, 1.2], [0.7, 1.2], [0.7, 1.2]]), torch.tensor([0.7, 1.2])]
+    )
+    @pytest.mark.parametrize(
+        "shear", [None, torch.tensor([[0.0, 20.0], [0.0, 20.0], [0.0, 20.0], [0.0, 20.0], [0.0, 20.0], [0.0, 20.0]])]
+    )
+    @pytest.mark.parametrize("same_on_batch", [True, False])
+    def test_valid_param_combinations(
+        self, batch_shape, degrees, translate, scale, shear, same_on_batch, device, dtype
+    ):
+        if isinstance(degrees, torch.Tensor):
+            degrees.to(dtype=dtype, device=device)
+        if isinstance(translate, torch.Tensor):
+            translate.to(dtype=dtype, device=device)
+        if isinstance(scale, torch.Tensor):
+            scale.to(dtype=dtype, device=device)
+        if isinstance(shear, torch.Tensor):
+            shear.to(dtype=dtype, device=device)
+
+        param_gen = AffineGenerator3D(degrees=degrees, translate=translate, scale=scale, shears=shear)
+        param_gen(batch_shape=torch.Size(batch_shape), same_on_batch=same_on_batch)
+
+    @pytest.mark.parametrize(
+        "depth,height,width,degrees,translate,scale,shear",
+        [
+            (-100, 100, 100, torch.tensor([[0, 9], [0, 9], [0, 9]]), None, None, None),
+            (100, -100, 100, torch.tensor([[0, 9], [0, 9], [0, 9]]), None, None, None),
+            (100, 100, -100, torch.tensor([[0, 9], [0, 9], [0, 9]]), None, None, None),
+            # (100, 100, 100, torch.tensor([0, 9]), None, None, None),
+            (100, 100, 100, torch.tensor([[0, 9], [0, 9], [0, 9]]), torch.tensor([0.1, 0.2]), None, None),
+            (100, 100, 100, torch.tensor([[0, 9], [0, 9], [0, 9]]), torch.tensor([0.1]), None, None),
+            (100, 100, 100, torch.tensor([[0, 9], [0, 9], [0, 9]]), None, torch.tensor([[0.2, 0.2, 0.2]]), None),
+            (100, 100, 100, torch.tensor([[0, 9], [0, 9], [0, 9]]), None, torch.tensor([0.2]), None),
+            (100, 100, 100, torch.tensor([[0, 9], [0, 9], [0, 9]]), None, None, torch.tensor([[20, 20, 30]])),
+            # (100, 100, 100, torch.tensor([[0, 9], [0, 9], [0, 9]]), None, None, torch.tensor([20])),
+        ],
+    )
+    def test_invalid_param_combinations(self, depth, height, width, degrees, translate, scale, shear, device, dtype):
+        if isinstance(degrees, torch.Tensor):
+            degrees.to(dtype=dtype, device=device)
+        if isinstance(translate, torch.Tensor):
+            translate.to(dtype=dtype, device=device)
+        if isinstance(scale, torch.Tensor):
+            scale.to(dtype=dtype, device=device)
+        if isinstance(shear, torch.Tensor):
+            shear.to(dtype=dtype, device=device)
+
+        with pytest.raises(
+            (AssertionError, TypeError, ValueError),
+            match=r"depth|height|width|[Dd]egrees|translate|scale",
+        ):
+            AffineGenerator3D(degrees=degrees, translate=translate, scale=scale, shears=shear)(
+                batch_shape=torch.Size((2, depth, height, width))
+            )
+
+    def test_random_gen(self, device, dtype):
+        tol = float32_literal_tolerance(dtype)
+        torch.manual_seed(42)
+        degrees = torch.tensor([[10, 20], [10, 20], [10, 20]], device=device, dtype=dtype)
+        translate = torch.tensor([0.1, 0.1, 0.1], device=device, dtype=dtype)
+        scale = torch.tensor([[0.7, 1.2], [0.7, 1.2], [0.7, 1.2]], device=device, dtype=dtype)
+        shear = torch.tensor([[0, 20], [0, 20], [0, 20], [0, 20], [0, 20], [0, 20]], device=device, dtype=dtype)
+
+        param_gen = AffineGenerator3D(degrees=degrees, translate=translate, scale=scale, shears=shear)
+        res = param_gen(batch_shape=torch.Size((2, 200, 200, 200)))
+
+        expected = {
+            "translations": torch.tensor(
+                [[14.7762, 9.6438, 15.4177], [2.7086, -2.8238, 2.9562]], device=device, dtype=dtype
+            ),
+            "center": torch.tensor(
+                [[99.5000, 99.5000, 99.5000], [99.5000, 99.5000, 99.5000]], device=device, dtype=dtype
+            ),
+            "scale": torch.tensor([[0.8283, 1.1704, 1.1673], [1.0968, 0.7666, 0.9968]], device=device, dtype=dtype),
+            "angles": torch.tensor(
+                [[18.8227, 13.8286, 13.9045], [19.1500, 19.5931, 16.0090]], device=device, dtype=dtype
+            ),
+            "sxy": torch.tensor([5.3316, 12.5490], device=device, dtype=dtype),
+            "sxz": torch.tensor([5.3926, 8.8273], device=device, dtype=dtype),
+            "syx": torch.tensor([5.9384, 16.6337], device=device, dtype=dtype),
+            "syz": torch.tensor([2.1063, 5.3899], device=device, dtype=dtype),
+            "szx": torch.tensor([7.1763, 3.9873], device=device, dtype=dtype),
+            "szy": torch.tensor([10.9438, 0.1232], device=device, dtype=dtype),
+        }
+        assert res.keys() == expected.keys()
+        assert_close(res["translations"], expected["translations"], **tol)
+        assert_close(res["center"], expected["center"], **tol)
+        assert_close(res["scale"], expected["scale"], **tol)
+        assert_close(res["angles"], expected["angles"], **tol)
+        assert_close(res["sxy"], expected["sxy"], **tol)
+        assert_close(res["sxz"], expected["sxz"], **tol)
+        assert_close(res["syx"], expected["syx"], **tol)
+        assert_close(res["syz"], expected["syz"], **tol)
+        assert_close(res["szx"], expected["szx"], **tol)
+        assert_close(res["szy"], expected["szy"], **tol)
+
+    def test_same_on_batch(self, device, dtype):
+        tol = float32_literal_tolerance(dtype)
+        torch.manual_seed(42)
+        degrees = torch.tensor([[10, 20], [10, 20], [10, 20]], device=device, dtype=dtype)
+        translate = torch.tensor([0.1, 0.1, 0.1], device=device, dtype=dtype)
+        scale = torch.tensor([[0.7, 1.2], [0.7, 1.2], [0.7, 1.2]], device=device, dtype=dtype)
+        shear = torch.tensor([[0, 20], [0, 20], [0, 20], [0, 20], [0, 20], [0, 20]], device=device, dtype=dtype)
+
+        param_gen = AffineGenerator3D(degrees=degrees, translate=translate, scale=scale, shears=shear)
+        res = param_gen(batch_shape=torch.Size((2, 200, 200, 200)), same_on_batch=True)
+
+        expected = {
+            "translations": torch.tensor(
+                [[-9.7371, 11.7457, 17.6309], [-9.7371, 11.7457, 17.6309]], device=device, dtype=dtype
+            ),
+            "center": torch.tensor(
+                [[99.5000, 99.5000, 99.5000], [99.5000, 99.5000, 99.5000]], device=device, dtype=dtype
+            ),
+            "scale": torch.tensor([[1.1797, 0.8952, 1.0004], [1.1797, 0.8952, 1.0004]], device=device, dtype=dtype),
+            "angles": torch.tensor(
+                [[18.8227, 19.1500, 13.8286], [18.8227, 19.1500, 13.8286]], device=device, dtype=dtype
+            ),
+            "sxy": torch.tensor([2.6637, 2.6637], device=device, dtype=dtype),
+            "sxz": torch.tensor([18.6920, 18.6920], device=device, dtype=dtype),
+            "syx": torch.tensor([11.8716, 11.8716], device=device, dtype=dtype),
+            "syz": torch.tensor([17.3881, 17.3881], device=device, dtype=dtype),
+            "szx": torch.tensor([11.3543, 11.3543], device=device, dtype=dtype),
+            "szy": torch.tensor([14.8219, 14.8219], device=device, dtype=dtype),
+        }
+        assert res.keys() == expected.keys()
+        assert_close(res["translations"], expected["translations"], **tol)
+        assert_close(res["center"], expected["center"], **tol)
+        assert_close(res["scale"], expected["scale"], **tol)
+        assert_close(res["angles"], expected["angles"], **tol)
+        assert_close(res["sxy"], expected["sxy"], **tol)
+        assert_close(res["sxz"], expected["sxz"], **tol)
+        assert_close(res["syx"], expected["syx"], **tol)
+        assert_close(res["syz"], expected["syz"], **tol)
+        assert_close(res["szx"], expected["szx"], **tol)
+        assert_close(res["szy"], expected["szy"], **tol)
+
+
+class TestRandomRotationGen3D(RandomGeneratorBaseTests):
+    @pytest.mark.parametrize("batch_size", [0, 1, 8])
+    @pytest.mark.parametrize("same_on_batch", [True, False])
+    def test_valid_param_combinations(self, batch_size, same_on_batch, device, dtype):
+        degrees = torch.tensor([[0.0, 30.0], [0.0, 30.0], [0.0, 30.0]], device=device, dtype=dtype)
+        param_gen = RotationGenerator3D(degrees=degrees.to(device=device, dtype=dtype))
+        param_gen(torch.Size((batch_size,)), same_on_batch=same_on_batch)
+
+    @pytest.mark.parametrize(
+        "degrees",
+        [(torch.tensor(-10)), (torch.tensor([-10])), (torch.tensor([[0, 30]])), (torch.tensor([[0, 30], [0, 30]]))],
+    )
+    def test_invalid_param_combinations(self, degrees, device, dtype):
+        with pytest.raises(ValueError, match=r"must be a positive number|Degrees must be"):
+            RotationGenerator3D(degrees=degrees.to(device=device, dtype=dtype))(torch.Size((2,)))
+
+    def test_random_gen(self, device, dtype):
+        torch.manual_seed(42)
+        degrees = torch.tensor([[0.0, 30.0], [0.0, 30.0], [0.0, 30.0]], device=device, dtype=dtype)
+        param_gen = RotationGenerator3D(degrees=degrees)
+        res = param_gen(torch.Size((2,)), same_on_batch=False)
+
+        expected = {
+            "yaw": torch.tensor([26.4681, 27.4501], device=device, dtype=dtype),
+            "pitch": torch.tensor([11.4859, 28.7792], device=device, dtype=dtype),
+            "roll": torch.tensor([11.7134, 18.0269], device=device, dtype=dtype),
+        }
+        assert res.keys() == expected.keys()
+        assert_close(res["yaw"], expected["yaw"], atol=1e-4, rtol=1e-4)
+        assert_close(res["pitch"], expected["pitch"], atol=1e-4, rtol=1e-4)
+        assert_close(res["roll"], expected["roll"], atol=1e-4, rtol=1e-4)
+
+    def test_same_on_batch(self, device, dtype):
+        torch.manual_seed(42)
+        degrees = torch.tensor([[0.0, 30.0], [0.0, 30.0], [0.0, 30.0]], device=device, dtype=dtype)
+        param_gen = RotationGenerator3D(degrees=degrees)
+        res = param_gen(torch.Size((2,)), same_on_batch=True)
+
+        expected = {
+            "yaw": torch.tensor([26.4681, 26.4681], device=device, dtype=dtype),
+            "pitch": torch.tensor([27.4501, 27.4501], device=device, dtype=dtype),
+            "roll": torch.tensor([11.4859, 11.4859], device=device, dtype=dtype),
+        }
+        assert res.keys() == expected.keys()
+        assert_close(res["yaw"], expected["yaw"], atol=1e-4, rtol=1e-4)
+        assert_close(res["pitch"], expected["pitch"], atol=1e-4, rtol=1e-4)
+        assert_close(res["roll"], expected["roll"], atol=1e-4, rtol=1e-4)
+
+
+class TestRandomCropGen3D(RandomGeneratorBaseTests):
+    @pytest.mark.parametrize("batch_size", [0, 2])
+    @pytest.mark.parametrize("size", [(5, 5, 6), (4, 6, 6), (4, 5, 7)])
+    @pytest.mark.parametrize("resize_to", [None, (2, 2, 2)])
+    @pytest.mark.parametrize("same_on_batch", [False, True])
+    def test_oversized_crop_is_rejected_for_empty_batches_4429(
+        self, batch_size, size, resize_to, same_on_batch, device, dtype
+    ):
+        """A fixed crop must fit the source volume even when no rows are sampled."""
+        generator = CropGenerator3D(size, resize_to)
+        generator.set_rng_device_and_dtype(device, dtype)
+
+        with pytest.raises(ValueError, match=r"size.*must not exceed.*input_size=\(4, 5, 6\)"):
+            generator((batch_size, 1, 4, 5, 6), same_on_batch=same_on_batch)
+
+    @pytest.mark.parametrize("batch_size", [0, 2])
+    def test_dynamo_fixed_crop_parameters_4429(self, batch_size, device, dtype, torch_optimizer):
+        """Fullgraph compilation captures a legal fixed-size crop for empty and non-empty batches."""
+        generator = CropGenerator3D((3, 4, 5))
+        generator.set_rng_device_and_dtype(device, dtype)
+        optimized = torch_optimizer(generator, fullgraph=True)
+
+        params = optimized((batch_size, 1, 4, 5, 6))
+
+        assert params["src"].shape == (batch_size, 8, 3)
+        assert params["dst"].shape == (batch_size, 8, 3)
+        assert params["output_size"].tolist() == [[3, 4, 5]] * batch_size
+        assert params["output_size"].dtype == torch.long
+
+    @pytest.mark.parametrize("batch_size", [0, 2])
+    @pytest.mark.parametrize("input_size", [(200, 200, 200)])
+    @pytest.mark.parametrize("size", [(100, 100, 100), torch.tensor([50, 60, 70])])
+    @pytest.mark.parametrize("resize_to", [None, (100, 100, 100)])
+    @pytest.mark.parametrize("same_on_batch", [True, False])
+    def test_valid_param_combinations(self, batch_size, input_size, size, resize_to, same_on_batch, device, dtype):
+        if isinstance(size, torch.Tensor):
+            size = size.repeat(batch_size, 1).to(device=device, dtype=dtype)
+
+        param_gen = CropGenerator3D(size=size, resize_to=resize_to)
+        params = param_gen(batch_shape=torch.Size((batch_size, 1, *input_size)), same_on_batch=same_on_batch)
+        expected = torch.as_tensor(resize_to if resize_to is not None else size).expand(batch_size, 3)
+        assert_close(params["output_size"].to(device=device, dtype=dtype), expected.to(device=device, dtype=dtype))
+
+    @pytest.mark.parametrize(
+        "input_size,size,resize_to",
+        [
+            ((-300, 300, 300), (200, 200, 200), (100, 100, 100)),
+            ((100, 100, 100), (200, 200, 200), (100, 100, 100)),
+            ((200, 200, 200), torch.tensor([50, 50, 50]), (100, 100, 100)),
+            ((100, 100, 100), torch.tensor([[50, 60, 70], [50, 60, 70]]), (100, 100)),
+        ],
+    )
+    def test_invalid_param_combinations(self, input_size, size, resize_to, device, dtype):
+        with pytest.raises((AssertionError, ValueError), match=r"batch_shape|size|resize_to"):
+            CropGenerator3D(
+                size=size.to(device=device, dtype=dtype) if isinstance(size, torch.Tensor) else size,
+                resize_to=resize_to,
+            )(batch_shape=torch.Size((2, 1, *input_size)))
+
+    @pytest.mark.parametrize("resize_to", [None, (2, 3, 2)])
+    def test_boxes_measure_crop_and_output_size_4018(self, resize_to, device, dtype):
+        # kornia#4018: src measures the crop size and dst the output size, inclusively, with dst at the origin.
+        size = torch.tensor([[2, 3, 4], [1, 1, 1], [4, 5, 6]], device=device, dtype=dtype)
+        params = CropGenerator3D(size, resize_to)(torch.Size((3, 1, 4, 5, 6)))
+        output_size = size if resize_to is None else torch.tensor([resize_to] * 3, device=device, dtype=dtype)
+        for key, expected in (("src", size), ("dst", output_size)):
+            measured = torch.stack(infer_bbox_shape3d(params[key].to(dtype)), dim=-1)
+            assert_close(measured, expected, atol=0.0, rtol=0.0)
+        assert_close(params["dst"][:, 0], torch.zeros(3, 3, device=device, dtype=params["dst"].dtype))
+
+    def test_random_gen(self, device, dtype):
+        torch.manual_seed(42)
+        param_gen = CropGenerator3D(
+            size=torch.tensor([[50, 60, 70], [50, 60, 70]], device=device, dtype=dtype), resize_to=(100, 100, 100)
+        )
+        res = param_gen(batch_shape=torch.Size((2, 1, 200, 200, 200)))
+
+        expected = {
+            "src": torch.tensor(
+                [
+                    [
+                        [115, 53, 58],
+                        [184, 53, 58],
+                        [184, 112, 58],
+                        [115, 112, 58],
+                        [115, 53, 107],
+                        [184, 53, 107],
+                        [184, 112, 107],
+                        [115, 112, 107],
+                    ],
+                    [
+                        [119, 135, 90],
+                        [188, 135, 90],
+                        [188, 194, 90],
+                        [119, 194, 90],
+                        [119, 135, 139],
+                        [188, 135, 139],
+                        [188, 194, 139],
+                        [119, 194, 139],
+                    ],
+                ],
+                device=device,
+                dtype=dtype,
+            ),
+            "dst": torch.tensor(
+                [
+                    [
+                        [0, 0, 0],
+                        [99, 0, 0],
+                        [99, 99, 0],
+                        [0, 99, 0],
+                        [0, 0, 99],
+                        [99, 0, 99],
+                        [99, 99, 99],
+                        [0, 99, 99],
+                    ],
+                    [
+                        [0, 0, 0],
+                        [99, 0, 0],
+                        [99, 99, 0],
+                        [0, 99, 0],
+                        [0, 0, 99],
+                        [99, 0, 99],
+                        [99, 99, 99],
+                        [0, 99, 99],
+                    ],
+                ],
+                device=device,
+                dtype=dtype,
+            ),
+        }
+        expected["output_size"] = torch.tensor([[100, 100, 100]]).expand(2, -1)
+        assert res.keys() == expected.keys()
+        assert_close(res["output_size"].cpu(), expected["output_size"])
+        assert_close(res["src"], expected["src"], atol=1e-4, rtol=1e-4)
+        assert_close(res["dst"], expected["dst"], atol=1e-4, rtol=1e-4)
+
+    def test_same_on_batch(self, device, dtype):
+        torch.manual_seed(42)
+
+        param_gen = CropGenerator3D(
+            size=torch.tensor([[50, 60, 70], [50, 60, 70]], device=device, dtype=dtype), resize_to=(100, 100, 100)
+        )
+        res = param_gen(batch_shape=torch.Size((2, 1, 200, 200, 200)), same_on_batch=True)
+
+        expected = {
+            "src": torch.tensor(
+                [
+                    [
+                        [115, 129, 57],
+                        [184, 129, 57],
+                        [184, 188, 57],
+                        [115, 188, 57],
+                        [115, 129, 106],
+                        [184, 129, 106],
+                        [184, 188, 106],
+                        [115, 188, 106],
+                    ],
+                    [
+                        [115, 129, 57],
+                        [184, 129, 57],
+                        [184, 188, 57],
+                        [115, 188, 57],
+                        [115, 129, 106],
+                        [184, 129, 106],
+                        [184, 188, 106],
+                        [115, 188, 106],
+                    ],
+                ],
+                device=device,
+                dtype=dtype,
+            ),
+            "dst": torch.tensor(
+                [
+                    [
+                        [0, 0, 0],
+                        [99, 0, 0],
+                        [99, 99, 0],
+                        [0, 99, 0],
+                        [0, 0, 99],
+                        [99, 0, 99],
+                        [99, 99, 99],
+                        [0, 99, 99],
+                    ],
+                    [
+                        [0, 0, 0],
+                        [99, 0, 0],
+                        [99, 99, 0],
+                        [0, 99, 0],
+                        [0, 0, 99],
+                        [99, 0, 99],
+                        [99, 99, 99],
+                        [0, 99, 99],
+                    ],
+                ],
+                device=device,
+                dtype=dtype,
+            ),
+        }
+        expected["output_size"] = torch.tensor([[100, 100, 100]]).expand(2, -1)
+        assert res.keys() == expected.keys()
+        assert_close(res["output_size"].cpu(), expected["output_size"])
+        assert_close(res["src"], expected["src"], atol=1e-4, rtol=1e-4)
+        assert_close(res["dst"], expected["dst"], atol=1e-4, rtol=1e-4)
+
+
+# A centre crop draws nothing, so it has no same_on_batch behaviour to pin and does not take the generator base.
+class TestCenterCropGen3D:
+    @pytest.mark.parametrize("batch_size", [0, 2])
+    @pytest.mark.parametrize("depth,height,width", [(200, 200, 200)])
+    @pytest.mark.parametrize("size", [(100, 100, 100)])
+    def test_valid_param_combinations(self, batch_size, depth, height, width, size):
+        center_crop_generator3d(batch_size=batch_size, depth=depth, height=height, width=width, size=size)
+
+    @pytest.mark.parametrize(
+        "depth,height,width,size",
+        [
+            (200, 200, -200, (100, 100, 100)),
+            (200, -200, 200, (100, 100)),
+            (200, 100, 100, (300, 120, 100)),
+            (200, 150, 100, (120, 180, 100)),
+            (200, 100, 150, (120, 80, 200)),
+        ],
+    )
+    def test_invalid_param_combinations(self, depth, height, width, size):
+        with pytest.raises((AssertionError, ValueError), match=r"depth|height|width|size"):
+            center_crop_generator3d(batch_size=2, depth=depth, height=height, width=width, size=size)
+
+    def test_random_gen(self, device):
+        torch.manual_seed(42)
+        res = center_crop_generator3d(batch_size=2, depth=200, height=200, width=200, size=(120, 150, 100))
+        expected = {
+            "src": torch.tensor(
+                [
+                    [
+                        [50, 25, 40],
+                        [149, 25, 40],
+                        [149, 174, 40],
+                        [50, 174, 40],
+                        [50, 25, 159],
+                        [149, 25, 159],
+                        [149, 174, 159],
+                        [50, 174, 159],
+                    ]
+                ],
+                device=device,
+                dtype=torch.long,
+            ).repeat(2, 1, 1),
+            "dst": torch.tensor(
+                [
+                    [
+                        [0, 0, 0],
+                        [99, 0, 0],
+                        [99, 149, 0],
+                        [0, 149, 0],
+                        [0, 0, 119],
+                        [99, 0, 119],
+                        [99, 149, 119],
+                        [0, 149, 119],
+                    ]
+                ],
+                device=device,
+                dtype=torch.long,
+            ).repeat(2, 1, 1),
+        }
+        expected["output_size"] = torch.tensor([[120, 150, 100]]).expand(2, -1)
+        assert res.keys() == expected.keys()
+        assert_close(res["output_size"].cpu(), expected["output_size"])
+        assert_close(res["src"].to(device=device), expected["src"], atol=1e-4, rtol=1e-4)
+        assert_close(res["dst"].to(device=device), expected["dst"], atol=1e-4, rtol=1e-4)
+
+
+class TestRandomMotionBlur3D(RandomGeneratorBaseTests):
+    @pytest.mark.parametrize("batch_size", [0, 1, 8])
+    @pytest.mark.parametrize("kernel_size", [3, (3, 5)])
+    @pytest.mark.parametrize("angle", [torch.tensor([(10.0, 30.0), (30.0, 60.0), (60.0, 90.0)])])
+    @pytest.mark.parametrize(
+        "direction", [torch.tensor([-1.0, -1.0]), torch.tensor([-1.0, 1.0]), torch.tensor([1.0, 1.0])]
+    )
+    @pytest.mark.parametrize("same_on_batch", [True, False])
+    def test_valid_param_combinations(self, batch_size, kernel_size, angle, direction, same_on_batch, device, dtype):
+        param_gen = MotionBlurGenerator3D(
+            kernel_size=kernel_size,
+            angle=angle.to(device=device, dtype=dtype),
+            direction=direction.to(device=device, dtype=dtype),
+        )
+
+        param_gen(batch_shape=torch.Size((batch_size,)), same_on_batch=same_on_batch)
+
+    @pytest.mark.parametrize(
+        "kernel_size,angle,direction",
+        [
+            (4, torch.tensor([(10, 30), (30, 60), (60, 90)]), torch.tensor([-1, 1])),
+            (1, torch.tensor([(10, 30), (30, 60), (60, 90)]), torch.tensor([-1, 1])),
+            ((3, 4, 5), torch.tensor([(10, 30), (30, 60), (60, 90)]), torch.tensor([-1, 1])),
+            (3, torch.tensor([(10, 30), (30, 60), (60, 90)]), torch.tensor([-2, 1])),
+            (3, torch.tensor([(10, 30), (30, 60), (60, 90)]), torch.tensor([-1, 2])),
+        ],
+    )
+    def test_invalid_param_combinations(self, kernel_size, angle, direction, device, dtype):
+        with pytest.raises((AssertionError, ValueError), match=r"kernel_size|direction out of bounds"):
+            MotionBlurGenerator3D(
+                kernel_size=kernel_size,
+                angle=angle.to(device=device, dtype=dtype),
+                direction=direction.to(device=device, dtype=dtype),
+            )(batch_shape=torch.Size((2,)))
+
+    def test_random_gen(self, device, dtype):
+        torch.manual_seed(42)
+        angle = torch.tensor([(10, 30), (30, 60), (60, 90)], device=device, dtype=dtype)
+        direction = torch.tensor([-1, 1], device=device, dtype=dtype)
+        param_gen = MotionBlurGenerator3D(kernel_size=3, angle=angle, direction=direction)
+
+        res = param_gen(batch_shape=torch.Size((2,)), same_on_batch=False)
+
+        expected = {
+            "ksize_factor": torch.tensor([3, 3], device=device, dtype=torch.int32),
+            "angle_factor": torch.tensor(
+                [[27.6454, 41.4859, 71.7134], [28.3001, 58.7792, 78.0269]], device=device, dtype=dtype
+            ),
+            "direction_factor": torch.tensor([-0.4869, 0.5873], device=device, dtype=dtype),
+        }
+        assert res.keys() == expected.keys()
+        assert_close(res["ksize_factor"], expected["ksize_factor"], rtol=1e-4, atol=1e-4)
+        assert_close(res["angle_factor"], expected["angle_factor"], rtol=1e-4, atol=1e-4)
+        assert_close(res["direction_factor"], expected["direction_factor"], rtol=1e-4, atol=1e-4)
+
+    def test_same_on_batch(self, device, dtype):
+        torch.manual_seed(42)
+        angle = torch.tensor([(10, 30), (30, 60), (60, 90)], device=device, dtype=dtype)
+        direction = torch.tensor([-1, 1], device=device, dtype=dtype)
+        param_gen = MotionBlurGenerator3D(kernel_size=3, angle=angle, direction=direction)
+
+        res = param_gen(batch_shape=torch.Size((2,)), same_on_batch=True)
+
+        expected = {
+            "ksize_factor": torch.tensor([3, 3], device=device, dtype=torch.int32),
+            "angle_factor": torch.tensor(
+                [[27.6454, 57.4501, 71.4859], [27.6454, 57.4501, 71.4859]], device=device, dtype=dtype
+            ),
+            "direction_factor": torch.tensor([0.9186, 0.9186], device=device, dtype=dtype),
+        }
+        assert res.keys() == expected.keys()
+        assert_close(res["ksize_factor"], expected["ksize_factor"], rtol=1e-4, atol=1e-4)
+        assert_close(res["angle_factor"], expected["angle_factor"], rtol=1e-4, atol=1e-4)
+        assert_close(res["direction_factor"], expected["direction_factor"], rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.device_agnostic
+    def test_ranged_kernel_size_is_constant_across_batch(self, device, dtype):
+        param_gen = MotionBlurGenerator3D(
+            kernel_size=(3, 7),
+            angle=torch.tensor([(0.0, 0.0)] * 3, device=device, dtype=dtype),
+            direction=torch.tensor([0.0, 0.0], device=device, dtype=dtype),
+        )
+
+        for seed in range(20):
+            torch.manual_seed(seed)
+            res = param_gen(batch_shape=torch.Size((6,)), same_on_batch=False)
+
+            assert res["ksize_factor"].shape == (6,)
+            assert res["ksize_factor"].unique().numel() == 1
+            assert int(res["ksize_factor"][0]) in {3, 5, 7}
+
+    @pytest.mark.device_agnostic
+    def test_ranged_kernel_size_includes_upper_bound(self, device, dtype):
+        param_gen = MotionBlurGenerator3D(
+            kernel_size=(3, 7),
+            angle=torch.tensor([(0.0, 0.0)] * 3, device=device, dtype=dtype),
+            direction=torch.tensor([0.0, 0.0], device=device, dtype=dtype),
+        )
+
+        seen = set()
+        for seed in range(1000):
+            torch.manual_seed(seed)
+            res = param_gen(batch_shape=torch.Size((1,)), same_on_batch=False)
+            seen.add(int(res["ksize_factor"][0]))
+
+        assert seen == {3, 5, 7}
+
+    # Issue #4672: an even upper bound used to admit the odd size above it -- `ks[1] // 2 + 1` took the
+    # `+ 1` off `ks[1] // 2` rather than off the largest odd size in the range -- so (3, 20) drew 21 and
+    # (3, 4) drew 5.  The bound is now the largest odd size not above `ks[1]`, as in 2D after #4610.
+    @pytest.mark.device_agnostic
+    def test_ranged_kernel_size_even_upper_bound_caps_at_largest_odd(self, device, dtype):
+        param_gen = MotionBlurGenerator3D(
+            kernel_size=(3, 20),
+            angle=torch.tensor([(0.0, 0.0)] * 3, device=device, dtype=dtype),
+            direction=torch.tensor([0.0, 0.0], device=device, dtype=dtype),
+        )
+
+        seen = set()
+        for seed in range(1000):
+            torch.manual_seed(seed)
+            res = param_gen(batch_shape=torch.Size((1,)), same_on_batch=False)
+            seen.add(int(res["ksize_factor"][0]))
+
+        assert seen == {3, 5, 7, 9, 11, 13, 15, 17, 19}
+
+    # A range holding no odd size keeps rounding up out of the range, which 2D documents as well: the
+    # half-size floor is taken from the lower bound, so (4, 4) draws 5 and (2, 2) draws 3.
+    @pytest.mark.device_agnostic
+    @pytest.mark.parametrize(("kernel_size", "expected"), [((4, 4), 5), ((2, 2), 3)])
+    def test_ranged_kernel_size_without_an_odd_size_rounds_up(self, kernel_size, expected, device, dtype):
+        param_gen = MotionBlurGenerator3D(
+            kernel_size=kernel_size,
+            angle=torch.tensor([(0.0, 0.0)] * 3, device=device, dtype=dtype),
+            direction=torch.tensor([0.0, 0.0], device=device, dtype=dtype),
+        )
+
+        seen = set()
+        for seed in range(200):
+            torch.manual_seed(seed)
+            res = param_gen(batch_shape=torch.Size((1,)), same_on_batch=False)
+            seen.add(int(res["ksize_factor"][0]))
+
+        assert seen == {expected}
+
+    # The sampler is half-open on [lo, hi + 1), so a float32 draw can round up onto `hi + 1` itself and
+    # leave the range.  Forcing the largest float below 1 through the sampler used to draw 7 for (3, 5).
+    @pytest.mark.device_agnostic
+    def test_ranged_kernel_size_top_draw_stays_in_range(self, device, dtype):
+        param_gen = MotionBlurGenerator3D(
+            kernel_size=(3, 5),
+            angle=torch.tensor([(0.0, 0.0)] * 3, device=device, dtype=dtype),
+            direction=torch.tensor([0.0, 0.0], device=device, dtype=dtype),
+        )
+        param_gen.make_samplers(device, dtype)
+
+        def _top_draw(*args, **kwargs):
+            shape = args[0] if args else kwargs["size"]
+            forwarded = {k: v for k, v in kwargs.items() if k in ("dtype", "device")}
+            return torch.full(shape, 1 - 2**-24, **forwarded)
+
+        with patch("torch.rand", _top_draw):
+            res = param_gen(batch_shape=torch.Size((4,)), same_on_batch=False)
+
+        assert int(res["ksize_factor"].max()) == 5
+
+    # A reversed pair used to be accepted and drew a constant above *both* bounds: (20, 3) drew 9.
+    @pytest.mark.device_agnostic
+    def test_reversed_kernel_size_raises(self, device, dtype):
+        # `make_samplers` runs from `__post_init__`, so the pair is refused as the generator is built.
+        with pytest.raises(ValueError, match="should be smaller than or equal to"):
+            MotionBlurGenerator3D(
+                kernel_size=(20, 3),
+                angle=torch.tensor([(0.0, 0.0)] * 3, device=device, dtype=dtype),
+                direction=torch.tensor([0.0, 0.0], device=device, dtype=dtype),
+            )
+
+
+def test_crop3d_output_size_owns_storage(device):
+    size = torch.tensor([[4, 5, 6]], device=device, dtype=torch.long)
+    generator = CropGenerator3D(size)
+    params = generator((1, 1, 8, 10, 12))
+    params["output_size"][0, 0] = 2
+    assert_close(size, torch.tensor([[4, 5, 6]], device=device))
+    size[0, 1] = 3
+    assert_close(params["output_size"], torch.tensor([[2, 5, 6]], device=device))

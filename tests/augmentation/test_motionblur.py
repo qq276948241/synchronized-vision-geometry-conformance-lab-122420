@@ -1,0 +1,287 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+import pytest
+import torch
+
+from kornia.augmentation import RandomMotionBlur, RandomMotionBlur3D
+from kornia.core.exceptions import BaseError
+from kornia.filters import motion_blur, motion_blur3d
+
+from testing.base import BaseTester
+
+
+class TestRandomMotionBlur(BaseTester):
+    # TODO: improve and implement more meaningful smoke tests e.g check for a consistent
+    # return values such a torch.Tensor variable.
+    @pytest.mark.xfail(reason="might fail under windows OS due to printing preicision.")
+    def test_smoke(self):
+        f = RandomMotionBlur(kernel_size=(3, 5), angle=(10, 30), direction=0.5)
+        repr = (
+            "RandomMotionBlur(kernel_size=(3, 5), angle=tensor([10., 30.]), direction=tensor([-0.5000, 0.5000]), "
+            "border_type='constant', p=0.5, p_batch=1.0, same_on_batch=False, return_transform=None)"
+        )
+        assert str(f) == repr
+
+    @pytest.mark.parametrize("kernel_size", [(3, 5), (7, 21)])
+    @pytest.mark.parametrize("same_on_batch", [True, False])
+    @pytest.mark.parametrize("p", [0.0, 1.0])
+    def test_random_motion_blur(self, kernel_size, same_on_batch, p, device, dtype):
+        f = RandomMotionBlur(kernel_size=kernel_size, angle=(10, 30), direction=0.5, same_on_batch=same_on_batch, p=p)
+        torch.manual_seed(0)
+        batch_size = 2
+        input = torch.randn(1, 3, 5, 6, device=device, dtype=dtype).repeat(batch_size, 1, 1, 1)
+
+        output = f(input)
+
+        if same_on_batch:
+            self.assert_close(output[0], output[1], rtol=1e-4, atol=1e-4)
+        elif p == 0:
+            self.assert_close(output, input, rtol=1e-4, atol=1e-4)
+        else:
+            assert not torch.allclose(output[0], output[1], rtol=1e-4, atol=1e-4)
+
+        assert output.shape == torch.Size([batch_size, 3, 5, 6])
+
+    @pytest.mark.parametrize("input_shape", [(1, 1, 5, 5), (2, 1, 5, 5)])
+    def test_against_functional(self, input_shape):
+        input = torch.randn(*input_shape)
+
+        f = RandomMotionBlur(kernel_size=(3, 5), angle=(10, 30), direction=0.5, p=1.0)
+        output = f(input)
+
+        expected = motion_blur(
+            input,
+            # The whole batch is blurred with the kernel size at `idx`; the per-sample draws can differ.
+            int(f._params["ksize_factor"][f._params["idx"][0]]),
+            f._params["angle_factor"],
+            f._params["direction_factor"],
+            f.flags["border_type"].name.lower(),
+        )
+
+        self.assert_close(output, expected, rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.parametrize("kernel_size", [5, (3, 9)])
+    @pytest.mark.parametrize("same_on_batch", [False, True])
+    @pytest.mark.parametrize("p", [0.0, 0.5, 1.0])
+    def test_seeded_parameters_and_replay(self, kernel_size, same_on_batch, p, device, dtype):
+        torch.manual_seed(42)
+        image = torch.rand(8, 1, 16, 16).to(device=device, dtype=dtype)
+        aug = RandomMotionBlur(kernel_size, (-45.0, 45.0), (-1.0, 1.0), same_on_batch=same_on_batch, p=p)
+        torch.manual_seed(0)
+        output = aug(image)
+        params = {key: value.clone() for key, value in aug._params.items()}
+        torch.manual_seed(0)
+        self.assert_close(aug(image), output, rtol=0, atol=0)
+        for key, value in params.items():
+            self.assert_close(aug._params[key], value, rtol=0, atol=0)
+        self.assert_close(aug(image, params=params), output, rtol=0, atol=0)
+        blurred = motion_blur(
+            image,
+            int(params["ksize_factor"][params["idx"][0]]),
+            params["angle_factor"],
+            params["direction_factor"],
+            border_type=aug.flags["border_type"].name.lower(),
+        )
+        expected = torch.where(params["batch_prob"].to(device=device).view(-1, 1, 1, 1) > 0.5, blurred, image)
+        self.assert_close(output, expected)
+
+    def test_replay_legacy_per_sample_kernel_sizes(self, device, dtype):
+        torch.manual_seed(0)
+        image = torch.rand(3, 1, 16, 16).to(device=device, dtype=dtype)
+        aug = RandomMotionBlur((3, 9), (0.0, 0.0), (0.0, 0.0), p=1.0)
+        params = aug.forward_parameters(image.shape)
+        params["ksize_factor"] = torch.tensor([3, 5, 7], dtype=torch.int32)
+        params["idx"] = torch.tensor([1])
+        border_type = aug.flags["border_type"].name.lower()
+        expected = motion_blur(image, 5, params["angle_factor"], params["direction_factor"], border_type=border_type)
+        self.assert_close(aug(image, params=params), expected)
+
+    @pytest.mark.parametrize("p", [1.0, 0.5])
+    @pytest.mark.parametrize("same_on_batch", [False, True])
+    def test_empty_batch_ranged_kernel_size(self, p, same_on_batch, device, dtype):
+        # #4429: a ranged kernel_size picks the batch's size from the sampled list, which an empty batch leaves
+        # empty (IndexError). A fixed kernel_size takes the filter path instead.
+        image = torch.rand(0, 3, 8, 10, device=device, dtype=dtype, requires_grad=True)
+        output = RandomMotionBlur((3, 7), 35.0, 0.5, same_on_batch=same_on_batch, p=p)(image)
+        assert output.shape == image.shape
+        assert output.dtype == dtype
+        output.sum().backward()
+        assert image.grad is not None
+        assert image.grad.shape == image.shape
+
+    @pytest.mark.parametrize(
+        ("params_batch", "batch", "error", "match"),
+        [(0, 2, IndexError, "list index out of range"), (2, 0, BaseError, "kernel batch must be 1 or the input batch")],
+    )
+    def test_empty_batch_shortcut_needs_an_empty_batch(self, params_batch, batch, error, match, device, dtype):
+        # Replaying parameters drawn for another batch size raises as it did before the empty-batch shortcut; a
+        # non-empty batch with no drawn kernel size must not come back unblurred.
+        aug = RandomMotionBlur((3, 7), 35.0, 0.5, p=1.0)
+        params = aug.forward_parameters(torch.Size((params_batch, 3, 8, 10)))
+        with pytest.raises(error, match=match):
+            aug(torch.rand(batch, 3, 8, 10, device=device, dtype=dtype), params=params)
+
+    @pytest.mark.slow
+    def test_gradcheck(self, device):
+        torch.manual_seed(0)  # for random reproductibility
+        inp = torch.rand((1, 3, 11, 7), device=device, dtype=torch.float64)
+        # TODO: Gradcheck for param random gen failed. Suspect get_motion_kernel2d issue.
+        params = {
+            "batch_prob": torch.tensor([True]),
+            "ksize_factor": torch.tensor([31]),
+            "angle_factor": torch.tensor([30.0]),
+            "direction_factor": torch.tensor([-0.5]),
+            "border_type": torch.tensor([0]),
+            "idx": torch.tensor([0]),
+        }
+        self.gradcheck(
+            RandomMotionBlur(kernel_size=3, angle=(10, 30), direction=(-0.5, 0.5), p=1.0),
+            (inp, params),
+            fast_mode=False,
+        )
+
+    # The class zero-pads by its own default, although ``motion_blur`` now defaults to "reflect".
+    # Snippet used to generate expected:
+    #   import torch, kornia.augmentation as K
+    #   print(K.RandomMotionBlur(5, (0.0, 0.0), (0.0, 0.0), p=1.0)(torch.ones(1, 1, 5, 7))[0, 0, 2].tolist())
+    #   -> [0.6, 0.8, 1.0, 1.0, 1.0, 0.8, 0.6]
+    def test_default_border_still_zero_pads(self, device, dtype):
+        image = torch.ones(1, 1, 5, 7, device=device, dtype=dtype)
+        row = torch.tensor([0.6, 0.8, 1.0, 1.0, 1.0, 0.8, 0.6], device=device, dtype=dtype)
+
+        self.assert_close(RandomMotionBlur(5, (0.0, 0.0), (0.0, 0.0), p=1.0)(image), row.expand(1, 1, 5, 7))
+
+    def test_dynamo(self, device, dtype, torch_optimizer):
+        # A fixed (int) kernel size avoids the data-dependent kernel-size selection and
+        # is torch.compile fullgraph-safe.
+        img = torch.rand(2, 3, 16, 16, device=device, dtype=dtype)
+        op = RandomMotionBlur(kernel_size=5, angle=(35.0, 35.0), direction=(0.5, 0.5), p=1.0)
+        op_optimized = torch_optimizer(op)
+        self.assert_close(op(img), op_optimized(img))
+
+
+class TestRandomMotionBlur3D(BaseTester):
+    # TODO: improve and implement more meaningful smoke tests e.g check for a consistent
+    # return values such a torch.Tensor variable.
+    @pytest.mark.xfail(reason="might fail under windows OS due to printing preicision.")
+    def test_smoke(self):
+        f = RandomMotionBlur3D(kernel_size=(3, 5), angle=(10, 30), direction=0.5)
+        repr = (
+            "RandomMotionBlur3D(kernel_size=(3, 5), angle=tensor([[10., 30.],"
+            "\n        [10., 30.],\n        [10., 30.]]), direction=tensor([-0.5000, 0.5000]), "
+            "border_type='constant', p=0.5, p_batch=1.0, same_on_batch=False, return_transform=None)"
+        )
+        assert str(f) == repr
+
+    @pytest.mark.parametrize("same_on_batch", [True, False])
+    @pytest.mark.parametrize("p", [0.0, 1.0])
+    def test_random_motion_blur(self, same_on_batch, p, device, dtype):
+        f = RandomMotionBlur3D(kernel_size=(3, 5), angle=(10, 30), direction=0.5, same_on_batch=same_on_batch, p=p)
+        batch_size = 2
+        input = torch.randn(1, 3, 5, 6, 7, device=device, dtype=dtype).repeat(batch_size, 1, 1, 1, 1)
+
+        output = f(input)
+
+        if same_on_batch:
+            self.assert_close(output[0], output[1], rtol=1e-4, atol=1e-4)
+        elif p == 0:
+            self.assert_close(output, input, rtol=1e-4, atol=1e-4)
+        else:
+            assert not torch.allclose(output[0], output[1], rtol=1e-4, atol=1e-4)
+
+        assert output.shape == torch.Size([batch_size, 3, 5, 6, 7])
+
+    @pytest.mark.parametrize("input_shape", [(1, 1, 5, 6, 7), (2, 1, 5, 6, 7)])
+    def test_against_functional(self, input_shape):
+        input = torch.randn(*input_shape)
+
+        f = RandomMotionBlur3D(kernel_size=(3, 5), angle=(10, 30), direction=0.5, p=1.0)
+        output = f(input)
+
+        expected = motion_blur3d(
+            input,
+            f._params["ksize_factor"].unique().item(),
+            f._params["angle_factor"],
+            f._params["direction_factor"],
+            f.flags["border_type"].name.lower(),
+        )
+
+        self.assert_close(output, expected, rtol=1e-4, atol=1e-4)
+
+    def test_ranged_kernel_size_does_not_crash_for_batch(self):
+        input = torch.rand(6, 1, 4, 5, 6)
+
+        for seed in range(20):
+            torch.manual_seed(seed)
+            output = RandomMotionBlur3D((3, 7), 35.0, 0.5, p=1.0)(input)
+
+            assert output.shape == input.shape
+
+    @pytest.mark.parametrize("resample", ["nearest", "bilinear"])
+    @pytest.mark.parametrize("p", [1.0, 0.5])
+    def test_empty_batch_ranged_kernel_size(self, resample, p, device, dtype):
+        # #4429: a ranged kernel_size reads the batch's size with ``unique().item()``, which has no element for an
+        # empty batch (RuntimeError). A fixed kernel_size takes the filter path instead.
+        volume = torch.rand(0, 3, 4, 8, 10, device=device, dtype=dtype, requires_grad=True)
+        output = RandomMotionBlur3D((3, 5), 35.0, 0.5, resample=resample, p=p)(volume)
+        assert output.shape == volume.shape
+        assert output.dtype == dtype
+        output.sum().backward()
+        assert volume.grad is not None
+        assert volume.grad.shape == volume.shape
+
+    @pytest.mark.parametrize(
+        ("params_batch", "batch", "error", "match"),
+        [(0, 2, RuntimeError, "0 elements"), (2, 0, BaseError, "kernel batch must be 1 or the input batch")],
+    )
+    def test_empty_batch_shortcut_needs_an_empty_batch(self, params_batch, batch, error, match, device, dtype):
+        # As in the 2D class: parameters drawn for another batch size still raise.
+        aug = RandomMotionBlur3D((3, 5), 35.0, 0.5, p=1.0)
+        params = aug.forward_parameters(torch.Size((params_batch, 3, 4, 8, 10)))
+        with pytest.raises(error, match=match):
+            aug(torch.rand(batch, 3, 4, 8, 10, device=device, dtype=dtype), params=params)
+
+    # The class zero-pads by its own default, although ``motion_blur3d`` now defaults to "replicate".
+    # Snippet used to generate expected:
+    #   import torch, kornia.augmentation as K
+    #   print(K.RandomMotionBlur3D(3, (0.0, 0.0, 0.0), 0.0, p=1.0)(torch.ones(1, 1, 5, 6, 7))[0, 0, 2, 2].tolist())
+    #   -> [0.6667, 1.0, 1.0, 1.0, 1.0, 1.0, 0.6667]
+    def test_default_border_still_zero_pads(self, device, dtype):
+        volume = torch.ones(1, 1, 5, 6, 7, device=device, dtype=dtype)
+        row = torch.tensor([2.0 / 3.0, 1.0, 1.0, 1.0, 1.0, 1.0, 2.0 / 3.0], device=device, dtype=dtype)
+
+        actual = RandomMotionBlur3D(3, (0.0, 0.0, 0.0), 0.0, p=1.0)(volume)
+        self.assert_close(actual, row.expand(1, 1, 5, 6, 7))
+
+    @pytest.mark.slow
+    def test_gradcheck(self, device):
+        torch.manual_seed(0)  # for random reproductibility
+        inp = torch.rand((1, 3, 6, 7), device=device, dtype=torch.float64)
+        params = {
+            "batch_prob": torch.tensor([True]),
+            "ksize_factor": torch.tensor([31]),
+            "angle_factor": torch.tensor([[30.0, 30.0, 30.0]]),
+            "direction_factor": torch.tensor([-0.5]),
+            "border_type": torch.tensor([0]),
+            "idx": torch.tensor([0]),
+        }
+        self.gradcheck(
+            RandomMotionBlur3D(kernel_size=3, angle=(10, 30), direction=(-0.5, 0.5), p=1.0),
+            (inp, params),
+            fast_mode=False,
+        )

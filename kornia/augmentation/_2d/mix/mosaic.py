@@ -1,0 +1,297 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+import torch
+import torch.nn.functional as F
+
+from kornia.augmentation import random_generator as rg
+from kornia.augmentation._2d.mix.base import MixAugmentationBaseV2
+from kornia.constants import DataKey, Resample
+from kornia.core.check import KORNIA_UNWRAP
+from kornia.core.ops import eye_like
+from kornia.core.utils import _to_device_nonblocking, is_exporting
+from kornia.geometry.boxes import Boxes
+from kornia.geometry.transform import crop_by_indices, crop_by_transform_mat, get_perspective_transform
+
+__all__ = ["RandomMosaic"]
+
+
+class RandomMosaic(MixAugmentationBaseV2):
+    r"""Replace each sample, with probability ``p`` (default 0.7), by a crop of a mosaic of batch images.
+
+    ``output = RandomMosaic(output_size, ...)(input)`` arranges batch images in a mosaic before taking one output
+    crop.
+
+    Args:
+        output_size: the output ``(height, width)`` after mosaicing.
+        start_ratio_range: the ``(low, high)`` range from which both top-left crop ratios ``(x / W, y / H)`` are drawn.
+        mosaic_grid: the number of images and image arrangement. e.g. (2, 2) means
+            each output will mix 4 images in a 2x2 grid.
+        min_bbox_size: minimum area of bounding boxes. Default to 0.
+        data_keys: the input type sequential for applying augmentations. Only "input", "image", "bbox",
+            "bbox_xyxy" and "bbox_xywh" are implemented; see the Convention block.
+        p: probability of applying the transformation to each sample.
+        keepdim: whether to keep the output shape the same as input ``True`` or broadcast it
+            to the batch form ``False``.
+        padding_mode: Type of padding, used only with ``cropping_mode="resample"``.
+            Should be: constant, reflect, replicate.
+        resample: the interpolation mode.
+        align_corners: interpolation flag.
+        cropping_mode: The used algorithm to crop. ``slice`` will use advanced slicing to extract the torch.Tensor based
+            on the sampled indices. ``resample`` will use `warp_affine` using the affine transformation
+            to extract the window. Use `slice` for efficiency, or `resample` for proper
+            differentiability.
+
+    .. image:: https://raw.githubusercontent.com/kornia/data/main/random_mosaic.png
+
+    See the Convention block on :class:`~kornia.augmentation.MixAugmentationBaseV2`.
+
+    Convention:
+        - ``output_size`` and the default output shape are ordered ``(height, width)``. With ``output_size=None``
+          the output preserves the input's ``(H, W)`` even when they differ, in both ``cropping_mode="slice"`` and
+          ``cropping_mode="resample"``. ``start_ratio_range`` draws a pair used as ``(x / W, y / H)`` for the crop's
+          top-left corner, which is floored to a whole pixel that both cropping modes and the boxes share. These are
+          the repaired axis conventions from `#4438 <https://github.com/kornia/kornia/issues/4438>`_.
+        - ``p`` is per sample and this class fixes ``same_on_batch=False``. It composes ``mosaic_grid[0]`` tiles
+          along width and ``mosaic_grid[1]`` tiles along height, then crops each result. It supports
+          ``"bbox"``, ``"bbox_xyxy"``, and ``"bbox_xywh"`` in addition to image inputs; it does not support
+          masks, keypoints, or class labels.
+        - Both ``cropping_mode`` values take an ``output_size`` window of the composed canvas at the drawn corner,
+          without rescaling; where the window passes the canvas edge it is zero. With an explicit ``output_size`` an
+          unselected sample is zero-padded or cropped to that size rather than returned unchanged. The boxes of a
+          selected sample are translated with its tiles, not rescaled, and clipped to the output window
+          ``[0, W_out] x [0, H_out]``.
+        - A tensor box input comes back as one dense tensor. When the gate selects any sample, every row holds
+          ``N * mosaic_grid[0] * mosaic_grid[1]`` boxes for ``N`` input boxes per sample: a selected row holds its
+          mosaic boxes, and an unselected row holds its own ``N`` boxes unchanged followed by all-zero padding rows
+          (``[0, 0, 0, 0]`` in ``"bbox_xyxy"`` and ``"bbox_xywh"``, four ``(0, 0)`` vertices in ``"bbox"``), which
+          have zero area. When the gate selects no sample the boxes are returned unchanged with their ``N`` rows.
+        - A list box input comes back as a list with one tensor per sample, from a direct call and from
+          :class:`~kornia.augmentation.container.AugmentationSequential` alike, whatever the gate selects. An
+          unselected sample's tensor is its own boxes unchanged, with no padding rows. A selected sample's tensor
+          holds the boxes of each tile's source image, with no padding rows.
+        - In either form, a selected sample's box that falls below ``min_bbox_size`` is zeroed by
+          :meth:`~kornia.geometry.boxes.Boxes.filter_boxes_by_area`. It exports as exact zeros in every box
+          format, from a direct call and from :class:`~kornia.augmentation.container.AugmentationSequential`.
+
+    See Also:
+        - :class:`RandomJigsaw`: shuffles tiles within each individual image.
+
+    Examples:
+        >>> mosaic = RandomMosaic((300, 300), data_keys=["input", "bbox_xyxy"])
+        >>> boxes = torch.tensor([[
+        ...     [70, 5, 150, 100],
+        ...     [60, 180, 175, 220],
+        ... ]]).repeat(8, 1, 1)
+        >>> input = torch.randn(8, 3, 224, 224)
+        >>> out = mosaic(input, boxes)
+        >>> out[0].shape, out[1].shape
+        (torch.Size([8, 3, 300, 300]), torch.Size([8, 8, 4]))
+
+    """
+
+    def _validate_data_key(self, key: DataKey) -> None:
+        if key == DataKey.CLASS and type(self).apply_transform_class is RandomMosaic.apply_transform_class:
+            raise RuntimeError(f"{self.__class__.__name__} does not support `TAG` types.")
+        super()._validate_data_key(key)
+
+    def __init__(
+        self,
+        output_size: Optional[Tuple[int, int]] = None,
+        mosaic_grid: Tuple[int, int] = (2, 2),
+        start_ratio_range: Tuple[float, float] = (0.3, 0.7),
+        min_bbox_size: float = 0.0,
+        data_keys: Optional[List[Union[str, int, DataKey]]] = None,
+        p: float = 0.7,
+        keepdim: bool = False,
+        padding_mode: str = "constant",
+        resample: Union[str, int, Resample] = Resample.BILINEAR.name,
+        align_corners: bool = True,
+        cropping_mode: str = "slice",
+    ) -> None:
+        if padding_mode not in ("constant", "reflect", "replicate"):
+            raise ValueError(
+                f"{padding_mode!r} is not a valid padding_mode. Expected one of 'constant', 'reflect', 'replicate'."
+            )
+        super().__init__(p=p, p_batch=1.0, same_on_batch=False, keepdim=keepdim, data_keys=data_keys)
+        self.start_ratio_range = start_ratio_range
+        self._param_generator = rg.MosaicGenerator(output_size, mosaic_grid, start_ratio_range)
+
+        self.flags = {
+            "mosaic_grid": mosaic_grid,
+            "output_size": output_size,
+            "min_bbox_size": min_bbox_size,
+            "padding_mode": padding_mode,
+            "resample": Resample.get(resample),
+            "align_corners": align_corners,
+            "cropping_mode": cropping_mode,
+        }
+
+    @torch.no_grad()
+    def apply_transform_boxes(self, input: Boxes, params: Dict[str, torch.Tensor], flags: Dict[str, Any]) -> Boxes:
+        to_apply = params["batch_prob"] > 0.5
+        src_box = torch.as_tensor(params["src"], device=input.device, dtype=input.dtype)
+        dst_box = torch.as_tensor(params["dst"], device=input.device, dtype=input.dtype)
+        # Boxes is BxNx4x2 only.
+        batch_shapes = torch.as_tensor(params["batch_shapes"], device=input.device, dtype=input.dtype)
+        offset = torch.zeros((len(to_apply), 2), device=input.device, dtype=input.dtype)  # Bx2
+        # NOTE: not a pretty good line I think.
+        offset_end = dst_box[0, 2].repeat(input.data.shape[0], 1)
+        idx = torch.arange(0, input.data.shape[0], device=input.device, dtype=torch.long)[to_apply]
+
+        num_boxes = input.data.shape[1]
+        maybe_out_boxes: Optional[Boxes] = None
+        # ``batch_shapes`` and ``src_box`` are full-batch sized.
+        # Subset them to match ``idx`` (the to_apply indices).
+        batch_shapes_idx = batch_shapes[to_apply]
+        src_box_idx = src_box[to_apply]
+        for i in range(flags["mosaic_grid"][0]):
+            for j in range(flags["mosaic_grid"][1]):
+                _offset = offset.clone()
+                # _compose_images concatenates the i loop along the width and the j loop along
+                # the height, so tile (i, j) starts at x = W * i, y = H * j.
+                _offset[idx, 0] = batch_shapes_idx[:, -1] * i - src_box_idx[:, 0, 0]
+                _offset[idx, 1] = batch_shapes_idx[:, -2] * j - src_box_idx[:, 0, 1]
+                _box = input.clone()
+                _idx = i * flags["mosaic_grid"][1] + j
+                # A list input pads each sample to the longest one; the tile keeps its source's padding.
+                _box[params["permutation"][:, 0]] = input[params["permutation"][:, _idx]]
+                _box.translate(_offset, inplace=True)
+                if maybe_out_boxes is None:
+                    maybe_out_boxes = _box
+                else:
+                    KORNIA_UNWRAP(maybe_out_boxes, Boxes).merge(_box, inplace=True)
+        out_boxes: Boxes = KORNIA_UNWRAP(maybe_out_boxes, Boxes)
+        out_boxes.clamp(offset, offset_end, inplace=True)
+        out_boxes.filter_boxes_by_area(flags["min_bbox_size"], inplace=True)
+
+        if not bool(to_apply.all()):
+            # An unselected sample keeps its own boxes unchanged, followed by padding up to the mosaic box count.
+            # That padding is recorded and also marked invalid, so every export gives all-zero rows for it, also
+            # after a later geometric transform and in a container such as VideoBoxes that keeps no padding.
+            out_boxes._data[~to_apply, :num_boxes] = input._data[~to_apply]
+            out_boxes._valid[~to_apply, :num_boxes] = input._valid[~to_apply]
+            out_boxes._data[~to_apply, num_boxes:] = 0.0
+            out_boxes._valid[~to_apply, num_boxes:] = False
+            skipped = ~to_apply.cpu()
+            padding = out_boxes._padding_or_real()
+            padding[skipped, :num_boxes] = input._padding_or_real()[skipped]
+            padding[skipped, num_boxes:] = True
+            out_boxes._set_padding(padding)
+
+        return out_boxes
+
+    def apply_transform_class(
+        self, input: torch.Tensor, params: Dict[str, torch.Tensor], flags: Dict[str, Any]
+    ) -> torch.Tensor:
+        raise RuntimeError(f"{self.__class__.__name__} does not support `TAG` types.")
+
+    @torch.no_grad()
+    def _compose_images(
+        self, input: torch.Tensor, params: Dict[str, torch.Tensor], flags: Dict[str, Any]
+    ) -> torch.Tensor:
+        out = []
+        for i in range(flags["mosaic_grid"][0]):
+            out_row = []
+            for j in range(flags["mosaic_grid"][1]):
+                img_idx = flags["mosaic_grid"][1] * i + j
+                image = input[_to_device_nonblocking(params["permutation"][:, img_idx], input.device)]
+                out_row.append(image)
+            out.append(torch.cat(out_row, -2))
+        return torch.cat(out, -1)
+
+    def compute_transformation(
+        self, input: torch.Tensor, params: Dict[str, torch.Tensor], flags: Dict[str, Any]
+    ) -> torch.Tensor:
+        if flags["cropping_mode"] == "resample":
+            src = _to_device_nonblocking(params["src"], input.device, input.dtype)
+            dst = _to_device_nonblocking(params["dst"], input.device, input.dtype)
+            transform: torch.Tensor = get_perspective_transform(src, dst)
+            return transform
+        if flags["cropping_mode"] == "slice":  # Skip the computation for slicing.
+            return eye_like(3, input)
+        raise NotImplementedError(f"Not supported type: {flags['cropping_mode']}.")
+
+    def _crop_images(
+        self,
+        input: torch.Tensor,
+        params: Dict[str, torch.Tensor],
+        flags: Dict[str, Any],
+        transform: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        flags = self.flags if flags is None else flags
+        if flags["cropping_mode"] == "resample":  # uses bilinear interpolation to crop
+            if not isinstance(transform, torch.Tensor):
+                raise TypeError(f"Expected the transform to be a torch.Tensor. Got {type(transform)}")
+
+            # Fit the arg to F.F.pad
+            if flags["padding_mode"] == "constant":
+                padding_mode = "zeros"
+            elif flags["padding_mode"] == "replicate":
+                padding_mode = "border"
+            elif flags["padding_mode"] == "reflect":
+                padding_mode = "reflection"
+            else:
+                padding_mode = flags["padding_mode"]
+
+            output_size = (
+                tuple(params["batch_shapes"][0, -2:].tolist()) if flags["output_size"] is None else flags["output_size"]
+            )
+            return crop_by_transform_mat(
+                input,
+                transform[:, :2, :],
+                output_size,
+                mode=flags["resample"].name.lower(),
+                padding_mode=padding_mode,
+                align_corners=flags["align_corners"],
+            )
+        if flags["cropping_mode"] == "slice":  # uses advanced slicing to crop
+            if flags["output_size"] is not None and input.shape[0] > 0 and not is_exporting():
+                # The window is ``output_size`` and may pass the canvas edge. Zero-pad the canvas so every slice is
+                # exactly ``output_size``: ``crop_by_indices`` resizes rather than pads when all boxes coincide.
+                src = params["src"].long()
+                pad_w = int(src[:, 1, 0].max()) + 1 - input.shape[-1]
+                pad_h = int(src[:, 3, 1].max()) + 1 - input.shape[-2]
+                if pad_w > 0 or pad_h > 0:
+                    input = F.pad(input, [0, max(pad_w, 0), 0, max(pad_h, 0)])
+            return crop_by_indices(input, params["src"], flags["output_size"], shape_compensation="F.pad")
+        raise NotImplementedError(f"Not supported type: {flags['cropping_mode']}.")
+
+    def apply_non_transform(
+        self, input: torch.Tensor, params: Dict[str, torch.Tensor], flags: Optional[Dict[str, Any]] = None
+    ) -> torch.Tensor:
+        if flags is not None and flags["output_size"] is not None:
+            output_size = KORNIA_UNWRAP(flags["output_size"], Tuple[int, int])
+            return F.pad(input, [0, output_size[1] - input.shape[-1], 0, output_size[0] - input.shape[-2]])
+            # NOTE: resize is not suitable for being consistent with bounding boxes.
+            # return resize(
+            #     input,
+            #     size=flags["output_size"],
+            #     interpolation=flags["resample"].name.lower(),
+            #     align_corners=flags["align_corners"]
+            # )
+        return input
+
+    def apply_transform(
+        self, input: torch.Tensor, params: Dict[str, torch.Tensor], maybe_flags: Optional[Dict[str, Any]] = None
+    ) -> torch.Tensor:
+        flags = KORNIA_UNWRAP(maybe_flags, Dict[str, Any])
+        output = self._compose_images(input, params, flags=flags)
+        transform = self.compute_transformation(output, params, flags=flags)
+        return self._crop_images(output, params, flags=flags, transform=transform)

@@ -1,0 +1,441 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
+
+# References:
+#   https://github.com/facebookresearch/dino/blob/main/vision_transformer.py
+#   https://github.com/rwightman/pytorch-image-models/tree/master/timm/models/vision_transformer.py
+
+import math
+from functools import partial
+from typing import Callable, Sequence, Tuple, Union
+
+import torch
+import torch.utils.checkpoint
+from torch import nn
+from torch.nn.init import trunc_normal_
+
+from kornia.core.check import KORNIA_CHECK
+
+from .layers import MemEffAttention, Mlp, PatchEmbed, SwiGLUFFNFused
+from .layers import NestedTensorBlock as Block
+
+
+def named_apply(fn: Callable, module: nn.Module, name="", depth_first=True, include_root=False) -> nn.Module:
+    """Apply named function to module."""
+    if not depth_first and include_root:
+        fn(module=module, name=name)
+    for child_name, child_module in module.named_children():
+        child_name = ".".join((name, child_name)) if name else child_name
+        named_apply(fn=fn, module=child_module, name=child_name, depth_first=depth_first, include_root=True)
+    if depth_first and include_root:
+        fn(module=module, name=name)
+    return module
+
+
+class BlockChunk(nn.ModuleList):
+    """Implement a container for sequential execution of transformer block chunks."""
+
+    def forward(self, x):
+        """Run this DeDoDe module forward.
+
+        Args:
+            x: Token sequence or tensor passed through each transformer block in sequence.
+
+        Returns:
+            Token sequence with the same shape as input after processing through all blocks.
+        """
+        for b in self:
+            x = b(x)
+        return x
+
+
+class DinoVisionTransformer(nn.Module):
+    """Implement the DINOv2 Vision Transformer architecture."""
+
+    def __init__(
+        self,
+        img_size=224,
+        patch_size=16,
+        in_chans=3,
+        embed_dim=768,
+        depth=12,
+        num_heads=12,
+        mlp_ratio=4.0,
+        qkv_bias=True,
+        ffn_bias=True,
+        proj_bias=True,
+        drop_path_rate=0.0,
+        drop_path_uniform=False,
+        init_values=None,  # for layerscale: None or 0 => no layerscale
+        embed_layer=PatchEmbed,
+        act_layer=nn.GELU,
+        block_fn=Block,
+        ffn_layer="mlp",
+        block_chunks=1,
+    ):
+        """Construct dino vision transformer.
+
+        Args:
+        img_size (int, tuple): input image size
+        patch_size (int, tuple): patch size
+        in_chans (int): number of input channels
+        embed_dim (int): embedding dimension
+        depth (int): depth of transformer
+        num_heads (int): number of attention heads
+        mlp_ratio (int): ratio of mlp hidden dim to embedding dim
+        qkv_bias (bool): enable bias for qkv if True
+        proj_bias (bool): enable bias for proj in attn if True
+        ffn_bias (bool): enable bias for ffn if True
+        drop_path_rate (float): stochastic depth rate
+        drop_path_uniform (bool): apply uniform drop rate across blocks
+        init_values (float): layer-scale init values
+        embed_layer (nn.Module): patch embedding layer
+        act_layer (nn.Module): MLP activation layer
+        block_fn (nn.Module): transformer block class
+        ffn_layer (str): "mlp", "swiglu", "swiglufused" or "identity"
+        block_chunks: (int) split block sequence into block_chunks units for FSDP wrap
+
+        """
+        super().__init__()
+        norm_layer = partial(nn.LayerNorm, eps=1e-6)
+
+        self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
+        self.num_tokens = 1
+        self.n_blocks = depth
+        self.num_heads = num_heads
+        self.patch_size = patch_size
+
+        self.patch_embed = embed_layer(img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
+        num_patches = self.patch_embed.num_patches
+
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + self.num_tokens, embed_dim))
+
+        if drop_path_uniform is True:
+            dpr = [drop_path_rate] * depth
+        else:
+            dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
+
+        if ffn_layer == "mlp":
+            ffn_layer = Mlp
+        elif ffn_layer == "swiglufused" or ffn_layer == "swiglu":
+            ffn_layer = SwiGLUFFNFused
+        elif ffn_layer == "identity":
+
+            def f(*args, **kwargs):
+                return nn.Identity()
+
+            ffn_layer = f
+        else:
+            raise NotImplementedError
+
+        blocks_list = [
+            block_fn(
+                dim=embed_dim,
+                num_heads=num_heads,
+                mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias,
+                proj_bias=proj_bias,
+                ffn_bias=ffn_bias,
+                drop_path=dpr[i],
+                norm_layer=norm_layer,
+                act_layer=act_layer,
+                ffn_layer=ffn_layer,
+                init_values=init_values,
+            )
+            for i in range(depth)
+        ]
+        if block_chunks > 0:
+            self.chunked_blocks = True
+            chunked_blocks = []
+            chunksize = depth // block_chunks
+            for i in range(0, depth, chunksize):
+                # this is to keep the block index consistent if we chunk the block list
+                chunked_blocks.append([nn.Identity()] * i + blocks_list[i : i + chunksize])
+            self.blocks = nn.ModuleList([BlockChunk(p) for p in chunked_blocks])
+        else:
+            self.chunked_blocks = False
+            self.blocks = nn.ModuleList(blocks_list)
+
+        self.norm = norm_layer(embed_dim)
+        self.head = nn.Identity()
+
+        self.mask_token = nn.Parameter(torch.zeros(1, embed_dim))
+
+        self.init_weights()
+        for param in self.parameters():
+            param.requires_grad = False
+
+    @property
+    def device(self):
+        """Return the device of the stored tensors or module parameters.
+
+        Returns:
+            Device used by the model parameters.
+        """
+        return self.cls_token.device
+
+    def init_weights(self):
+        """Initialize transformer weights.
+
+        Returns:
+            None. Model weights are initialized in place.
+        """
+        trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.normal_(self.cls_token, std=1e-6)
+        named_apply(init_weights_vit_timm, self)
+
+    def interpolate_pos_encoding(self, x, w, h):
+        """Interpolate positional encodings to the current patch grid.
+
+        Args:
+            x: Token sequence with class token prepended, shape ``(B, N+1, D)``.
+            w: Image width in pixels.
+            h: Image height in pixels.
+
+        Returns:
+            Positional embedding tensor resized to match the current patch grid, shape ``(1, N' + 1, D)``.
+        """
+        previous_dtype = x.dtype
+        npatch = x.shape[1] - 1
+        N = self.pos_embed.shape[1] - 1
+        if npatch == N and w == h:
+            return self.pos_embed
+        pos_embed = self.pos_embed.float()
+        class_pos_embed = pos_embed[:, 0]
+        patch_pos_embed = pos_embed[:, 1:]
+        dim = x.shape[-1]
+        w0 = w // self.patch_size
+        h0 = h // self.patch_size
+        # we add a small number to avoid floating point error in the interpolation
+        # see discussion at https://github.com/facebookresearch/dino/issues/8
+        w0, h0 = w0 + 0.1, h0 + 0.1
+
+        patch_pos_embed = nn.functional.interpolate(
+            patch_pos_embed.reshape(1, int(math.sqrt(N)), int(math.sqrt(N)), dim).permute(0, 3, 1, 2),
+            scale_factor=(w0 / math.sqrt(N), h0 / math.sqrt(N)),
+            mode="bicubic",
+        )
+        KORNIA_CHECK(int(w0) == patch_pos_embed.shape[-2])
+        KORNIA_CHECK(int(h0) == patch_pos_embed.shape[-1])
+        patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
+        return torch.cat((class_pos_embed.unsqueeze(0), patch_pos_embed), dim=1).to(previous_dtype)
+
+    def prepare_tokens_with_masks(self, x, masks=None):
+        """Prepare image patch tokens before transformer encoding.
+
+        Args:
+            x: Input image tensor with shape ``(B, C, H, W)``.
+            masks: Optional boolean mask tensor with shape ``(B, N)`` for masked patch tokens.
+
+        Returns:
+            Token sequence with class token, positional embeddings, and optional masks, shape ``(B, N+1, D)``.
+        """
+        _B, _nc, w, h = x.shape
+        x = self.patch_embed(x)
+        if masks is not None:
+            x = torch.where(masks.unsqueeze(-1), self.mask_token.to(x.dtype).unsqueeze(0), x)
+
+        x = torch.cat((self.cls_token.expand(x.shape[0], -1, -1), x), dim=1)
+        return x + self.interpolate_pos_encoding(x, w, h)
+
+    def forward_features(self, x, masks=None):
+        """Compute transformer features for one image tensor.
+
+        Args:
+            x: Input image tensor with shape ``(B, C, H, W)``.
+            masks: Optional boolean mask tensor with shape ``(B, N)`` or ``None``.
+
+        Returns:
+            Feature dictionary with keys ``x_norm_clstoken``, ``x_norm_patchtokens``, ``x_prenorm``, and ``masks``.
+        """
+        x = self.prepare_tokens_with_masks(x, masks)
+
+        for blk in self.blocks:
+            x = blk(x)
+
+        x_norm = self.norm(x)
+        return {
+            "x_norm_clstoken": x_norm[:, 0],
+            "x_norm_patchtokens": x_norm[:, 1:],
+            "x_prenorm": x,
+            "masks": masks,
+        }
+
+    def _get_intermediate_layers_not_chunked(self, x, n=1):
+        x = self.prepare_tokens_with_masks(x)
+        # If n is an int, take the n last blocks. If it's a list, take them
+        output, total_block_len = [], len(self.blocks)
+        blocks_to_take = range(total_block_len - n, total_block_len) if isinstance(n, int) else n
+        for i, blk in enumerate(self.blocks):
+            x = blk(x)
+            if i in blocks_to_take:
+                output.append(x)
+        KORNIA_CHECK(len(output) == len(blocks_to_take), f"only {len(output)} / {len(blocks_to_take)} blocks found")
+        return output
+
+    def _get_intermediate_layers_chunked(self, x, n=1):
+        x = self.prepare_tokens_with_masks(x)
+        output, i, total_block_len = [], 0, len(self.blocks[-1])
+        # If n is an int, take the n last blocks. If it's a list, take them
+        blocks_to_take = range(total_block_len - n, total_block_len) if isinstance(n, int) else n
+        for block_chunk in self.blocks:
+            for blk in block_chunk[i:]:  # Passing the nn.Identity()
+                x = blk(x)
+                if i in blocks_to_take:
+                    output.append(x)
+                i += 1
+        KORNIA_CHECK(len(output) == len(blocks_to_take), f"only {len(output)} / {len(blocks_to_take)} blocks found")
+        return output
+
+    def get_intermediate_layers(
+        self,
+        x: torch.Tensor,
+        n: Union[int, Sequence] = 1,  # Layers or n last layers to take
+        reshape: bool = False,
+        return_class_token: bool = False,
+        norm=True,
+    ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor]]]:
+        """Return selected intermediate transformer layer outputs.
+
+        Args:
+            x: Input image tensor with shape ``(B, C, H, W)``.
+            n: Number of last transformer blocks to return, or explicit list of block indices.
+            reshape: If ``True``, reshape patch tokens from ``(B, N, D)`` to ``(B, D, H_p, W_p)``.
+            return_class_token: If ``True``, return ``(patch_tokens, class_token)`` tuples.
+            norm: If ``True``, apply layer normalization to each output.
+
+        Returns:
+            Tuple of intermediate transformer layer outputs, optionally reshaped and with class tokens.
+        """
+        if self.chunked_blocks:
+            outputs = self._get_intermediate_layers_chunked(x, n)
+        else:
+            outputs = self._get_intermediate_layers_not_chunked(x, n)
+        if norm:
+            outputs = [self.norm(out) for out in outputs]
+        class_tokens = [out[:, 0] for out in outputs]
+        outputs = [out[:, 1:] for out in outputs]
+        if reshape:
+            B, _, w, h = x.shape
+            outputs = [
+                out.reshape(B, w // self.patch_size, h // self.patch_size, out.shape[-1])
+                .permute(0, 3, 1, 2)
+                .contiguous()
+                for out in outputs
+            ]
+        if return_class_token:
+            return tuple(zip(outputs, class_tokens))
+        return tuple(outputs)
+
+    def forward(self, *args, is_training=False, **kwargs):
+        r"""Run this DeDoDe module forward.
+
+        Returns:
+            During training: full feature dictionary from ``forward_features``.
+            During inference: the normalised class token with shape ``(B, embed_dim)``, through the identity
+            ``head``.
+        """
+        ret = self.forward_features(*args, **kwargs)
+        if is_training:
+            return ret
+        return self.head(ret["x_norm_clstoken"])
+
+
+def init_weights_vit_timm(module: nn.Module, name: str = ""):
+    """ViT weight initialization, original timm impl (for reproducibility)."""
+    if isinstance(module, nn.Linear):
+        trunc_normal_(module.weight, std=0.02)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+
+
+def vit_small(patch_size=16, **kwargs) -> DinoVisionTransformer:
+    """Return ViT Small."""
+    return DinoVisionTransformer(
+        patch_size=patch_size,
+        embed_dim=384,
+        depth=12,
+        num_heads=6,
+        mlp_ratio=4,
+        block_fn=partial(Block, attn_class=MemEffAttention),
+        **kwargs,
+    )
+
+
+def vit_base(patch_size=16, **kwargs) -> DinoVisionTransformer:
+    """Return ViT Base."""
+    return DinoVisionTransformer(
+        patch_size=patch_size,
+        embed_dim=768,
+        depth=12,
+        num_heads=12,
+        mlp_ratio=4,
+        block_fn=partial(Block, attn_class=MemEffAttention),
+        **kwargs,
+    )
+
+
+def vit_large(patch_size=16, **kwargs) -> DinoVisionTransformer:
+    """Build the DINOv2 ViT-L vision transformer that DeDoDe's G descriptor runs as its frozen backbone.
+
+    ``backbone = vit_large(patch_size=14, img_size=518, init_values=1.0, ffn_layer="mlp", block_chunks=0)`` builds
+    the ViT-L architecture of the ``dinov2_vitl14_pretrain.pth`` checkpoint, 24 blocks of width 1024 with 16 heads,
+    with random weights and every parameter frozen (``requires_grad`` is ``False``); load the checkpoint with
+    ``backbone.load_state_dict``, as :class:`~kornia.feature.DeDoDe` does for its ``G`` descriptor. Then
+    ``backbone.forward_features(images)["x_norm_patchtokens"]`` takes images ``(B, 3, H, W)`` with ``H`` and ``W``
+    multiples of ``patch_size`` and returns one token per patch, ``(B, (H / patch_size) * (W / patch_size), 1024)``,
+    and ``backbone(images)`` returns the class token ``(B, 1024)``. The defaults, ``patch_size=16``,
+    ``img_size=224``, no layer scale (``init_values=None``) and ``block_chunks=1``, do not match that checkpoint.
+    The other keyword arguments go to ``DinoVisionTransformer``, except ``embed_dim``, ``depth``, ``num_heads``,
+    ``mlp_ratio`` and ``block_fn``, which this function sets.
+
+    See Also:
+        - :class:`~kornia.feature.DeDoDe`: builds this backbone for its ``G`` descriptor and loads the DINOv2 weights
+          into it.
+        - :class:`~kornia.models.vit.VisionTransformer`: kornia's general ViT encoder, which loads AugReg weights
+          rather than DINOv2's.
+
+    """
+    return DinoVisionTransformer(
+        patch_size=patch_size,
+        embed_dim=1024,
+        depth=24,
+        num_heads=16,
+        mlp_ratio=4,
+        block_fn=partial(Block, attn_class=MemEffAttention),
+        **kwargs,
+    )
+
+
+def vit_giant2(patch_size=16, **kwargs):
+    """Close to ViT-giant, with embed-dim 1536 and 24 heads => embed-dim per head 64."""
+    return DinoVisionTransformer(
+        patch_size=patch_size,
+        embed_dim=1536,
+        depth=40,
+        num_heads=24,
+        mlp_ratio=4,
+        block_fn=partial(Block, attn_class=MemEffAttention),
+        **kwargs,
+    )

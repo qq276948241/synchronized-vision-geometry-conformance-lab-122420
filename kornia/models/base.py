@@ -1,0 +1,239 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from __future__ import annotations
+
+import datetime
+import logging
+import os
+from abc import ABC, abstractmethod
+from typing import Any, Generic, List, Optional, TypeVar, Union, cast
+
+import torch
+from torch import nn
+
+from kornia.core._compat import _emit_deprecation_warning
+from kornia.core.download import load_state_dict_from_url
+from kornia.core.external import PILImage as Image
+from kornia.core.mixin.image_module import ImageModuleMixIn, _to_uint8_image
+from kornia.io import write_image
+
+logger = logging.getLogger(__name__)
+
+ModelConfig = TypeVar("ModelConfig")
+
+
+def _write_png_batch(path_stem: str, image: Union[torch.Tensor, Image.Image]) -> None:
+    """Write one image, or one file per item of a batch.
+
+    ``visualize`` returns float images in ``[0, 1]``, but ``write_image`` writes
+    PNG only for ``uint8``/``uint16``; float32 is TIFF-only and every other
+    float dtype is rejected outright. These are pictures for a human to look at,
+    not data to round-trip, so a float image is converted to ``uint8`` the way
+    ``ImageModule`` hands a tensor to PIL: clamped, scaled and rounded. A
+    ``uint8`` or ``uint16`` visualization is written as-is.
+
+    ``write_image`` takes one image, ``(3, H, W)``, ``(1, H, W)``, ``(H, W)`` or,
+    for PNG only, ``(4, H, W)``, and rejects a batched tensor; the containers
+    document their inputs as ``(B, 3, H, W)``, so a batch is written as one file
+    per item.
+
+    A batch of one still gets an index suffix, so a caller does not have to
+    guess whether a file will be ``name.png`` or ``name_0.png``.
+
+    A PIL image, what ``visualize(output_type="pil")`` returns, was made 8-bit by
+    the same conversion and is written as it is, to ``name.png``.
+    """
+    if not isinstance(image, torch.Tensor):
+        image.save(f"{path_stem}.png")
+        return
+    image = _to_uint8_image(image)
+    if image.dim() == 4:
+        for i, item in enumerate(image):
+            write_image(f"{path_stem}_{i}.png", item)
+    else:
+        write_image(f"{path_stem}.png", image)
+
+
+class ModelBaseMixin:
+    """Provide common properties and utilities for Kornia model classes."""
+
+    name: str = "model"
+
+    def _tensor_to_type(
+        self, output: Union[torch.Tensor, List[torch.Tensor]], output_type: str
+    ) -> Union[torch.Tensor, List[torch.Tensor], List[Image.Image]]:
+        """Convert the output tensor to the desired type.
+
+        Args:
+            output: The output tensor or list of tensors.
+            output_type: The desired output type. Accepted values are "torch" and "pil".
+
+        Returns:
+            The output unchanged for "torch". For "pil", a list of PIL images, one per ``(C, H, W)`` or
+            ``(H, W)`` image: a ``(B, C, H, W)`` tensor gives B images, and a list gives the images of each
+            element in turn. They are converted as :meth:`~kornia.core.mixin.image_module.ImageModuleMixIn.to_pil`
+            does: a floating image is clamped to ``[0, 1]`` and rounded to 8 bits, and a one-channel or
+            ``(H, W)`` image becomes a mode ``"L"`` image.
+
+        Raises:
+            RuntimeError: If the output type is not supported.
+
+        """
+        self._check_output_type(output_type)
+        if output_type == "pil":
+            images = []
+            for t in output if isinstance(output, list) else [output]:
+                # an (H, W) item is one single-channel image; larger items are split into (C, H, W) slices
+                t = t[None] if t.dim() == 2 else t
+                images.extend(ImageModuleMixIn._chw_to_pil(chw) for chw in t.reshape(-1, *t.shape[-3:]))
+            return images
+        return output
+
+    @staticmethod
+    def _check_output_type(output_type: str) -> None:
+        """Raise ``RuntimeError`` unless ``output_type`` is "torch" or "pil"."""
+        if output_type not in ("torch", "pil"):
+            raise RuntimeError(f"Output type {output_type} is not supported. Accepted values are 'torch' and 'pil'.")
+
+    def save(
+        self,
+        output: Union[torch.Tensor, List[torch.Tensor], List[Image.Image]],
+        directory: str,
+        is_batch: Optional[bool] = None,
+    ) -> None:
+        """Save the output tensor to a directory.
+
+        Args:
+            output: The output tensor, or a list of tensors or PIL images.
+            directory: The directory to save the output.
+            is_batch: deprecated since kornia 0.9.1 and ignored; passing ``True`` or ``False`` emits a
+              :class:`DeprecationWarning`, and the default ``None`` does not. A 4D tensor is always written as one
+              file per item, whatever its value.
+
+        """
+        if is_batch is not None:
+            _emit_deprecation_warning(
+                "save(is_batch=...)",
+                None,
+                "0.9.1",
+                "The argument has no effect: the files written depend only on `output`, whatever its value; stop "
+                "passing it.",
+            )
+        os.makedirs(directory, exist_ok=True)
+        timestamp = datetime.datetime.now(tz=datetime.UTC).strftime("%Y%m%d_%H%M%S")
+        if isinstance(output, list):
+            for i, out in enumerate(output):
+                _write_png_batch(os.path.join(directory, f"{self.name}_{timestamp}_{i}"), out)
+        else:
+            _write_png_batch(os.path.join(directory, f"{self.name}_{timestamp}"), output)
+        logger.info(f"Outputs are saved in {directory}")
+
+    def _save_outputs(
+        self,
+        output: Union[torch.Tensor, List[torch.Tensor], List[Image.Image]],
+        directory: Optional[str] = None,
+        suffix: str = "",
+    ) -> None:
+        """Save the output tensor to a directory with an optional suffix.
+
+        Args:
+            output: The output tensor, or a list of tensors or PIL images.
+            directory: The directory to save the output. If None, a default directory is used.
+            suffix: Optional suffix to add to the filename.
+
+        """
+        if directory is None:
+            name = f"{self.name}{suffix}_{datetime.datetime.now(tz=datetime.UTC).strftime('%Y%m%d%H%M%S')!s}"
+            directory = os.path.join("kornia_outputs", name)
+
+        os.makedirs(directory, exist_ok=True)
+        timestamp = datetime.datetime.now(tz=datetime.UTC).strftime("%Y%m%d_%H%M%S")
+        if isinstance(output, list):
+            for i, out in enumerate(output):
+                _write_png_batch(os.path.join(directory, f"{self.name}{suffix}_{timestamp}_{i}"), out)
+        else:
+            _write_png_batch(os.path.join(directory, f"{self.name}{suffix}_{timestamp}"), output)
+        logger.info(f"Outputs are saved in {directory}")
+
+
+class ModelBase(ABC, nn.Module, ModelBaseMixin, Generic[ModelConfig]):
+    """Abstract model class with some utilities function."""
+
+    def load_checkpoint(self, checkpoint: str | list[str], device: Optional[torch.device] = None) -> None:
+        """Load checkpoint from a given url or file.
+
+        Either way the file is loaded with ``weights_only=True``, so it may hold
+        tensors, primitive types and plain containers only; see
+        :func:`kornia.core.download.load_state_dict_from_url`.
+
+        Args:
+            checkpoint: The url or filepath for the respective checkpoint
+            device: The desired device to load the weights and move the model
+
+        """
+        local = os.path.expanduser(checkpoint) if isinstance(checkpoint, str) else None
+        if local is not None and os.path.isfile(local):
+            with open(local, "rb") as f:
+                state_dict = torch.load(f, map_location=device, weights_only=True)
+        else:
+            state_dict = load_state_dict_from_url(checkpoint, map_location=device)
+
+        self.load_state_dict(state_dict)
+        if device is not None:
+            self.to(device)
+
+    @staticmethod
+    @abstractmethod
+    def from_config(config: ModelConfig) -> ModelBase[ModelConfig]:
+        """Build/load the model.
+
+        Args:
+            config: The specifications for the model be build/loaded
+
+        """
+        raise NotImplementedError
+
+    def compile(
+        self,
+        *,
+        fullgraph: bool = False,
+        dynamic: bool = False,
+        backend: str = "inductor",
+        mode: Optional[str] = None,
+        options: Optional[dict[Any, Any]] = None,
+        disable: bool = False,
+    ) -> ModelBase[ModelConfig]:
+        """Compile this model with :func:`torch.compile`.
+
+        Args:
+            fullgraph: Whether Dynamo should require a single full graph.
+            dynamic: Whether dynamic shape tracing is enabled.
+            backend: Compilation backend name passed to :func:`torch.compile`.
+            mode: Optional backend-specific compilation mode.
+            options: Optional backend-specific option dictionary.
+            disable: If ``True``, return an uncompiled model wrapper according
+                to PyTorch's compile semantics.
+
+        Returns:
+            Compiled model object with the same high-level interface as this
+            instance.
+        """
+        compiled = torch.compile(
+            self, fullgraph=fullgraph, dynamic=dynamic, backend=backend, mode=mode, options=options, disable=disable
+        )
+        return cast(ModelBase[ModelConfig], compiled)

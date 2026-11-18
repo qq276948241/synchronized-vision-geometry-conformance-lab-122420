@@ -1,0 +1,214 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from __future__ import annotations
+
+from typing import Any, Literal, Optional
+
+from torch import nn
+
+from .mixin.image_module import ImageModuleMixIn
+from .mixin.onnx import ONNXExportMixin
+
+
+class ImageModule(nn.Module, ImageModuleMixIn, ONNXExportMixin):
+    """Subclass for an image ``nn.Module`` whose call also takes NumPy arrays, PIL images and image paths.
+
+    A subclass defines ``forward`` on tensors. ``out = module(image, output_type="pt")`` converts ``image`` to a tensor
+    when it is a NumPy array, a PIL image or, as the first positional argument, the path of an image file, runs
+    ``forward`` and returns the output as a tensor (``"pt"``), a channels-last NumPy array (``"numpy"``) or a PIL image,
+    a list of them for a batch (``"pil"``). The last output is kept for :meth:`ImageModuleMixIn.show` and
+    :meth:`ImageModuleMixIn.save`.
+
+    Note:
+        The output cache retains a detached reference to the last tensor output, so it can keep that storage alive and
+        reflects later in-place edits. Setting ``disable_features = True`` clears the cache and bypasses the extra
+        behavior. The cache is omitted when the module is pickled.
+
+    See Also:
+        - :class:`ImageSequential`: the same conversions around an ``nn.Sequential`` chain of modules.
+        - :class:`ImageModuleMixIn`: the conversion methods alone, as a decorator for any function.
+
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._disable_features: bool = False
+        self._output_image = None
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = super().__getstate__()
+        state.pop("_output_image", None)
+        return state
+
+    @property
+    def disable_features(self) -> bool:
+        """Whether convenience I/O (input/output) helper features are disabled.
+
+        This flag controls the extra behavior provided by :class:`ImageModuleMixIn`,
+        such as automatic input conversion (for example, PIL or NumPy inputs),
+        automatic output conversion, and output caching for visualization helpers.
+
+        Returns:
+            ``True`` if the helper features are bypassed and the module behaves like
+            a plain :class:`torch.nn.Module` call. ``False`` if helper features are enabled.
+        """
+        return self._disable_features
+
+    @disable_features.setter
+    def disable_features(self, value: bool = True) -> None:
+        """Enable or disable convenience I/O (input/output) handling features.
+
+        Args:
+            value: Feature toggle.
+                - ``True``: disable automatic type conversion and output caching,
+                  so ``__call__`` behaves closer to a raw PyTorch module call.
+                - ``False``: keep helper features active.
+        """
+        self._disable_features = value
+        if value:
+            self._output_image = None
+
+    def __call__(
+        self,
+        *inputs: Any,
+        input_names_to_handle: Optional[list[Any]] = None,
+        output_type: Literal["pt", "numpy", "pil"] = "pt",
+        **kwargs: Any,
+    ) -> Any:
+        """Run the module on converted inputs and return its output as ``output_type``.
+
+        Args:
+            inputs: Inputs to operate on.
+            input_names_to_handle: List of parameter names to convert. Module calls use the ``forward``
+                signature; a variadic parameter name selects all its values.
+                If None, convert every tensor, NumPy array and PIL image argument, and load a string as an image
+                path only if it is the first positional argument.
+            output_type: Desired output type ('pt', 'numpy', or 'pil').
+            kwargs: Additional arguments.
+
+        Returns:
+            The output of ``forward``, converted to ``output_type``; a tuple or list output is converted element by
+            element.
+
+        """
+        # Convert inputs and outputs around the forward call
+        if not self._disable_features:
+            tensor_output = self._call_converted(
+                super().__call__, inputs, kwargs, input_names_to_handle, "pt", signature_source=self.forward
+            )
+            self._store_output_image(self._convert_output(tensor_output, "pt"), "pt")
+            _output_image = self._convert_output(tensor_output, output_type)
+
+        else:
+            _output_image = super().__call__(*inputs, **kwargs)
+        return _output_image
+
+
+class ImageSequential(nn.Sequential, ImageModuleMixIn, ONNXExportMixin):
+    """Chain modules in an ``nn.Sequential`` whose call also takes NumPy arrays, PIL images and image paths.
+
+    ``seq = ImageSequential(first, second)`` builds an ``nn.Sequential`` of the given modules.
+    ``out = seq(image, output_type="numpy")`` converts the input and the output of the whole chain as
+    :class:`ImageModule` converts those of its ``forward``, keeps the last output for :meth:`ImageModuleMixIn.show` and
+    :meth:`ImageModuleMixIn.save`, and :meth:`ONNXExportMixin.to_onnx` exports the chain. For random augmentations whose
+    parameters are recorded and replayed, use the container of the same name,
+    :class:`~kornia.augmentation.container.ImageSequential`.
+
+    Note:
+        The output cache retains a detached reference to the last tensor output, so it can keep that storage alive and
+        reflects later in-place edits. Setting ``disable_features = True`` clears the cache and bypasses the extra
+        behavior. The cache is omitted when the module is pickled.
+
+    See Also:
+        - :class:`ImageModule`: the same conversions around one module with its own ``forward``.
+        - :class:`~kornia.augmentation.container.ImageSequential`: records and replays its random parameters.
+
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._disable_features: bool = False
+        self._output_image = None
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = super().__getstate__()
+        state.pop("_output_image", None)
+        return state
+
+    @property
+    def disable_features(self) -> bool:
+        """Whether convenience I/O (input/output) helper features are disabled.
+
+        This flag controls the extra behavior provided by :class:`ImageModuleMixIn`,
+        such as automatic input conversion (for example, PIL or NumPy inputs),
+        automatic output conversion, and output caching for visualization helpers.
+
+        Returns:
+            ``True`` if the helper features are bypassed and the module behaves like
+            a plain :class:`torch.nn.Sequential` call. ``False`` if helper features are enabled.
+        """
+        return self._disable_features
+
+    @disable_features.setter
+    def disable_features(self, value: bool = True) -> None:
+        """Enable or disable convenience I/O (input/output) handling features.
+
+        Args:
+            value: Feature toggle.
+                - ``True``: disable automatic type conversion and output caching,
+                  so ``__call__`` behaves closer to a raw PyTorch sequential call.
+                - ``False``: keep helper features active.
+        """
+        self._disable_features = value
+        if value:
+            self._output_image = None
+
+    def __call__(
+        self,
+        *inputs: Any,
+        input_names_to_handle: Optional[list[Any]] = None,
+        output_type: Literal["pt", "numpy", "pil"] = "pt",
+        **kwargs: Any,
+    ) -> Any:
+        """Run the module on converted inputs and return its output as ``output_type``.
+
+        Args:
+            inputs: Inputs to operate on.
+            input_names_to_handle: List of parameter names to convert. Module calls use the ``forward``
+                signature; a variadic parameter name selects all its values.
+                If None, convert every tensor, NumPy array and PIL image argument, and load a string as an image
+                path only if it is the first positional argument.
+            output_type: Desired output type ('pt', 'numpy', or 'pil').
+            kwargs: Additional arguments.
+
+        Returns:
+            The output of ``forward``, converted to ``output_type``; a tuple or list output is converted element by
+            element.
+
+        """
+        # Convert inputs and outputs around the forward call
+        if not self._disable_features:
+            tensor_output = self._call_converted(
+                super().__call__, inputs, kwargs, input_names_to_handle, "pt", signature_source=self.forward
+            )
+            self._store_output_image(self._convert_output(tensor_output, "pt"), "pt")
+            _output_image = self._convert_output(tensor_output, output_type)
+
+        else:
+            _output_image = super().__call__(*inputs, **kwargs)
+        return _output_image

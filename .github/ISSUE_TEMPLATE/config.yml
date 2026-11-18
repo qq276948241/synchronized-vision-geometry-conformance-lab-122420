@@ -1,0 +1,14 @@
+blank_issues_enabled: false
+contact_links:
+  - name: ❓ Ask a question
+    url: https://github.com/kornia/kornia/discussions
+    about: Please post questions related to the library in discussions.
+  - name: 🆘 Help Wanted Issues
+    url: https://github.com/kornia/kornia/issues?q=is%3Aissue%20state%3Aopen%20label%3A%22help%20wanted%22
+    about: Browse issues looking for contributors
+  - name: 💬 Discord
+    url: https://discord.gg/HfnywwpBnD
+    about: Chat with our community
+  - name: 📖 Contributing Guide
+    url: https://github.com/kornia/kornia/blob/main/CONTRIBUTING.md
+    about: Read our contribution guide

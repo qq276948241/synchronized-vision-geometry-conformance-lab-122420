@@ -1,0 +1,164 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+import pytest
+import torch
+from torch import nn
+
+from kornia.augmentation import RandomMotionBlur3D, RandomPerspective3D, RandomRotation3D
+
+
+class TestRandomRotation3DBackward:
+    @pytest.mark.parametrize(
+        "degrees",
+        [
+            10,
+            [10.0, 20.0],
+            [10.0, 20.0, 30.0],
+            [(10, 20), (10, 20), (10, 20)],
+            torch.tensor(10.0),
+            torch.tensor([10.0, 20.0]),
+            torch.tensor([10, 20, 30]),
+            torch.tensor([(10, 20), (10, 20), (10, 20)]),
+        ],
+    )
+    @pytest.mark.parametrize("resample", ["bilinear"])  # TODO: Ignore nearest for now.
+    @pytest.mark.parametrize("align_corners", [True, False])
+    @pytest.mark.parametrize("same_on_batch", [True, False])
+    def test_param(self, degrees, resample, align_corners, same_on_batch, device, dtype):
+        _degrees = (
+            degrees
+            if isinstance(degrees, (int, float, list, tuple))
+            else nn.Parameter(degrees.clone().to(device=device, dtype=dtype))
+        )
+
+        torch.manual_seed(0)
+        input = torch.randint(255, (2, 3, 10, 10, 10), device=device, dtype=dtype) / 255.0
+        aug = RandomRotation3D(_degrees, resample, align_corners=align_corners, same_on_batch=same_on_batch, p=1.0)
+
+        output = aug(input)
+
+        if len(list(aug.parameters())) != 0:
+            mse = nn.MSELoss()
+            # The (10, 20) range gets gradients of about 2e-3 to 5e-3. At lr=10 each step stays below half the
+            # bfloat16 spacing at that value (0.03125 at 10, 0.0625 at 20), so it rounds away and the range cannot
+            # move. lr=100 makes every step at least 0.2, which every tested dtype can represent.
+            opt = torch.optim.SGD(aug.parameters(), lr=100)
+            loss = mse(output, torch.ones_like(output) * 2)  # to ensure that a big loss value could be obtained
+            loss.backward()
+            opt.step()
+
+        if not isinstance(degrees, (int, float, list, tuple)):
+            assert isinstance(aug._param_generator.degrees, torch.Tensor)
+            # Bilinear sampling reaches the range: a zero gradient (which the test used to accept with an unchanged
+            # range, as nearest sampling gives) is a failure, and the SGD step must move the range.
+            grad = aug._param_generator.degrees.grad
+            assert torch.isfinite(grad).all()
+            assert torch.count_nonzero(grad) > 0
+            assert (degrees.to(device=device, dtype=dtype) - aug._param_generator.degrees.data).sum() != 0
+
+
+class TestRandomPerspective3DBackward:
+    @pytest.mark.parametrize("distortion_scale", [0.5, torch.tensor(0.5)])
+    @pytest.mark.parametrize("resample", ["bilinear"])  # TODO: Ignore nearest for now.
+    @pytest.mark.parametrize("align_corners", [True, False])
+    @pytest.mark.parametrize("same_on_batch", [True, False])
+    def test_param(self, distortion_scale, resample, align_corners, same_on_batch, device, dtype):
+        _distortion_scale = (
+            distortion_scale
+            if isinstance(distortion_scale, (float, int))
+            else nn.Parameter(distortion_scale.clone().to(device=device, dtype=dtype))
+        )
+
+        torch.manual_seed(0)
+        input = torch.randint(255, (2, 3, 10, 10, 10), device=device, dtype=dtype) / 255.0
+        aug = RandomPerspective3D(
+            _distortion_scale, resample=resample, same_on_batch=same_on_batch, align_corners=align_corners, p=1.0
+        )
+
+        output = aug(input)
+
+        if len(list(aug.parameters())) != 0:
+            mse = nn.MSELoss()
+            opt = torch.optim.SGD(aug.parameters(), lr=10)
+            loss = mse(output, torch.ones_like(output) * 2)  # to ensure that a big loss value could be obtained
+            loss.backward()
+            opt.step()
+
+        if not isinstance(distortion_scale, (float, int)):
+            assert isinstance(aug._param_generator.distortion_scale, torch.Tensor)
+            # Bilinear sampling reaches the scale: a zero gradient (which the test used to accept with an unchanged
+            # scale, as nearest sampling gives) is a failure, and the SGD step must move the scale.
+            grad = aug._param_generator.distortion_scale.grad
+            assert torch.isfinite(grad).all()
+            assert torch.count_nonzero(grad) > 0
+            assert (
+                distortion_scale.to(device=device, dtype=dtype) - aug._param_generator.distortion_scale.data
+            ).sum() != 0
+
+
+class TestRandomMotionBlur3DBackward:
+    @pytest.mark.parametrize("angle", [20.0, torch.tensor(20.0), torch.tensor([20.0])])
+    @pytest.mark.parametrize("direction", [[-0.5, 0.5], torch.tensor([-0.5, 0.5])])
+    # 'reflect' is not implemented by torch.
+    @pytest.mark.parametrize("border_type", ["constant", "replicate", "circular"])
+    @pytest.mark.parametrize("resample", ["bilinear"])  # TODO: Ignore nearest for now.
+    @pytest.mark.parametrize("same_on_batch", [True, False])
+    def test_param(self, angle, direction, border_type, resample, same_on_batch, device, dtype):
+        _angle = (
+            angle
+            if isinstance(angle, (float, int, list, tuple))
+            else nn.Parameter(angle.clone().to(device=device, dtype=dtype))
+        )
+        _direction = (
+            direction
+            if isinstance(direction, (list, tuple))
+            else nn.Parameter(direction.clone().to(device=device, dtype=dtype))
+        )
+
+        torch.manual_seed(0)
+        input = torch.randint(255, (2, 3, 10, 10, 10), device=device, dtype=dtype) / 255.0
+        aug = RandomMotionBlur3D((3, 3), _angle, _direction, border_type, resample, same_on_batch, p=1.0)
+
+        output = aug(input)
+
+        if len(list(aug.parameters())) != 0:
+            mse = nn.MSELoss()
+            opt = torch.optim.SGD(aug.parameters(), lr=10)
+            loss = mse(output, torch.ones_like(output) * 2)  # to ensure that a big loss value could be obtained
+            loss.backward()
+            opt.step()
+
+        if not isinstance(angle, (float, int, list, tuple)):
+            assert isinstance(aug._param_generator.angle, torch.Tensor)
+            # Bilinear kernel resampling reaches the angle: a zero gradient (which the test used to accept with an
+            # unchanged angle, as nearest resampling gives) is a failure.
+            assert torch.count_nonzero(aug._param_generator.angle.grad) > 0
+            if dtype in (torch.float16, torch.bfloat16):
+                # The step lr * grad, about 0.006 degrees (the float32 gradient is 6e-4), is under half an ulp of 20 in
+                # float16 (0.0078) and bfloat16 (0.0625), so SGD leaves the angle as it was. The nonzero gradient
+                # checked above is what reaches it; it must be finite too.
+                assert torch.isfinite(aug._param_generator.angle._grad).all()
+            else:
+                # Assert if param not updated
+                assert (angle.to(device=device, dtype=dtype) - aug._param_generator.angle.data).sum() != 0
+        if not isinstance(direction, (list, tuple)):
+            assert isinstance(aug._param_generator.direction, torch.Tensor)
+            # The direction weights the kernel taps, so it always has a gradient; a zero one is a failure.
+            assert torch.isfinite(aug._param_generator.direction.grad).all()
+            assert torch.count_nonzero(aug._param_generator.direction.grad) > 0
+            assert (direction.to(device=device, dtype=dtype) - aug._param_generator.direction.data).sum() != 0

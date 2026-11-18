@@ -1,0 +1,619 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from __future__ import annotations
+
+import copy
+import math
+import re
+import sys
+import types
+from contextlib import contextmanager
+from functools import cache
+from typing import Any, Callable, Iterator, Optional, Sequence, Union
+
+import pytest
+import torch
+import torch.nn.functional as F
+from torch.autograd import gradcheck
+from torch.testing import assert_close as _assert_close
+
+from kornia.core._compat import torch_version_lt
+
+Dtype = Union[torch.dtype, None]
+Tensor = torch.Tensor
+
+DYNAMO_UNAVAILABLE_REASON = "torch.compile requires torch>=2.4 on Python>=3.12 and torch>=2.6 on Python>=3.13"
+DYNAMIC_EXPORT_UNAVAILABLE_REASON = (
+    f"named torch.export dynamic shapes require torch>=2.2, and {DYNAMO_UNAVAILABLE_REASON}"
+)
+
+
+# gradcheck computes the analytical Jacobian twice and, with its default nondet_tol=0, fails when the two differ at all.
+# On CUDA, cuDNN's default convolution algorithms and the backward kernels that accumulate with atomics need not repeat
+# their rounding: two backward passes of raw_to_rgb differed by up to 8.9e-16 (gradients up to 5), and of
+# HausdorffERLoss3D by up to 4.3e-19, in 1 to 3 % of random float64 cases. This tolerance is 1e5 times that and 1e5
+# times below gradcheck's own atol, so the default kernels, the ones users run, stay under test. Deterministic
+# algorithms are no substitute: they swap in other kernels, and torch's deterministic reflection_pad2d backward returns
+# wrong gradients for large pads (pytorch/pytorch#203421).
+CUDA_GRADCHECK_NONDET_TOL = 1e-10
+
+
+@contextmanager
+def deterministic_algorithms_on_cuda(device: torch.device) -> Iterator[None]:
+    """Run the block with deterministic algorithms on CUDA, and restore the caller's mode afterwards.
+
+    Some CUDA backward kernels accumulate with atomics, so two backward passes of one graph can round differently.
+    Deterministic algorithms fix the accumulation order (CPU kernels already have one). ``warn_only`` keeps an op
+    without a deterministic CUDA kernel running, as it does by default; it only warns. A strict mode the caller
+    already set is kept.
+    """
+    if device.type != "cuda":
+        yield
+        return
+    enabled = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    torch.use_deterministic_algorithms(True, warn_only=warn_only if enabled else True)
+    try:
+        yield
+    finally:
+        torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
+
+
+def autocast_for(device: torch.device, dtype: torch.dtype) -> torch.autocast:
+    """Return a ``torch.autocast`` region on ``device`` for an input of ``dtype``.
+
+    A float16 or bfloat16 input runs in a region of its own dtype, any other input in the device's default region.
+    CPU autocast promotes the operands of ``torch.stack`` and ``torch.cat`` within one half dtype: a float16 operand in
+    the default bfloat16 region raises ``Unexpected floating ScalarType in at::autocast::prioritize`` in plain PyTorch
+    (torch 2.15 and the 2.16.0.dev20261105 nightly), so a mixed-half region tests PyTorch rather than Kornia.
+    """
+    return torch.autocast(device.type, dtype=dtype if dtype in (torch.float16, torch.bfloat16) else None)
+
+
+@contextmanager
+def raises_cuda_device_assert(match: str, capfd: pytest.CaptureFixture[str]) -> Iterator[None]:
+    """Expect the block to fail a CUDA device-side assert whose message matches ``match``.
+
+    A value check on CUDA is ``torch._assert_async``: the call returns, and the failure surfaces by the next
+    synchronization, which closes the block, as a :exc:`RuntimeError` (``torch.AcceleratorError`` where torch has it)
+    naming a device-side assert rather than the check's message. The kernel prints the message to stderr, which
+    ``capfd`` captures, so the message still pins which check fired. torch's Windows builds print only the asserted
+    condition: the MSVC branch of ``CUDA_KERNEL_ASSERT_MSG`` drops the message, so there only the assert is checked.
+
+    The assert leaves the CUDA context unusable for the rest of the process, so a test that uses this must be marked
+    ``@pytest.mark.cuda_device_assert``, which runs it in a fresh subprocess on CUDA (see TESTING.md).
+    """
+    try:
+        yield
+        torch.cuda.synchronize()
+    except RuntimeError as error:
+        if "device-side assert" not in str(error):
+            raise
+    else:
+        pytest.fail("the block failed no CUDA device-side assert")
+    err = capfd.readouterr().err
+    if sys.platform != "win32" and not re.search(match, err):
+        pytest.fail(f"the device-side assert printed no message matching {match!r}:\n{err}")
+
+
+def raises_value_check(
+    device: torch.device,
+    match: str,
+    capfd: pytest.CaptureFixture[str],
+    expected_exception: type[BaseException] = RuntimeError,
+) -> Any:
+    """Expect the block to fail a value check whose message matches ``match``, on any device.
+
+    Off CUDA it is ``pytest.raises(expected_exception, match=match)``; the block synchronizes an asynchronous device
+    such as MPS itself. On CUDA it is :func:`raises_cuda_device_assert`, so the test must be marked
+    ``@pytest.mark.cuda_device_assert``.
+    """
+    if device.type == "cuda":
+        return raises_cuda_device_assert(match, capfd)
+    return pytest.raises(expected_exception, match=match)
+
+
+def skip_unsupported_autocast(device: torch.device, autocast_dtype: str) -> None:
+    """Skip a test of a caller's autocast region on a device without one, or that cannot run ``autocast_dtype``."""
+    if device.type not in ("cpu", "cuda", "mps"):
+        pytest.skip("CPU, CUDA and MPS autocast")
+    if device.type == "cuda" and autocast_dtype == "bfloat16" and not torch.cuda.is_bf16_supported():
+        pytest.skip("this CUDA device does not support bfloat16")
+
+
+def dynamo_is_available() -> bool:
+    """Return whether this Torch/Python pair can run Dynamo-backed capture."""
+    return not (
+        (torch_version_lt(2, 4, 0) and sys.version_info >= (3, 12))
+        or (torch_version_lt(2, 6, 0) and sys.version_info >= (3, 13))
+    )
+
+
+def onnx_exporter_params(default_id: str = "default", legacy_id: str = "legacy") -> list[Any]:
+    """Return the ``to_onnx`` keyword sets of the exporters worth testing, as ``pytest.param`` values.
+
+    ``{"dynamo": False}`` runs the legacy TorchScript exporter. ``{}`` runs ``torch.onnx.export``'s default: the dynamo
+    exporter from torch 2.9, the TorchScript exporter before it. The default case is listed only from torch 2.9, so an
+    older torch does not export the same graph twice. Keep the ids free of "dynamo" and "compile": conftest deselects
+    every test whose name contains them unless an optimizer is set.
+    """
+    params = [pytest.param({"dynamo": False}, id=legacy_id)]
+    if not torch_version_lt(2, 9, 0):
+        params.insert(0, pytest.param({}, id=default_id))
+    return params
+
+
+def dynamic_export_is_available() -> bool:
+    """Return whether ``torch.export`` accepts named dynamic shapes on this Torch/Python pair.
+
+    ``torch.export.Dim`` and the ``dynamic_shapes`` argument both landed in PyTorch 2.2.
+    """
+    return dynamo_is_available() and hasattr(getattr(torch, "export", None), "Dim")
+
+
+def script_uncached(fn: Callable[..., Any]) -> torch.jit.ScriptFunction:
+    """``torch.jit.script`` a fresh copy of ``fn``, with no profiling history from earlier calls.
+
+    ``torch.jit.script`` caches one compiled function per Python function, and the profiling executor specializes
+    and fuses it on the shapes of the calls it has seen, so a test that scripts a shared function inherits whatever
+    other tests ran before it. A copy with the same code object, globals and annotations compiles to the same
+    graph but starts its own history, which makes a test of a call sequence deterministic.
+    """
+    copy = types.FunctionType(fn.__code__, fn.__globals__, fn.__name__, fn.__defaults__, fn.__closure__)
+    copy.__annotations__ = dict(fn.__annotations__)
+    copy.__kwdefaults__ = fn.__kwdefaults__
+    copy.__module__ = fn.__module__
+    copy.__qualname__ = fn.__qualname__
+    return torch.jit.script(copy)
+
+
+# {dtype: (rtol, atol)}
+_DTYPE_PRECISIONS = {
+    torch.bfloat16: (7.8e-3, 7.8e-3),
+    torch.float16: (1e-3, 1e-3),
+    torch.float32: (1e-4, 1e-5),  # TODO: Update to ~1.2e-7
+    # TODO: Update to ~2.3e-16 for fp64
+    torch.float64: (1e-5, 1e-5),  # TODO: BaseTester used (1.3e-6, 1e-5), but it fails for general cases
+}
+
+
+def _default_tolerances(*inputs: Any) -> tuple[float, float]:
+    rtols, atols = zip(*[_DTYPE_PRECISIONS.get(torch.as_tensor(input_).dtype, (0.0, 0.0)) for input_ in inputs])
+    return max(rtols), max(atols)
+
+
+def assert_close(
+    actual: Tensor, expected: Tensor, *, rtol: Optional[float] = None, atol: Optional[float] = None, **kwargs: Any
+) -> None:
+    if rtol is None and atol is None:
+        # `torch.testing.assert_close` used different default tolerances than `torch.testing.assert_allclose`.
+        # TODO: remove this special handling as soon as https://github.com/kornia/kornia/issues/1134 is resolved
+        #  Basically, this whole wrapper function can be removed and `torch.testing.assert_close` can be used
+        #  directly.
+        rtol, atol = _default_tolerances(actual, expected)
+
+    return _assert_close(
+        actual,
+        expected,
+        rtol=rtol,
+        atol=atol,
+        # this is the default value for torch>=1.10, but not for torch==1.9
+        # TODO: remove this if kornia relies on torch>=1.10
+        check_stride=False,
+        equal_nan=False,
+        **kwargs,
+    )
+
+
+def assert_deepcopy_copies_state_as_leaves(module: torch.nn.Module) -> torch.nn.Module:
+    """Check that ``copy.deepcopy(module)`` copies its state like ``torch.save`` / ``torch.load``.
+
+    The copy holds the same keys, each as a parameter or a buffer like the original and with the same values, dtype,
+    device and ``requires_grad``, but as leaves in storage of their own, so no gradient flows back through it. The
+    property is checked directly, since ``torch.load`` cannot rebuild a complex32 tensor that requires grad. Returns
+    the copy.
+    """
+    copied = copy.deepcopy(module)
+    assert type(copied) is type(module)
+    original = module.state_dict(keep_vars=True)
+    actual = copied.state_dict(keep_vars=True)
+    assert list(actual) == list(original)
+    assert set(dict(copied.named_buffers())) == set(dict(module.named_buffers()))
+    for name, source in original.items():
+        tensor = actual[name]
+        assert type(tensor) is type(source), name
+        assert tensor.grad_fn is None, name
+        assert tensor.requires_grad == source.requires_grad, name
+        assert tensor.data_ptr() != source.data_ptr(), name
+        assert_close(tensor.detach(), source.detach(), rtol=0, atol=0)
+    return copied
+
+
+def tensor_to_gradcheck_var(
+    tensor: Tensor, dtype: Dtype = torch.float64, requires_grad: bool = True
+) -> Union[Tensor, str]:
+    """Convert the input tensor to a valid variable to check the gradient.
+
+    `gradcheck` needs 64-bit floating point and requires gradient.
+    """
+    if not torch.is_tensor(tensor):
+        raise AssertionError(type(tensor))
+    t = tensor.type(dtype)
+
+    if t.is_floating_point():
+        return t.requires_grad_(requires_grad)
+
+    return t
+
+
+_UNSUPPORTED_BORDER_PADDING_MSG = "Unsupported Border padding mode"
+
+
+@cache
+def _supports_2d_border_padding_probe(device_type: str) -> bool:
+    inp = torch.zeros(1, 1, 2, 2, device=device_type)
+    grid = torch.zeros(1, 1, 1, 2, device=device_type)
+    try:
+        F.grid_sample(inp, grid, padding_mode="border", align_corners=True)
+    except RuntimeError as e:
+        if _UNSUPPORTED_BORDER_PADDING_MSG in str(e):
+            return False
+        raise
+    return True
+
+
+def supports_2d_border_padding(device: torch.device) -> bool:
+    """Whether this device's 2D ``grid_sample`` supports ``padding_mode='border'``.
+
+    Probed at runtime (and cached per device type): MPS's 2D ``grid_sample`` currently
+    raises "Unsupported Border padding mode"; its 3D ``grid_sample`` does support it, so
+    this guard is only needed for 2D call sites. Probing (rather than hardcoding on
+    ``device.type == "mps"``) means this auto-enables once PyTorch adds support.
+    """
+    return _supports_2d_border_padding_probe(device.type)
+
+
+_UNSUPPORTED_KERNEL_MSGS = (
+    "not implemented for",
+    "Unsupported Bicubic interpolation",
+    "Unsupported Nearest interpolation",
+)
+
+
+class _UnsupportedProbeDtype(Exception):
+    """The device cannot hold the probe dtype at all -- MPS and float64 -- so it cannot run ``op``."""
+
+
+def _probe_zeros(device_type: str, dtype: torch.dtype, *shape: int) -> Tensor:
+    """Allocate a probe tensor, reporting "this device cannot hold ``dtype``" as a distinct error.
+
+    ``torch.zeros`` raises TypeError for a device/dtype pair it cannot represent (MPS and
+    float64). That is still "unsupported" and must not escape a helper whose whole contract is to
+    return a bool -- but a TypeError raised by the *operator* is a mis-written probe, and silently
+    reading it as "unsupported" would skip the guarded test on every build forever. Translating
+    only the allocation failure keeps the two apart.
+    """
+    try:
+        return torch.zeros(shape, device=device_type, dtype=dtype)
+    except TypeError as e:
+        raise _UnsupportedProbeDtype from e
+
+
+@cache
+def _supports_kernel_probe(op: Callable[[str, torch.dtype], object], device_type: str, dtype: torch.dtype) -> bool:
+    """Run ``op`` on tiny tensors and report whether this build has a kernel for it.
+
+    ``op`` allocates its probe tensors through :func:`_probe_zeros` and then calls the operator.
+    Cached per (op, device type, dtype), so every probe below runs once per session and
+    auto-enables once PyTorch fills the kernel in.
+    """
+    try:
+        op(device_type, dtype)
+    except (_UnsupportedProbeDtype, NotImplementedError):
+        return False
+    except RuntimeError as e:
+        if any(message in str(e) for message in _UNSUPPORTED_KERNEL_MSGS):
+            return False
+        raise
+    return True
+
+
+def _bilinear_2d_grid_sample_op(device_type: str, dtype: torch.dtype) -> None:
+    inp = _probe_zeros(device_type, dtype, 1, 1, 2, 2)
+    grid = _probe_zeros(device_type, dtype, 1, 1, 1, 2)
+    F.grid_sample(inp, grid, mode="bilinear", align_corners=True)
+
+
+def supports_bilinear_2d_grid_sample(device: torch.device, dtype: torch.dtype) -> bool:
+    """Whether this device supports bilinear interpolation in 2D ``grid_sample`` for ``dtype``.
+
+    Probed at runtime and cached per (device type, dtype), so tests guarded by this helper
+    auto-enable once PyTorch adds the missing interpolation kernel.
+    """
+    return _supports_kernel_probe(_bilinear_2d_grid_sample_op, device.type, dtype)
+
+
+def _bilinear_2d_grid_sample_backward_op(device_type: str, dtype: torch.dtype) -> None:
+    inp = _probe_zeros(device_type, dtype, 1, 1, 2, 2).requires_grad_()
+    grid = _probe_zeros(device_type, dtype, 1, 1, 1, 2).requires_grad_()
+    F.grid_sample(inp, grid, mode="bilinear", align_corners=True).sum().backward()
+
+
+def supports_bilinear_2d_grid_sample_backward(device: torch.device, dtype: torch.dtype) -> bool:
+    """Whether 2D bilinear grid sampling supports gradients to both input and grid for this device/dtype."""
+    return _supports_kernel_probe(_bilinear_2d_grid_sample_backward_op, device.type, dtype)
+
+
+def _nearest_2d_grid_sample_op(device_type: str, dtype: torch.dtype) -> None:
+    inp = _probe_zeros(device_type, dtype, 1, 1, 2, 2)
+    grid = _probe_zeros(device_type, dtype, 1, 1, 1, 2)
+    F.grid_sample(inp, grid, mode="nearest", align_corners=True)
+
+
+def supports_nearest_2d_grid_sample(device: torch.device, dtype: torch.dtype) -> bool:
+    """Whether this device supports nearest interpolation in 2D ``grid_sample`` for ``dtype``.
+
+    Probed at runtime and cached per (device type, dtype), so tests guarded by this helper
+    auto-enable once PyTorch adds the missing interpolation kernel.
+    """
+    return _supports_kernel_probe(_nearest_2d_grid_sample_op, device.type, dtype)
+
+
+def _arange_op(device_type: str, dtype: torch.dtype) -> None:
+    _probe_zeros(device_type, dtype, 1)
+    torch.arange(2, device=device_type, dtype=dtype)
+
+
+def supports_arange(device: torch.device, dtype: torch.dtype) -> bool:
+    """Whether this device has a ``torch.arange`` kernel for ``dtype``.
+
+    :func:`kornia.filters.get_motion_kernel2d` builds its taps with ``arange`` in the dtype of ``direction``;
+    torch 2.5.1 has no bfloat16 ``arange`` on MPS. Probed at runtime and cached per (device type, dtype), so it
+    auto-enables once PyTorch fills the kernel in.
+    """
+    return _supports_kernel_probe(_arange_op, device.type, dtype)
+
+
+def _bicubic_2d_grid_sample_op(device_type: str, dtype: torch.dtype) -> None:
+    inp = _probe_zeros(device_type, dtype, 1, 1, 2, 2)
+    grid = _probe_zeros(device_type, dtype, 1, 1, 1, 2)
+    F.grid_sample(inp, grid, mode="bicubic", align_corners=True)
+
+
+def supports_bicubic_2d_grid_sample(device: torch.device, dtype: torch.dtype) -> bool:
+    """Whether this device supports bicubic interpolation in 2D ``grid_sample`` for ``dtype``.
+
+    Probed at runtime and cached per (device type, dtype), so tests guarded by this helper
+    auto-enable once PyTorch adds the missing interpolation kernel.
+    """
+    return _supports_kernel_probe(_bicubic_2d_grid_sample_op, device.type, dtype)
+
+
+def _bilinear_3d_grid_sample_op(device_type: str, dtype: torch.dtype) -> None:
+    inp = _probe_zeros(device_type, dtype, 1, 1, 2, 2, 2)
+    grid = _probe_zeros(device_type, dtype, 1, 1, 1, 1, 3)
+    F.grid_sample(inp, grid, mode="bilinear", align_corners=True)
+
+
+def supports_bilinear_3d_grid_sample(device: torch.device, dtype: torch.dtype) -> bool:
+    """Whether this device supports bilinear interpolation in 3D ``grid_sample`` for ``dtype``.
+
+    Probed at runtime and cached per (device type, dtype), so tests guarded by this helper
+    auto-enable once PyTorch adds the missing interpolation kernel.
+    """
+    return _supports_kernel_probe(_bilinear_3d_grid_sample_op, device.type, dtype)
+
+
+def _nearest_3d_grid_sample_op(device_type: str, dtype: torch.dtype) -> None:
+    inp = _probe_zeros(device_type, dtype, 1, 1, 2, 2, 2)
+    grid = _probe_zeros(device_type, dtype, 1, 1, 1, 1, 3)
+    F.grid_sample(inp, grid, mode="nearest", align_corners=True)
+
+
+def supports_nearest_3d_grid_sample(device: torch.device, dtype: torch.dtype) -> bool:
+    """Whether this device supports nearest interpolation in 3D ``grid_sample`` for ``dtype``.
+
+    Probed at runtime and cached per (device type, dtype), so tests guarded by this helper
+    auto-enable once PyTorch adds the missing interpolation kernel.
+    """
+    return _supports_kernel_probe(_nearest_3d_grid_sample_op, device.type, dtype)
+
+
+def _reflect_padding_op(device_type: str, dtype: torch.dtype) -> None:
+    F.pad(_probe_zeros(device_type, dtype, 1, 1, 2, 2), (1, 1, 1, 1), mode="reflect")
+
+
+def supports_reflect_padding(device: torch.device, dtype: torch.dtype) -> bool:
+    """Whether this device supports 2D reflection padding for this dtype, probed once per device/dtype."""
+    return _supports_kernel_probe(_reflect_padding_op, device.type, dtype)
+
+
+def _replicate_padding_op(device_type: str, dtype: torch.dtype) -> None:
+    F.pad(_probe_zeros(device_type, dtype, 1, 1, 2, 2), (1, 1, 1, 1), mode="replicate")
+
+
+def supports_replicate_padding(device: torch.device, dtype: torch.dtype) -> bool:
+    """Whether this device has a 2D ``mode="replicate"`` pad kernel for ``dtype``.
+
+    :func:`kornia.filters.spatial_gradient` pads that way, so everything built on it inherits the
+    gap: both SIFT descriptors, and ``BlobHessian`` with the detectors above it. torch 2.5.1 has no
+    float16 CPU ``replication_pad2d`` (bfloat16 is fine), so a test that hardcodes float16 rather
+    than reading the injected dtype fails there on every job. Probed at runtime and cached per
+    (device type, dtype), so it auto-enables once PyTorch fills the kernel in.
+    """
+    return _supports_kernel_probe(_replicate_padding_op, device.type, dtype)
+
+
+def _replicate_padding_3d_op(device_type: str, dtype: torch.dtype) -> None:
+    F.pad(_probe_zeros(device_type, dtype, 1, 1, 2, 2, 2), (1, 1, 1, 1, 1, 1), mode="replicate")
+
+
+def supports_replicate_padding_3d(device: torch.device, dtype: torch.dtype) -> bool:
+    """Whether this device has a 3D ``mode="replicate"`` pad kernel (``replication_pad3d``) for ``dtype``.
+
+    :func:`kornia.filters.filter3d` and :func:`kornia.filters.motion_blur3d` pad that way by default.
+    torch 2.5.1 has no float16 CPU ``replication_pad3d`` (bfloat16 is fine). Probed at runtime and cached per
+    (device type, dtype), so it auto-enables once PyTorch fills the kernel in.
+    """
+    return _supports_kernel_probe(_replicate_padding_3d_op, device.type, dtype)
+
+
+def _conv2d_op(device_type: str, dtype: torch.dtype) -> None:
+    F.conv2d(_probe_zeros(device_type, dtype, 1, 1, 3, 3), _probe_zeros(device_type, dtype, 1, 1, 2, 2))
+
+
+def supports_conv2d(device: torch.device, dtype: torch.dtype) -> bool:
+    """Whether this device has a 2D convolution kernel for ``dtype``.
+
+    Every CNN descriptor -- :class:`kornia.feature.HardNet`, ``HardNet8``, ``SOSNet``, ``TFeat`` --
+    is a stack of convolutions. torch 2.1.2 has no float16 CPU ``slow_conv2d`` (bfloat16 is fine),
+    so a test that hardcodes a half dtype rather than reading the injected one fails there on every
+    job. Probed at runtime and cached per (device type, dtype), like
+    :func:`supports_replicate_padding`.
+    """
+    return _supports_kernel_probe(_conv2d_op, device.type, dtype)
+
+
+def _matmul_op(device_type: str, dtype: torch.dtype) -> None:
+    _probe_zeros(device_type, dtype, 2, 3) @ _probe_zeros(device_type, dtype, 3, 2)
+
+
+def supports_matmul(device: torch.device, dtype: torch.dtype) -> bool:
+    """Whether this device has a 2D matrix-multiply kernel for ``dtype``.
+
+    Descriptor matching multiplies: :func:`kornia.feature.match_mnn` and friends route half
+    precision around ``torch.cdist`` into a manual expand-and-multiply distance matrix, and
+    ``kornia.feature.steerers.DiscreteSteerer`` steers through ``F.linear``. Both are 2D, so this
+    probes ``mm``/``addmm``; batched ``bmm`` is a separate kernel and needs its own probe. torch
+    2.1.2 has no
+    float16 CPU ``addmm`` (bfloat16 is fine), so a test that hardcodes a half dtype rather than
+    reading the injected one fails there on every job. Probed at runtime and cached per
+    (device type, dtype), like :func:`supports_replicate_padding`.
+    """
+    return _supports_kernel_probe(_matmul_op, device.type, dtype)
+
+
+def _topk_op(device_type: str, dtype: torch.dtype) -> None:
+    _probe_zeros(device_type, dtype, 2).topk(k=1)
+
+
+def supports_topk(device: torch.device, dtype: torch.dtype) -> bool:
+    """Whether this device has a ``topk`` kernel for ``dtype``.
+
+    Every detector ranks its candidates that way, so a response map in a narrower dtype than the
+    image -- what a learned response module under autocast produces -- reaches ``topk`` in that
+    dtype. torch 2.1.2 has no float16 CPU ``topk`` (bfloat16 is fine), so a test that hardcodes a
+    half dtype rather than reading the injected one fails there on every job. Probed at runtime and
+    cached per (device type, dtype), like :func:`supports_replicate_padding`.
+    """
+    return _supports_kernel_probe(_topk_op, device.type, dtype)
+
+
+class BaseTester:
+    @staticmethod
+    def assert_close(
+        actual: Tensor | float,
+        expected: Tensor | float,
+        rtol: Optional[float] = None,
+        atol: Optional[float] = None,
+        low_tolerance: bool = False,
+    ) -> None:
+        """Asserts that `actual` and `expected` are close.
+
+        Args:
+            actual: Actual input.
+            expected: Expected input.
+            rtol: Relative tolerance.
+            atol: Absolute tolerance.
+            low_tolerance:
+                This parameter allows to reduce tolerance. Half the decimal places.
+                Example, 1e-4 -> 1e-2 or 1e-6 -> 1e-3
+
+        """
+        if hasattr(actual, "data"):
+            actual = actual.data
+        if hasattr(expected, "data"):
+            expected = expected.data
+
+        if (isinstance(actual, Tensor) and "xla" in actual.device.type) or (
+            isinstance(expected, Tensor) and "xla" in expected.device.type
+        ):
+            rtol, atol = 1e-2, 1e-2
+
+        if (isinstance(actual, Tensor) and isinstance(expected, Tensor)) and rtol is None and atol is None:
+            actual_rtol, actual_atol = _DTYPE_PRECISIONS.get(actual.dtype, (0.0, 0.0))
+            expected_rtol, expected_atol = _DTYPE_PRECISIONS.get(expected.dtype, (0.0, 0.0))
+            rtol, atol = max(actual_rtol, expected_rtol), max(actual_atol, expected_atol)
+
+            # halve the tolerance if `low_tolerance` is true
+            rtol = math.sqrt(rtol) if low_tolerance else rtol
+            atol = math.sqrt(atol) if low_tolerance else atol
+
+        return assert_close(actual, expected, rtol=rtol, atol=atol)
+
+    @staticmethod
+    def gradcheck(
+        func: Callable[..., Union[torch.Tensor, Sequence[torch.Tensor]]],
+        inputs: Union[torch.Tensor, Sequence[Any]],
+        *,
+        raise_exception: bool = True,
+        fast_mode: bool = True,
+        requires_grad: Sequence[bool] = [],
+        dtypes: Sequence[Dtype] = [],
+        **kwargs: Any,
+    ) -> bool:
+        """It will gradcheck the function using the `torch.autograd.gradcheck` method.
+
+        By default this method will pass all tensor to `tensor_to_gradcheck_var` which casts the tensor
+        to be float64 dtype, and requires grad as True. You can overwrite which tensors should have requires grad
+        equals True, by using a Sequence of the same length of the sequence of inputs, within the requires_grad
+        per item. You also, can overwrite with the same mechanics the dtype using the `dtypes`
+        parameter.
+        """
+        requires_grad = requires_grad if len(requires_grad) > 0 else [True] * len(inputs)
+        dtypes = dtypes if len(dtypes) > 0 else [torch.float64] * len(inputs)
+
+        # gradcheck requires float64. MPS does not support it at all, and XLA lowers a float64
+        # request to float32, where gradcheck's default eps=1e-6 makes the numerical Jacobian
+        # invalid. The name-based marker in conftest.py covers tests *called* ``*gradcheck*``,
+        # including every caller that imports ``torch.autograd.gradcheck`` directly; this guard
+        # covers the callers of this method named something else (``test_grad_zca_with_fit``).
+        _all_inputs = (
+            [inputs]
+            if isinstance(inputs, torch.Tensor)
+            else list(inputs.values() if isinstance(inputs, dict) else inputs)
+        )
+        if any(isinstance(t, torch.Tensor) and (t.device.type == "mps" or "xla" in t.device.type) for t in _all_inputs):
+            pytest.skip("gradcheck requires float64, which this device does not compute in")
+
+        if isinstance(inputs, torch.Tensor):
+            inputs = tensor_to_gradcheck_var(inputs)
+        elif isinstance(inputs, dict):
+            inputs = {
+                k: tensor_to_gradcheck_var(v, d, r) if isinstance(v, torch.Tensor) else v
+                for (k, v), d, r in zip(inputs.items(), dtypes, requires_grad)
+            }
+        else:
+            inputs = [
+                tensor_to_gradcheck_var(i, d, r) if isinstance(i, torch.Tensor) else i
+                for i, r, d in zip(inputs, requires_grad, dtypes)
+            ]
+
+        if any(isinstance(t, torch.Tensor) and t.device.type == "cuda" for t in _all_inputs):
+            kwargs.setdefault("nondet_tol", CUDA_GRADCHECK_NONDET_TOL)
+        return gradcheck(func, inputs, raise_exception=raise_exception, fast_mode=fast_mode, **kwargs)

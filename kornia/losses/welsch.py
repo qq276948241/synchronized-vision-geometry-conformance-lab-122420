@@ -1,0 +1,150 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from __future__ import annotations
+
+from typing import Optional
+
+import torch
+from torch import nn
+
+# from torch import Tensor (use torch.Tensor instead)
+from kornia.core.check import KORNIA_CHECK, KORNIA_CHECK_IS_TENSOR, KORNIA_CHECK_SAME_DEVICE, KORNIA_CHECK_SAME_SHAPE
+
+
+def welsch_loss(img1: torch.Tensor, img2: torch.Tensor, reduction: Optional[str] = "none") -> torch.Tensor:
+    r"""Compute the Welsch (Leclerc) loss between a prediction and a target.
+
+    ``loss = welsch_loss(img1, img2)`` penalises each residual :math:`x - y` of ``img1`` (:math:`x`) and ``img2``
+    (:math:`y`) quadratically near 0 and saturates at 1, and its gradient vanishes for large residuals.
+
+    .. math::
+
+        \text{loss}(x, y) = 1 - \exp\left(-\frac{1}{2} (x - y)^{2}\right)
+
+    Reference:
+        [1] https://arxiv.org/pdf/1701.03077.pdf
+        [2] Welsch: https://www.tandfonline.com/doi/abs/10.1080/03610917808812083
+        [3] Leclerc: https://link.springer.com/article/10.1007/BF00054839
+
+    Convention:
+        See the Convention block of :func:`~kornia.losses.charbonnier_loss`; this is Barron's loss with
+        :math:`\alpha = -\infty`.
+
+    Args:
+        img1: prediction with shape ``(*)``.
+        img2: target with the same shape as ``img1``.
+        reduction: ``'none'`` (default) or ``None`` keeps one loss per element, ``'mean'`` averages them, ``'sum'``
+            adds them.
+
+    Returns:
+        the loss with the shape of the inputs for ``reduction='none'`` or ``None``, a scalar otherwise.
+
+    See Also:
+        - :class:`~kornia.losses.WelschLoss`: the module form.
+        - :func:`~kornia.losses.geman_mcclure_loss`: saturates at 2, more slowly.
+
+    Example:
+        >>> img1 = torch.randn(2, 3, 32, 32, requires_grad=True)
+        >>> img2 = torch.randn(2, 3, 32, 32)
+        >>> output = welsch_loss(img1, img2, reduction="mean")
+        >>> output.backward()
+
+    """
+    KORNIA_CHECK_IS_TENSOR(img1)
+
+    KORNIA_CHECK_IS_TENSOR(img2)
+
+    KORNIA_CHECK_SAME_SHAPE(img1, img2)
+
+    KORNIA_CHECK_SAME_DEVICE(img1, img2)
+
+    KORNIA_CHECK(
+        reduction is None or reduction in ("mean", "sum", "none"),
+        f"Given type of reduction is not supported. Got: {reduction}",
+    )
+
+    # 1 - exp(-s) cancels for small s = r^2 / 2. There it equals 2 t / (1 + t) with t = tanh(s / 2), which does not
+    # cancel; torch.expm1 has only the precision of exp(x) - 1 on MPS (pytorch/pytorch#198708) and in ONNX export.
+    # The exp form is kept for r^2 >= 1, where it is accurate and keeps the gradient of the saturating loss.
+    output_dtype = torch.promote_types(img1.dtype, img2.dtype)
+    diff = img1.float() - img2.float() if output_dtype in (torch.float16, torch.bfloat16) else img1 - img2
+    squared = diff**2
+    t = torch.tanh(0.25 * squared)
+    loss = torch.where(squared < 1.0, 2.0 * t / (1.0 + t), 1.0 - (-0.5 * squared).exp())
+
+    # perform reduction
+    # None is tested first: TorchScript compares an Optional[str] with a string only once it has been refined to str.
+    if reduction is None or reduction == "none":
+        pass
+    elif reduction == "mean":
+        loss = loss.mean()
+    elif reduction == "sum":
+        loss = loss.sum()
+    else:
+        raise NotImplementedError("Invalid reduction option.")
+
+    return loss.to(output_dtype) if output_dtype in (torch.float16, torch.bfloat16) else loss
+
+
+class WelschLoss(nn.Module):
+    r"""Compute the Welsch (Leclerc) loss between a prediction and a target (module form).
+
+    ``criterion = WelschLoss(reduction)`` stores ``reduction``, and ``loss = criterion(img1, img2)`` is
+    :func:`~kornia.losses.welsch_loss`.
+
+    Convention:
+        See the Convention block of :func:`~kornia.losses.welsch_loss`.
+
+    Args:
+        reduction: ``'none'`` (default), ``None``, ``'mean'`` or ``'sum'``, as in :func:`~kornia.losses.welsch_loss`.
+
+    Shape:
+        - img1: prediction ``(*)``.
+        - img2: target with the same shape as ``img1``.
+        - Output: the shape of the inputs for ``reduction='none'`` or ``None``, a scalar otherwise.
+
+    See Also:
+        - :func:`~kornia.losses.welsch_loss`: the one-call form.
+        - :class:`~kornia.losses.GemanMcclureLoss`: saturates at 2, more slowly.
+
+    Example:
+        >>> criterion = WelschLoss(reduction="mean")
+        >>> img1 = torch.randn(2, 3, 32, 32, requires_grad=True)
+        >>> img2 = torch.randn(2, 3, 32, 32)
+        >>> output = criterion(img1, img2)
+        >>> output.backward()
+
+    """
+
+    def __init__(self, reduction: Optional[str] = "none") -> None:
+        super().__init__()
+        self.reduction = reduction
+
+    def forward(self, img1: torch.Tensor, img2: torch.Tensor) -> torch.Tensor:
+        """Compute the Welsch robust regression loss.
+
+        Args:
+            img1: Predicted tensor with arbitrary shape.
+            img2: Target tensor with the same shape as ``img1``.
+
+        Returns:
+            Loss tensor reduced according to ``self.reduction``. The Welsch
+            penalty saturates for large residuals, reducing the influence of
+            strong outliers.
+        """
+        return welsch_loss(img1=img1, img2=img2, reduction=self.reduction)

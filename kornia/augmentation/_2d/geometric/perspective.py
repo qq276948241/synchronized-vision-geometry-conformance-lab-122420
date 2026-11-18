@@ -1,0 +1,148 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from typing import Any, Dict, Optional, Tuple, Union
+
+import torch
+
+from kornia.augmentation import random_generator as rg
+from kornia.augmentation._2d.geometric.base import GeometricAugmentationBase2D
+from kornia.constants import Resample
+from kornia.core.utils import _to_device_nonblocking
+from kornia.geometry.transform import get_perspective_transform, warp_perspective
+
+
+class RandomPerspective(GeometricAugmentationBase2D):
+    r"""Warp images with a random perspective transformation, applied per sample with probability ``p`` (default 0.5).
+
+    ``output = RandomPerspective(distortion_scale, ...)(input)`` applies a projective warp to selected images of
+    shape ``(B, C, H, W)``.
+
+    Args:
+        distortion_scale: the degree of distortion, ranged from 0 to 1.
+        resample: the interpolation method to use.
+        same_on_batch: apply the same transformation across the batch. Default: False.
+        align_corners: interpolation flag.
+        p: probability of applying the transformation to each sample.
+        keepdim: whether to keep the output shape the same as input (True) or broadcast it
+                 to the batch form (False).
+        sampling_method: ``'basic'`` | ``'area_preserving'``. Default: ``'basic'``
+            If ``'basic'``, samples by translating the image corners randomly inwards.
+            If ``'area_preserving'``, samples by randomly translating the image corners in any direction.
+            Preserves area on average. See https://arxiv.org/abs/2104.03308 for further details.
+
+    Shape:
+        - Input: ``(C, H, W)`` or ``(B, C, H, W)``, Optional: ``(B, 3, 3)``
+        - Output: ``(B, C, H, W)``
+
+    Convention:
+        - See :class:`~kornia.augmentation.GeometricAugmentationBase2D` for coordinates, defaults and inverse.
+          The source corners are ``(0, 0)``, ``(W - 1, 0)``, ``(W - 1, H - 1)`` and ``(0, H - 1)``;
+          ``transform_matrix`` maps them to the sampled destination corners.
+        - ``basic`` samples each corner inward by at most ``distortion_scale * (W, H) / 2``. ``area_preserving``
+          samples each coordinate in both directions over the same extent.
+        - with ``distortion_scale=0`` and ``H > 1``, ``W > 1``, the warp is an identity up to numerical precision
+          for either ``align_corners``.
+        - a spatial dimension of 1 is not distorted: its source corners span a unit extent instead of ``0`` and
+          its offsets are zero, so the single row or column maps onto itself and only the other axis is warped.
+          At ``distortion_scale=0`` this is the identity.
+
+    .. note::
+        This function internally uses :func:`kornia.geometry.transform.warp_perspective`.
+
+    .. image:: _static/img/RandomPerspective.png
+
+    See Also:
+        - :class:`RandomAffine`: samples an affine rather than projective transform.
+        - :class:`RandomPerspective3D`: applies a projective warp to volumes.
+
+    Examples:
+        >>> rng = torch.manual_seed(0)
+        >>> inputs= torch.tensor([[[[1., 0., 0.],
+        ...                         [0., 1., 0.],
+        ...                         [0., 0., 1.]]]])
+        >>> aug = RandomPerspective(0.5, p=0.5)
+        >>> out = aug(inputs)
+        >>> out
+        tensor([[[[0.2795, 0.3852, 0.0000],
+                  [0.0000, 0.6243, 0.0000],
+                  [0.0000, 0.0000, 0.0000]]]])
+        >>> aug.inverse(out)
+        tensor([[[[0.3417, 0.3022, 0.0436],
+                  [0.3767, 0.4769, 0.1879],
+                  [0.1434, 0.1958, 0.1091]]]])
+
+    To apply the exact augmenation again, you may take the advantage of the previous parameter state:
+        >>> input = torch.randn(1, 3, 32, 32)
+        >>> aug = RandomPerspective(0.5, p=1.)
+        >>> (aug(input) == aug(input, params=aug._params)).all()
+        tensor(True)
+
+    """
+
+    def __init__(
+        self,
+        distortion_scale: Union[torch.Tensor, float] = 0.5,
+        resample: Union[str, int, Resample] = Resample.BILINEAR.name,
+        same_on_batch: bool = False,
+        align_corners: bool = False,
+        p: float = 0.5,
+        keepdim: bool = False,
+        sampling_method: str = "basic",
+    ) -> None:
+        super().__init__(p=p, same_on_batch=same_on_batch, keepdim=keepdim)
+        self._param_generator = rg.PerspectiveGenerator(distortion_scale, sampling_method=sampling_method)
+
+        self.flags: Dict[str, Any] = {"align_corners": align_corners, "resample": Resample.get(resample)}
+
+    def compute_transformation(
+        self, input: torch.Tensor, params: Dict[str, torch.Tensor], flags: Dict[str, Any]
+    ) -> torch.Tensor:
+        start_points = _to_device_nonblocking(params["start_points"], input.device, input.dtype)
+        end_points = _to_device_nonblocking(params["end_points"], input.device, input.dtype)
+        return get_perspective_transform(start_points, end_points)
+
+    def apply_transform(
+        self,
+        input: torch.Tensor,
+        params: Dict[str, torch.Tensor],
+        flags: Dict[str, Any],
+        transform: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        _, _, height, width = input.shape
+        if not isinstance(transform, torch.Tensor):
+            raise TypeError(f"Expected the `transform` be a torch.Tensor. Got {type(transform)}.")
+
+        return warp_perspective(
+            input, transform, (height, width), mode=flags["resample"].name.lower(), align_corners=flags["align_corners"]
+        )
+
+    def inverse_transform(
+        self,
+        input: torch.Tensor,
+        flags: Dict[str, Any],
+        transform: Optional[torch.Tensor] = None,
+        size: Optional[Tuple[int, int]] = None,
+    ) -> torch.Tensor:
+        if not isinstance(transform, torch.Tensor):
+            raise TypeError(f"Expected the `transform` be a torch.Tensor. Got {type(transform)}.")
+        return self.apply_transform(
+            input,
+            params=self._params,
+            transform=torch.as_tensor(transform, device=input.device, dtype=input.dtype),
+            flags=flags,
+        )

@@ -1,0 +1,210 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+import pytest
+import torch
+from numpy.testing import assert_almost_equal
+
+from kornia.contrib.object_detection import BoxFiltering
+
+from testing.base import BaseTester
+
+
+class TestBoxFiltering:
+    @pytest.fixture
+    def sample_boxes(self):
+        # Setup some sample boxes with the format [class_id, confidence_score, x, y, w, h]
+        return torch.tensor(
+            [
+                [
+                    [1, 0.9, 10, 10, 20, 20],  # High confidence, class 1
+                    [2, 0.7, 15, 15, 25, 25],  # Medium confidence, class 2
+                    [3, 0.7, 15, 15, 25, 25],  # Medium confidence, class 3
+                    [4, 0.3, 5, 5, 10, 10],
+                ],  # Low confidence, class 4
+                [
+                    [1, 0.95, 12, 12, 18, 18],  # High confidence, class 1
+                    [2, 0.5, 13, 13, 20, 20],  # Low confidence, class 2
+                    [3, 0.5, 13, 13, 20, 20],  # Low confidence, class 3
+                    [4, 0.2, 7, 7, 14, 14],
+                ],  # Very low confidence, class 4
+                [
+                    [1, 0.1, 12, 12, 18, 18],  # Very Low confidence, class 1
+                    [2, 0.1, 13, 13, 20, 20],  # Very Low confidence, class 2
+                    [3, 0.1, 13, 13, 20, 20],  # Very Low confidence, class 3
+                    [4, 0.1, 7, 7, 14, 14],
+                ],  # Very Low confidence, class 4
+            ]
+        )  # Shape: [3, 4, 6], i.e., [B, D, 6]
+
+    def test_confidence_filtering(self, sample_boxes):
+        """Test filtering based on confidence threshold."""
+        # Set a confidence threshold of 0.7
+        filter = BoxFiltering(confidence_threshold=0.7)
+        filtered_boxes = filter(sample_boxes)
+
+        # Expected output: only boxes with confidence > 0.7 should be kept
+        assert len(filtered_boxes[0]) == 1  # Only one box in the first batch
+        assert_almost_equal(filtered_boxes[0][0][1].item(), 0.9)  # Box with confidence 0.9
+        assert len(filtered_boxes[1]) == 1  # Only one box in the second batch
+        assert_almost_equal(filtered_boxes[1][0][1].item(), 0.95)  # Box with confidence 0.95
+        assert len(filtered_boxes[2]) == 0  # No boxes in the third batch
+
+    def test_class_filtering(self, sample_boxes):
+        """Test filtering based on class IDs."""
+        # Set classes_to_keep to [1, 2]
+        filter = BoxFiltering(classes_to_keep=torch.tensor([1, 2]))
+        filtered_boxes = filter(sample_boxes)
+
+        # Expected output: only boxes with class_id 1 and 2 should be kept
+        assert len(filtered_boxes[0]) == 2  # Two boxes in the first batch
+        assert filtered_boxes[0][0][0].item() == 1  # Box with class_id 1
+        assert filtered_boxes[0][1][0].item() == 2  # Box with class_id 2
+        assert len(filtered_boxes[1]) == 2  # Two boxes in the second batch
+        assert filtered_boxes[1][0][0].item() == 1  # Box with class_id 1
+        assert filtered_boxes[1][1][0].item() == 2  # Box with class_id 2
+        assert len(filtered_boxes[2]) == 2  # Two boxes in the third batch
+        assert filtered_boxes[2][0][0].item() == 1  # Box with class_id 1
+        assert filtered_boxes[2][1][0].item() == 2  # Box with class_id 2
+
+    def test_combined_confidence_and_class_filtering(self, sample_boxes):
+        """Test filtering based on both confidence and class IDs."""
+        # Set confidence threshold to 0.6 and classes_to_keep to [1, 3]
+        filter = BoxFiltering(confidence_threshold=0.6, classes_to_keep=torch.tensor([1, 3]))
+        filtered_boxes = filter(sample_boxes)
+
+        # Expected output: only boxes with confidence > 0.6 and class_id in [1, 3] should be kept
+        assert len(filtered_boxes[0]) == 2  # Two boxes in the first batch
+        assert filtered_boxes[0][0][0].item() == 1  # Class_id 1
+        assert filtered_boxes[0][1][0].item() == 3  # Class_id 3
+        assert filtered_boxes[1][0][0].item() == 1  # Class_id 1
+        assert len(filtered_boxes[1]) == 1  # No boxes in the second batch
+        assert len(filtered_boxes[2]) == 0  # No boxes in the third batch
+
+    def test_no_class_or_confidence_filtering(self, sample_boxes):
+        """Test when no class or confidence filtering is applied."""
+        filter = BoxFiltering()  # No thresholds set
+        filtered_boxes = filter(sample_boxes)
+
+        # Expected output: all boxes should be returned as-is
+        assert len(filtered_boxes[0]) == 4  # All boxes in the first batch should be kept
+        assert len(filtered_boxes[1]) == 4  # All boxes in the second batch should be kept
+        assert len(filtered_boxes[2]) == 4  # All boxes in the third batch should be kept
+
+
+class TestBoxFilteringDevice(BaseTester):
+    """The filter runs on the boxes' device after ``.to(device)``, and what worked before keeps working (#6180)."""
+
+    @staticmethod
+    def _boxes(device, dtype):
+        # (class_id, confidence, x, y, w, h): classes cycle through 0..4, confidences span (0, 1).
+        generator = torch.Generator().manual_seed(0)
+        boxes = torch.rand(2, 20, 6, generator=generator)
+        boxes[..., 0] = torch.arange(20) % 5
+        return boxes.to(device=device, dtype=dtype)
+
+    @pytest.mark.parametrize("kwargs", [{"classes_to_keep": [0, 1, 2]}, {"confidence_threshold": 0.5}])
+    def test_runs_next_to_meta_boxes_6180(self, kwargs):
+        """The ``meta`` device stands in for CUDA: a class list left on the CPU raised, as next to CUDA boxes."""
+        module = BoxFiltering(filter_as_zero=True, **kwargs).to("meta")
+        out = module(torch.rand(2, 20, 6, device="meta"))
+        assert out.device.type == "meta"
+        assert out.shape == (2, 20, 6)
+
+    @pytest.mark.parametrize("filter_as_zero", [False, True])
+    def test_matches_cpu_after_moving_the_module_6180(self, device, dtype, filter_as_zero):
+        """With the CUDA fixture this is the issue's scenario: it raised before the class list followed the boxes."""
+        kwargs = {"confidence_threshold": 0.5, "classes_to_keep": [0, 1, 2], "filter_as_zero": filter_as_zero}
+        expected = BoxFiltering(**kwargs)(self._boxes("cpu", dtype))
+        actual = BoxFiltering(**kwargs).to(device)(self._boxes(device, dtype))
+
+        if filter_as_zero:
+            # A comparison that kept or dropped every box would pass for the wrong reason.
+            assert 0 < (expected[..., 1] != 0).sum() < expected.shape[0] * expected.shape[1]
+            assert actual.device.type == device.type
+            self.assert_close(actual.cpu(), expected)
+        else:
+            assert 0 < sum(len(e) for e in expected) < 2 * 20
+            assert len(actual) == len(expected)
+            for got, want in zip(actual, expected):
+                assert got.device.type == device.type
+                self.assert_close(got.cpu(), want)
+
+    def test_classes_passed_to_forward_follow_the_boxes_6180(self, device, dtype):
+        boxes = self._boxes(device, dtype)
+        out = BoxFiltering(0.5, filter_as_zero=True)(boxes, None, torch.tensor([0, 1, 2]))
+        keep = (boxes[..., 1] > 0.5) & (boxes[..., 0] < 3)
+        self.assert_close(out, boxes * keep[..., None])
+
+    @pytest.mark.parametrize("value", [0.5, 0, torch.tensor(0.5), torch.tensor(0.5, dtype=torch.float64), None])
+    def test_threshold_assigned_after_construction_6180(self, device, dtype, value):
+        """A Python number assigned to the threshold keeps working, also after ``.to(device)``.
+
+        A 0-d CPU threshold works next to boxes on any device, a float64 one also on MPS, which holds no float64.
+        """
+        boxes = self._boxes(device, dtype)
+        module = BoxFiltering(0.9, classes_to_keep=[0, 1, 2], filter_as_zero=True).to(device)
+        module.confidence_threshold = value
+        threshold = 0.0 if value is None else float(value)
+        keep = (boxes[..., 1] > threshold) & (boxes[..., 0] < 3)
+        assert 0 < keep.sum() < keep.numel()
+        self.assert_close(module(boxes), boxes * keep[..., None])
+
+    def test_half_module_keeps_the_threshold_6180(self):
+        """``.half()`` leaves the threshold alone: 0.3 is 0.30004883 in float16, which would drop this box."""
+        boxes = self._boxes("cpu", torch.float32)
+        boxes[0, 0, 1] = 0.30002
+        expected = BoxFiltering(0.3, filter_as_zero=True)(boxes)
+        assert expected[0, 0, 1] == boxes[0, 0, 1]
+        self.assert_close(BoxFiltering(0.3, filter_as_zero=True).half()(boxes), expected, rtol=0, atol=0)
+
+    @pytest.mark.parametrize("kwargs", [{}, {"confidence_threshold": 0.5, "classes_to_keep": [0, 1, 2]}])
+    def test_jit_6180(self, device, dtype, kwargs):
+        module = BoxFiltering(filter_as_zero=True, **kwargs).to(device)
+        boxes = self._boxes(device, dtype)
+        self.assert_close(torch.jit.script(module)(boxes), module(boxes))
+
+
+class TestBoxFilteringFilterAsZero(BaseTester):
+    """``filter_as_zero=True`` sets every filtered-out row to zero and leaves kept rows as they are."""
+
+    def test_filtered_rows_are_zero_even_when_nonfinite(self, device, dtype):
+        """Multiplying by the keep mask left NaN for NaN or inf values and -0.0 for negative ones."""
+        nan, inf = float("nan"), float("inf")
+        boxes = torch.tensor(
+            [
+                [
+                    [0.0, 0.9, 1.0, 2.0, 3.0, 4.0],  # kept
+                    [1.0, nan, 1.0, 1.0, 1.0, 1.0],  # dropped: a NaN score is not above the threshold
+                    [2.0, 0.1, inf, 1.0, 1.0, 1.0],  # dropped, holds inf
+                    [3.0, 0.2, -5.0, 1.0, 1.0, nan],  # dropped, holds a negative value and NaN
+                    [4.0, 0.8, nan, 1.0, -inf, 1.0],  # kept, non-finite values stay
+                ]
+            ],
+            device=device,
+            dtype=dtype,
+        )
+        out = BoxFiltering(confidence_threshold=0.5, filter_as_zero=True)(boxes)
+
+        dropped = out[0, 1:4]
+        assert torch.all(dropped == 0)
+        assert not torch.signbit(dropped).any()
+        self.assert_close(out[0, 0], boxes[0, 0], rtol=0, atol=0)
+        kept = out[0, 4]
+        assert torch.isnan(kept[2])
+        assert kept[4] == -inf
+        self.assert_close(kept[[0, 1, 3, 5]], boxes[0, 4, [0, 1, 3, 5]], rtol=0, atol=0)

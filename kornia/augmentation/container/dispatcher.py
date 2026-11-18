@@ -1,0 +1,199 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from typing import Any, Dict, List, Tuple, Union
+
+from torch import Tensor, nn
+from torch.nn.parameter import is_lazy
+
+from .augment import AugmentationSequential
+
+
+def _fill_missing_augmentation_state(
+    module: nn.Module,
+    state_dict: Dict[str, Any],
+    prefix: str,
+    local_metadata: Dict[str, Any],
+    *args: Any,
+) -> None:
+    # Children used to live in a plain tuple, so old checkpoints contain no augmentation state.
+    # Version 2 records the registered layout: never hide its missing keys, even if all child state is absent.
+    if local_metadata.get("version", 1) >= 2:
+        return
+    if any(key.startswith(prefix + "augmentations.") for key in state_dict):
+        return
+    for name, value in module.state_dict(keep_vars=False).items():
+        if name.startswith("augmentations."):
+            # Lazy parameters and buffers must reach their load hooks without tensor operations.
+            state_dict[prefix + name] = (
+                value.detach().clone() if isinstance(value, Tensor) and not is_lazy(value) else value
+            )
+
+
+class ManyToManyAugmentationDispather(nn.Module):
+    r"""Run one augmentation container for each matching input bundle.
+
+    ``outputs = ManyToManyAugmentationDispather(*augmentations)(*bundles)`` pairs each
+    :class:`~kornia.augmentation.container.AugmentationSequential` with the bundle at the same position and returns
+    its result. Use :class:`~kornia.augmentation.container.ManyToOneAugmentationDispather` to run several containers
+    over one shared bundle.
+
+    See the Convention block on :class:`~kornia.augmentation.container.AugmentationSequential`.
+
+    Args:
+        augmentations: a list or a sequence of kornia AugmentationSequential modules.
+
+    Convention:
+        - every member has to be an :class:`~kornia.augmentation.container.AugmentationSequential`; anything else is
+          rejected at construction with ``ValueError``.
+        - the call takes one input bundle per augmentation and returns a list in that order; a different number
+          of bundles raises ``ValueError`` before any augmentation runs. Each augmentation draws its own
+          parameters, so the members are independent of one another.
+
+    See Also:
+        - :class:`~kornia.augmentation.container.ManyToOneAugmentationDispather`: gives every container one bundle.
+        - :class:`~kornia.augmentation.container.AugmentationSequential`: augments an aligned data bundle.
+
+    Examples:
+        >>> import torch
+        >>> input_1, input_2 = torch.randn(2, 3, 5, 6), torch.randn(2, 3, 5, 6)
+        >>> mask_1, mask_2 = torch.ones(2, 3, 5, 6), torch.ones(2, 3, 5, 6)
+        >>> aug_list = ManyToManyAugmentationDispather(
+        ...     AugmentationSequential(
+        ...         kornia.augmentation.ColorJiggle(0.1, 0.1, 0.1, 0.1, p=1.0),
+        ...         kornia.augmentation.RandomAffine(360, p=1.0),
+        ...         data_keys=["input", "mask",],
+        ...     ),
+        ...     AugmentationSequential(
+        ...         kornia.augmentation.ColorJiggle(0.1, 0.1, 0.1, 0.1, p=1.0),
+        ...         kornia.augmentation.RandomAffine(360, p=1.0),
+        ...         data_keys=["input", "mask",],
+        ...     )
+        ... )
+        >>> output = aug_list((input_1, mask_1), (input_2, mask_2))
+
+    """
+
+    _version = 2
+
+    def __init__(self, *augmentations: AugmentationSequential) -> None:
+        super().__init__()
+        self._check_consistency(*augmentations)
+        self.augmentations = nn.ModuleList(augmentations)
+        self._register_load_state_dict_pre_hook(_fill_missing_augmentation_state, with_module=True)
+
+    def _check_consistency(self, *augmentations: AugmentationSequential) -> bool:
+        for i, aug in enumerate(augmentations):
+            if not isinstance(aug, AugmentationSequential):
+                raise ValueError(f"Please wrap your augmentations[`{i}`] with `AugmentationSequentials`.")
+        return True
+
+    def forward(self, *input: Union[List[Tensor], List[Tuple[Tensor]]]) -> Union[List[Tensor], List[Tuple[Tensor]]]:
+        """Apply each augmentation to the matching input tuple.
+
+        Args:
+            *input: One input bundle per configured augmentation.
+
+        Returns:
+            Outputs from each augmentation, preserving input order.
+
+        Raises:
+            ValueError: If the number of input bundles differs from the number of augmentations.
+        """
+        if len(input) != len(self.augmentations):
+            raise ValueError(
+                f"Expected {len(self.augmentations)} input bundles, one per augmentation, but got {len(input)}."
+            )
+        return [aug(*inp) for inp, aug in zip(input, self.augmentations)]
+
+
+class ManyToOneAugmentationDispather(nn.Module):
+    r"""Run several augmentation containers independently over one input bundle.
+
+    ``outputs = ManyToOneAugmentationDispather(*augmentations)(*inputs)`` gives the same inputs to every
+    :class:`~kornia.augmentation.container.AugmentationSequential` and returns one result per container. Use
+    :class:`~kornia.augmentation.container.ManyToManyAugmentationDispather` to pair containers and bundles.
+
+    See the Convention block on :class:`~kornia.augmentation.container.AugmentationSequential`.
+
+    Same `datakeys` must be applied across different augmentations. By default, with input
+    (image, mask), the augmentations must not mess it as (mask, image) to avoid unexpected
+    errors. This check can be cancelled with `strict=False` if needed.
+
+    Args:
+        augmentations: a list or a sequence of kornia AugmentationSequential modules.
+
+    Convention:
+        - the same input payload is broadcast to every augmentation, so the returned list is always as long
+          as the list of augmentations and no input can be dropped.
+        - with ``strict=True``, the default, the members must all declare the same ``data_keys``; a mismatch
+          raises ``RuntimeError`` at construction.
+
+    See Also:
+        - :class:`~kornia.augmentation.container.ManyToManyAugmentationDispather`: pairs containers with bundles.
+        - :class:`~kornia.augmentation.container.AugmentationSequential`: augments an aligned data bundle.
+
+    Examples:
+        >>> import torch
+        >>> input = torch.randn(2, 3, 5, 6)
+        >>> mask = torch.ones(2, 3, 5, 6)
+        >>> aug_list = ManyToOneAugmentationDispather(
+        ...     AugmentationSequential(
+        ...         kornia.augmentation.ColorJiggle(0.1, 0.1, 0.1, 0.1, p=1.0),
+        ...         kornia.augmentation.RandomAffine(360, p=1.0),
+        ...         data_keys=["input", "mask",],
+        ...     ),
+        ...     AugmentationSequential(
+        ...         kornia.augmentation.ColorJiggle(0.1, 0.1, 0.1, 0.1, p=1.0),
+        ...         kornia.augmentation.RandomAffine(360, p=1.0),
+        ...         data_keys=["input", "mask",],
+        ...     )
+        ... )
+        >>> output = aug_list(input, mask)
+
+    """
+
+    _version = 2
+
+    def __init__(self, *augmentations: AugmentationSequential, strict: bool = True) -> None:
+        super().__init__()
+        self.strict = strict
+        self._check_consistency(*augmentations)
+        self.augmentations = nn.ModuleList(augmentations)
+        self._register_load_state_dict_pre_hook(_fill_missing_augmentation_state, with_module=True)
+
+    def _check_consistency(self, *augmentations: AugmentationSequential) -> bool:
+        for i, aug in enumerate(augmentations):
+            if not isinstance(aug, AugmentationSequential):
+                raise ValueError(f"Please wrap your augmentations[`{i}`] with `AugmentationSequentials`.")
+            if self.strict and i != 0 and aug.data_keys != augmentations[i - 1].data_keys:
+                raise RuntimeError(
+                    f"Different `data_keys` between {i - 1} and {i} elements, "
+                    f"got {aug.data_keys} and {augmentations[i - 1].data_keys}."
+                )
+        return True
+
+    def forward(self, *input: Union[Tensor, Tuple[Tensor]]) -> Union[List[Tensor], List[Tuple[Tensor]]]:
+        """Apply all augmentations to the same input payload.
+
+        Args:
+            *input: Shared input payload passed to every augmentation.
+
+        Returns:
+            One output per augmentation sequence.
+        """
+        return [aug(*input) for aug in self.augmentations]

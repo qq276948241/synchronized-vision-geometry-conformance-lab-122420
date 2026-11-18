@@ -1,0 +1,284 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from typing import List, Optional, TypedDict
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+from kornia.core.download import hf_url, load_state_dict_from_url
+from kornia.filters import SpatialGradient
+from kornia.geometry.transform import pyrdown
+
+from .scale_space_detector import Detector_config, MultiResolutionDetector, get_default_detector_config
+
+
+class KeyNet_conf(TypedDict):
+    """Define the configuration schema for the KeyNet feature detector.
+
+    Attributes:
+        num_filters: The number of filters in the convolutional layers.
+        num_levels: The number of levels in the image pyramid.
+        kernel_size: The kernel size of the last convolution, which merges the levels' features.
+        Detector_conf: The configuration of the :class:`MultiResolutionDetector` that :class:`KeyNetDetector` builds.
+    """
+
+    num_filters: int
+    num_levels: int
+    kernel_size: int
+    Detector_conf: Detector_config
+
+
+keynet_default_config: KeyNet_conf = {
+    # Key.Net Model
+    "num_filters": 8,
+    "num_levels": 3,
+    "kernel_size": 5,
+    # Extraction Parameters
+    "Detector_conf": get_default_detector_config(),
+}
+
+KeyNet_URL = [
+    hf_url("keynet", "keynet_pytorch.pth"),
+    "https://github.com/axelBarroso/Key.Net-Pytorch/raw/main/model/weights/keynet_pytorch.pth",
+]
+
+
+class _FeatureExtractor(nn.Module):
+    """Helper class for KeyNet.
+
+    It loads both, the handcrafted and learnable blocks
+    """
+
+    def __init__(self, num_filters: int = 8) -> None:
+        super().__init__()
+
+        self.hc_block = _HandcraftedBlock()
+        self.lb_block = _LearnableBlock(num_filters=num_filters)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_hc = self.hc_block(x)
+        return self.lb_block(x_hc)
+
+
+class _HandcraftedBlock(nn.Module):
+    """Helper class for KeyNet, it defines the handcrafted filters within the Key.Net handcrafted block."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.spatial_gradient = SpatialGradient("sobel", 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        sobel = self.spatial_gradient(x)
+        dx, dy = sobel[:, :, 0, :, :], sobel[:, :, 1, :, :]
+
+        sobel_dx = self.spatial_gradient(dx)
+        dxx, dxy = sobel_dx[:, :, 0, :, :], sobel_dx[:, :, 1, :, :]
+
+        # Only dyy is used from sobel_dy; dyx is discarded.
+        dyy = self.spatial_gradient(dy)[:, :, 1, :, :]
+
+        return torch.cat([dx, dy, dx.square(), dy.square(), dx * dy, dxy, dxy.square(), dxx, dyy, dxx * dyy], 1)
+
+
+class _LearnableBlock(nn.Sequential):
+    """Helper class for KeyNet.
+
+    It defines the learnable blocks within the Key.Net
+    """
+
+    def __init__(self, in_channels: int = 10, num_filters: int = 8) -> None:
+        super().__init__()
+
+        self.conv0 = _KeyNetConvBlock(in_channels, num_filters)
+        self.conv1 = _KeyNetConvBlock(num_filters, num_filters)
+        self.conv2 = _KeyNetConvBlock(num_filters, num_filters)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # These narrow convolutions benefit from channel-contiguous activations on
+        # CPU and CUDA. Convert once at the block boundary, without changing the
+        # parameter layout or the pretrained state-dict contract.
+        if x.dtype == torch.float32 and x.device.type in ("cpu", "cuda"):
+            x = x.to(memory_format=torch.channels_last)
+        return self.conv2(self.conv1(self.conv0(x)))
+
+
+def _KeyNetConvBlock(
+    in_channels: int = 8,
+    out_channels: int = 8,
+    kernel_size: int = 5,
+    stride: int = 1,
+    padding: int = 2,
+    dilation: int = 1,
+) -> nn.Sequential:
+    """Create KeyNet Conv Block.
+
+    Default learnable convolutional block for KeyNet.
+    """
+    return nn.Sequential(
+        nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, dilation),
+        nn.BatchNorm2d(out_channels),
+        nn.ReLU(inplace=True),
+    )
+
+
+class KeyNet(nn.Module):
+    """Compute the learned Key.Net keypoint response map of a grayscale image, at the input's size.
+
+    ``response = KeyNet()(img)`` takes grayscale images ``(B, 1, H, W)`` in ``[0, 1]`` and returns their Key.Net
+    response, a non-negative ``(B, 1, H, W)`` map, without non-maxima suppression: handcrafted first- and second-order
+    derivative filters and a small CNN run on the image and on ``num_levels - 1`` successive 1.2x downscales of it (two
+    by default), and a last convolution merges their features, resized back to the input size. The pretrained weights,
+    the default, come back in evaluation mode; a random model (``pretrained=False``) stays in training mode, so call
+    ``.eval()`` before inference (see :ref:`pretrained-models-conventions`). For keypoints, use
+    :class:`KeyNetDetector`, which finds the maxima of this response on an image pyramid.
+
+    This is based on the original code from the paper "Key.Net: Keypoint Detection by Handcrafted and Learned CNN
+    Filters". See :cite:`KeyNet2019` for more details.
+
+    .. image:: _static/img/KeyNet.png
+
+    Convention:
+        - The input is a grayscale image, and the pretrained weights expect it in ``[0, 1]``, as the Key.Net
+          reference scales its images. The response is not proportional to the intensity, so an image in
+          ``[0, 255]`` gives other detections. A multi-channel image raises ``RuntimeError``.
+        - The response is a non-negative map of the input's size when ``kernel_size`` is odd. With ``pretrained=False``
+          and an even ``kernel_size``, the final convolution returns a map one pixel larger on each axis.
+
+    Args:
+        pretrained: Download and set pretrained weights to the model.
+        keynet_conf: Dict with initialization parameters. Do not pass it, unless you know what you are doing. A
+            ``num_filters``, ``num_levels`` or an odd ``kernel_size`` other than the default changes the architecture.
+            Pass
+            ``pretrained=False`` with it, since the strict load of the weights raises ``RuntimeError``.
+
+    Returns:
+        KeyNet response score.
+
+    Shape:
+        - Input: ``(B, 1, H, W)``
+        - Output: ``(B, 1, H, W)``
+
+    See Also:
+        - :class:`KeyNetDetector`: detects LAFs at the maxima of this response on an image pyramid.
+        - :class:`BlobHessian`: a handcrafted blob response, with no weights to load.
+        - :class:`KeyNetHardNet`: KeyNet detection with OriNet orientation and HardNet descriptors.
+
+    """
+
+    def __init__(self, pretrained: bool = True, keynet_conf: Optional[KeyNet_conf] = None) -> None:
+        super().__init__()
+        if keynet_conf is None:
+            keynet_conf = keynet_default_config
+
+        num_filters = keynet_conf["num_filters"]
+        self.num_levels = keynet_conf["num_levels"]
+        kernel_size = keynet_conf["kernel_size"]
+        padding = kernel_size // 2
+
+        self.feature_extractor = _FeatureExtractor(num_filters)
+        self.last_conv = nn.Sequential(
+            nn.Conv2d(
+                in_channels=num_filters * self.num_levels, out_channels=1, kernel_size=kernel_size, padding=padding
+            ),
+            nn.ReLU(inplace=True),
+        )
+        # use torch.hub to load pretrained model
+        if pretrained:
+            pretrained_dict = load_state_dict_from_url(KeyNet_URL, map_location=torch.device("cpu"))
+            self.load_state_dict(pretrained_dict["state_dict"], strict=True)
+            self.eval()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """X - input image."""
+        h, w = x.shape[2], x.shape[3]
+        feats: List[torch.Tensor] = [self.feature_extractor(x)]
+        for _ in range(1, self.num_levels):
+            x = pyrdown(x, factor=1.2)
+            feats_i = self.feature_extractor(x)
+            feats_i = F.interpolate(feats_i, size=(h, w), mode="bilinear", align_corners=False)
+            feats.append(feats_i)
+        return self.last_conv(torch.cat(feats, 1))
+
+
+class KeyNetDetector(MultiResolutionDetector):
+    """Detect LAFs at the maxima of the learned Key.Net response on an image pyramid, one image per call.
+
+    ``detector = KeyNetDetector(num_features=2048)``, then ``lafs, responses = detector(img)`` takes one grayscale
+    image ``(1, 1, H, W)`` in ``[0, 1]`` and returns ``(1, num_features, 2, 3)`` LAFs in input pixels and their
+    ``(1, num_features)`` KeyNet responses, strongest first. ``laf_is_filled(lafs)`` is true for detections; index
+    every output with it to discard padded slots. It is a :class:`MultiResolutionDetector` on the :class:`KeyNet`
+    response with the default ``config``: maxima at the integer pixels of six pyramid levels, in upright frames unless
+    ``ori_module`` or ``aff_module`` change them. For KeyNet detections with orientation and HardNet descriptors, use
+    :class:`KeyNetAffNetHardNet` instead.
+
+    This is based on the original code from the paper "Key.Net: Keypoint Detection by Handcrafted and Learned CNN
+    Filters". See :cite:`KeyNet2019` for more details.
+
+    .. image:: _static/img/keynet.jpg
+
+    Convention:
+        A :class:`~kornia.feature.MultiResolutionDetector` with :class:`~kornia.feature.KeyNet` as its response; see
+        their Convention blocks for the pixel convention and input range. Only KeyNet is in evaluation mode after
+        construction, so this detector reports ``training=True``; calling ``.train()`` changes its detections.
+
+    Args:
+        pretrained: Download and set pretrained weights to the model.
+        num_features: Number of features to detect.
+        keynet_conf: Dict with initialization parameters. Do not pass it, unless you know what you are doing. A
+            ``num_filters``, ``num_levels`` or an odd ``kernel_size`` other than the default changes the architecture.
+            Pass
+            ``pretrained=False`` with it, since the strict load of the weights raises ``RuntimeError``.
+        ori_module: for local feature orientation estimation. Default: :class:`~kornia.feature.PassLAF`,
+           which does nothing. See :class:`~kornia.feature.LAFOrienter` for details.
+        aff_module: for local feature affine shape estimation. Default: :class:`~kornia.feature.PassLAF`,
+            which does nothing. See :class:`~kornia.feature.LAFAffineShapeEstimator` for details.
+        compile_model: wrap the response function and the non-maxima suppression with :func:`torch.compile`.
+        score_threshold: minimum response for a position to count as a detection. Must be non-negative:
+            non-maxima suppression writes an exact zero at every suppressed position, so a negative
+            threshold would admit all of them; it raises ``ValueError``.
+
+    See Also:
+        - :class:`KeyNet`: the response network alone, a dense ``(B, 1, H, W)`` map.
+        - :class:`MultiResolutionDetector`: the same detector on another response function.
+        - :class:`ScaleSpaceDetector`: batched detection at the sub-pixel scale-space extrema of a pluggable response,
+          the Hessian determinant by default.
+        - :class:`KeyNetHardNet`: this detector with OriNet orientation and HardNet descriptors.
+        - :class:`KeyNetAffNetHardNet`: the same, with AffNet affine shapes before the orientation.
+        - :class:`LAFOrienter`: an ``ori_module`` that orients each frame from its image patch.
+        - :class:`LAFAffineShapeEstimator`: an ``aff_module`` that adapts each frame to its patch's second moments.
+        - :func:`laf_is_filled`: is true for detections; use it to discard padded slots.
+
+    """
+
+    def __init__(
+        self,
+        pretrained: bool = True,
+        num_features: int = 2048,
+        keynet_conf: Optional[KeyNet_conf] = None,
+        ori_module: Optional[nn.Module] = None,
+        aff_module: Optional[nn.Module] = None,
+        compile_model: bool = False,
+        score_threshold: float = 0.0,
+    ) -> None:
+        if keynet_conf is None:
+            keynet_conf = keynet_default_config
+        model = KeyNet(pretrained, keynet_conf)
+        super().__init__(
+            model, num_features, keynet_conf["Detector_conf"], ori_module, aff_module, compile_model, score_threshold
+        )

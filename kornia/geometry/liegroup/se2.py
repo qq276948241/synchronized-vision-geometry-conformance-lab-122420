@@ -1,0 +1,577 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# kornia.geometry.se2 module inspired by Sophus-sympy.
+# https://github.com/strasdat/Sophus/blob/master/sympy/sophus/se2.py
+from __future__ import annotations
+
+from typing import Optional, Union, overload
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+from kornia.core.check import KORNIA_CHECK, KORNIA_CHECK_SAME_DEVICES, KORNIA_CHECK_SHAPE, KORNIA_CHECK_TYPE
+from kornia.core.exceptions import DeviceError, TypeCheckError
+from kornia.core.utils import _deepcopy_module_state, register_module_state
+from kornia.geometry.liegroup.so2 import So2
+from kornia.geometry.liegroup.so3 import _so3_small_angle_coefficients
+from kornia.geometry.vector import Vector2
+
+
+def _check_se2_r_t_shape(r: So2, t: torch.Tensor) -> None:
+    KORNIA_CHECK_SHAPE(t, ["*", "2"])
+    r_batch = r.z.shape
+    t_batch = t.shape[:-1]
+    try:
+        torch.broadcast_shapes(r_batch, t_batch)
+    except RuntimeError:
+        raise ValueError(
+            f"Expected a translation whose batch broadcasts with the rotation batch {tuple(r_batch)}. "
+            f"Got translation of shape {tuple(t.shape)}."
+        ) from None
+
+
+def _check_se2_r_t_dtype_device(r: So2, t: torch.Tensor) -> None:
+    """Reject a translation the rotation's methods cannot combine with: another dtype or another device."""
+    r_dtype = r.z.real.dtype
+    # ``.bfloat16()`` keeps the complex rotation's precision (PyTorch has no complex bfloat16) and casts the
+    # translation, so a bfloat16 translation beside a complex rotation is the module's own converted state.
+    if t.is_complex():
+        raise TypeCheckError(
+            f"Se2 translation must be a real floating-point tensor; got {t.dtype}.",
+            actual_type=t.dtype,
+        )
+    if not t.is_floating_point():
+        # register_module_state keeps an existing nn.Parameter as given, so it cannot reject an integer one
+        raise TypeCheckError(
+            f"Se2 stores 'translation' as module state, which needs a floating-point tensor; got {t.dtype}. "
+            "Cast it first, for example with `.float()`.",
+            actual_type=t.dtype,
+        )
+    if t.dtype not in (r_dtype, torch.bfloat16):
+        raise TypeCheckError(
+            f"Se2 translation must have the dtype of its rotation, {r_dtype} (z is {r.z.dtype}); got {t.dtype}. "
+            "Cast one of them first, for example with `.to(dtype)`.",
+            actual_type=t.dtype,
+            expected_type=r_dtype,
+        )
+    if t.device != r.z.device:
+        raise DeviceError(
+            f"Se2 translation must be on the device of its rotation, {r.z.device}; got {t.device}.",
+            actual_devices=[r.z.device, t.device],
+            expected_device=r.z.device,
+        )
+
+
+class Se2(nn.Module):
+    r"""Represent a 2D rigid motion, rotation and translation, as an SE(2) Lie group element.
+
+    ``g = Se2(rotation, t)`` pairs an :class:`So2` rotation with a translation ``t`` of shape ``(B, 2)``, or ``(2,)``
+    for an unbatched rotation; ``Se2.exp(v)`` builds one from tangent vectors :math:`v = (v_x, v_y, \theta)` of shape
+    ``(B, 3)``, :meth:`from_matrix` from ``(B, 3, 3)`` matrices, and ``Se2.identity(B)`` and ``Se2.random(B)`` build
+    ``B`` poses, or an unbatched one with ``batch_size=None``. ``g * p`` maps points as :math:`R p + t`, ``g1 * g2``
+    composes, ``g.inverse()`` inverts, ``g.log()`` returns the ``(B, 3)`` tangent vectors and ``g.matrix()`` the
+    ``(B, 3, 3)`` matrices. Unbatched, a pose drops the ``B`` and maps ``(2,)`` or ``(N, 2)`` points; a batch of ``B``
+    maps ``(B, 2)``, one point per pose, or a single ``(2,)`` point. For 3D, use :class:`Se3`; for a pose that names
+    its frames and checks them when composing, :class:`~kornia.geometry.pose.NamedPose`.
+
+    SE(2) is the group of rigid motions of :math:`R^2` under composition.
+
+    Convention:
+        - ``matrix()`` is the 3x3 :math:`[[R, t], [0, 1]]`. ``a * b`` is ``a.matrix() @ b.matrix()`` and ``g * p`` is
+          :math:`R p + t`, as in :class:`~kornia.geometry.liegroup.Se3`. The rotation is an
+          :class:`~kornia.geometry.liegroup.So2`, whose storage and direction conventions apply.
+        - The tangent vector is :math:`(v_x, v_y, \theta)`, angle last: ``exp`` rotates by :math:`\theta` and
+          translates by :math:`V(\theta) (v_x, v_y)`, and ``log`` returns :math:`\theta` in :math:`[-\pi, \pi]`.
+          ``adjoint()`` is :math:`[[R, (t_y, -t_x)^\top], [0, 1]]`.
+        - ``from_matrix`` ignores the bottom row. In eager execution, it checks approximately that the rotation block
+          has the form :math:`[[a, -b], [b, a]]`, a rotation scaled by :math:`\sqrt{a^2 + b^2}`, and keeps the scale
+          as a non-unit ``z`` that ``log`` drops; it rejects a reflection. Graph capture (``torch.compile``,
+          ``torch.export``) omits the value check and interprets the block as ``z = m00 + i m10``.
+        - ``t`` is always a tensor, whichever constructor built the pose, and registered as module state outside
+          graph capture; a ``Vector2`` passed to the constructor is unwrapped. ``g * p`` returns a ``Vector2`` only
+          when ``p`` is one.
+        - ``hat`` returns the se(2) generator :math:`[[0, -\theta, v_x], [\theta, 0, v_y], [0, 0, 0]]` and ``vee``
+          reads it back, so ``matrix_exp(hat(v))`` equals ``exp(v).matrix()``.
+        - Module conversions follow :class:`~kornia.geometry.liegroup.So2`'s dtype policy for the rotation and
+          PyTorch's native policy for the translation. A bfloat16 cast changes the translation precision while
+          keeping the rotation's existing complex precision; both follow any requested device move. Building a
+          pose from bfloat16 values (``exp``, ``identity``, ``random``, ``from_matrix`` or ``trans*``) raises
+          ``TypeCheckError``, as for ``So2``.
+        - ``copy.deepcopy`` copies the rotation and translation as for :class:`~kornia.geometry.liegroup.So2`.
+
+    See Also:
+        - :class:`Se3`: the 3D rigid motion, with an :class:`So3` rotation and a ``(B, 3)`` translation.
+        - :class:`So2`: the rotation alone, without a translation.
+        - :class:`~kornia.geometry.pose.NamedPose`: wraps an ``Se2`` with the names of its source and destination
+          frames, and checks that they chain when composing.
+
+    Example:
+        >>> so2 = So2.identity(1)
+        >>> t = torch.ones((1, 2))
+        >>> se2 = Se2(so2, t)
+        >>> se2
+        rotation: Parameter containing:
+        tensor([1.+0.j], requires_grad=True)
+        translation: Parameter containing:
+        tensor([[1., 1.]], requires_grad=True)
+
+    """
+
+    # Autograd history cannot be deep-copied, so a deep copy holds that state as new leaves.
+    __deepcopy__ = _deepcopy_module_state
+
+    def __init__(self, rotation: So2, translation: Vector2 | torch.Tensor) -> None:
+        """Construct an Se2 from an So2 rotation and a translation.
+
+        Internally represented by a torch.complex number `z` and a translation 2-vector.
+
+        Args:
+            rotation: So2 group encompassing a rotation.
+            translation: translation torch.Tensor with shape ``(B, 2)``, or ``(2,)`` for an unbatched translation,
+                or a Vector2 wrapping one; the tensor is what gets stored. Multidimensional batch shapes ``(*, 2)``
+                are also accepted. The rotation and translation batch shapes must be broadcastable (an unbatched side
+                may broadcast against a batched side). Incompatible batch shapes raise a ``ValueError`` at
+                construction time. It must have the rotation's dtype (``z``'s real dtype) and device;
+                a bfloat16 translation is also accepted beside a complex32, complex64 or complex128 rotation, which
+                is what ``.bfloat16()`` leaves (PyTorch has no complex bfloat16). Every method then reads the
+                translation at the rotation's precision, and ``inverse`` and ``g * g`` return a translation of the
+                rotation's real dtype.
+
+        Raises:
+            ValueError: if translation shape does not end in 2, or rotation and translation batch shapes cannot be
+                broadcast.
+            TypeCheckError: if the translation is an integer, bool or complex tensor (an ``nn.Parameter`` too), or its
+                dtype differs from the rotation's (``log`` and the other methods cannot combine them).
+            DeviceError: if the translation is on another device than the rotation.
+
+        Example:
+            >>> so2 = So2.identity(1)
+            >>> t = torch.ones((1, 2))
+            >>> se2 = Se2(so2, t)
+            >>> se2
+            rotation: Parameter containing:
+            tensor([1.+0.j], requires_grad=True)
+            translation: Parameter containing:
+            tensor([[1., 1.]], requires_grad=True)
+
+        """
+        super().__init__()
+        KORNIA_CHECK_TYPE(rotation, So2)
+        if not isinstance(translation, (Vector2, torch.Tensor)):
+            raise TypeError(f"translation type is {type(translation)}")
+        _t_data = translation.data if isinstance(translation, Vector2) else translation
+        _check_se2_r_t_shape(rotation, _t_data)  # TODO remove
+        _check_se2_r_t_dtype_device(rotation, _t_data)
+        self._translation: torch.Tensor
+        self._rotation: So2 = rotation
+        register_module_state(self, "_translation", _t_data)
+
+    def __repr__(self) -> str:
+        return f"rotation: {self.r}\ntranslation: {self.t}"
+
+    def __getitem__(self, idx: int | slice) -> Se2:
+        r = self._rotation
+        t = self._translation
+        r_batch = r.z.shape
+        t_batch = t.shape[:-1]
+        if len(r_batch) == 0 and len(t_batch) == 0:
+            return Se2(r[idx], t[idx])
+        r_b = (1,) if len(r_batch) == 0 else r_batch
+        t_b = (1,) if len(t_batch) == 0 else t_batch
+        b_batch = torch.broadcast_shapes(r_b, t_b)
+        z = r.z if r.z.shape == b_batch else r.z.expand(b_batch)
+        t_exp = t if t.shape[:-1] == b_batch else t.expand(b_batch + (2,))
+        return Se2(So2(z[idx]), t_exp[idx])
+
+    def _mul_se2(self, right: Se2) -> Se2:
+        so2 = self.so2
+        t = self.t
+        _r = so2 * right.so2
+        z = so2.z
+        real, imag = z.real, z.imag
+        x, y = right.t[..., 0], right.t[..., 1]
+        rot_t = torch.stack((real * x - imag * y, imag * x + real * y), -1)
+        # the rotation's real dtype: beside a complex32 rotation, a bfloat16 translation (what ``.bfloat16()``
+        # leaves) would otherwise be promoted to float32, which the constructor rejects
+        _t = (t + rot_t).to(_r.z.real.dtype)
+        return Se2(_r, _t)
+
+    @overload
+    def __mul__(self, right: Se2) -> Se2: ...
+
+    @overload
+    def __mul__(self, right: torch.Tensor) -> torch.Tensor: ...
+
+    def __mul__(self, right: Se2 | torch.Tensor) -> Se2 | torch.Tensor:
+        """Compose two Se2 transformations, or transform points.
+
+        Args:
+            right: the other Se2 transformation, or points as a tensor or a ``Vector2``: ``(2,)`` or ``(N, 2)``
+                for an unbatched pose, ``(B, 2)``, one point per pose, or a single ``(2,)`` point for a batch of
+                ``B`` (a batch of one also maps ``(N, 2)``).
+
+        Return:
+            The resulting Se2 transformation, or the transformed points.
+
+        """
+        so2 = self.so2
+        t = self.t
+        if isinstance(right, Se2):
+            KORNIA_CHECK_TYPE(right, Se2)
+            return self._mul_se2(right)
+        if isinstance(right, (Vector2, torch.Tensor)):
+            b_batch = torch.broadcast_shapes(so2.z.shape, t.shape[:-1])
+            rot = so2 if so2.z.shape == b_batch else So2(so2.z.expand(b_batch))
+            return rot * right + t
+        raise TypeError(f"Unsupported type: {type(right)}")
+
+    @property
+    def so2(self) -> So2:
+        """Return the underlying `rotation(So2)`."""
+        return self._rotation
+
+    @property
+    def r(self) -> So2:
+        """Return the underlying `rotation(So2)`."""
+        return self._rotation
+
+    @property
+    def t(self) -> torch.Tensor:
+        """Return the underlying translation vector of shape ``(B,2)``."""
+        return self._translation
+
+    @property
+    def rotation(self) -> So2:
+        """Return the underlying `rotation(So2)`."""
+        return self._rotation
+
+    @property
+    def translation(self) -> torch.Tensor:
+        """Return the underlying translation vector of shape ``(B,2)``."""
+        return self._translation
+
+    @staticmethod
+    def exp(v: torch.Tensor) -> Se2:
+        r"""Convert elements of lie algebra to elements of lie group.
+
+        Args:
+            v: vector :math:`(v_x, v_y, \theta)` of shape ``(B, 3)`` or ``(3,)``, angle last, in radians.
+
+        Example:
+            >>> v = torch.ones((1, 3))
+            >>> s = Se2.exp(v)
+            >>> s.r
+            Parameter containing:
+            tensor([0.5403+0.8415j], requires_grad=True)
+            >>> s.t
+            Parameter containing:
+            tensor([[0.3818, 1.3012]], requires_grad=True)
+
+        """
+        # check_v_shape
+        is_batch = KORNIA_CHECK_SHAPE(v, ["B", "3"], raises=False)
+        is_single = KORNIA_CHECK_SHAPE(v, ["3"], raises=False)
+        if not (is_batch or is_single):
+            raise ValueError(f"Invalid input shape, we expect [B, 3], [3] Got: {v.shape}")
+        theta = v[..., 2]
+        so2 = So2.exp(theta)
+        # V = [[a, -b], [b, a]] with a = sin(theta) / theta and b = (1 - cos(theta)) / theta. Both are
+        # 0/0 at theta = 0, 1 - cos(theta) cancels just above it, and so does the autograd derivative of
+        # sin(theta) / theta, so below 0.5 rad write them through the cancellation-free So3 coefficients:
+        # a = 1 - theta^2 (theta - sin(theta)) / theta^3 and
+        # b = theta (1 - cos(theta)) / theta^2 (kornia#4924), evaluated at |theta| because both are even.
+        # Above it take sin(theta) / theta and 2 sin(theta / 2)^2 / theta directly: 1 - theta^2 (...)
+        # cancels where sin(theta) / theta is small, and theta^3 overflows float16 above 40.3 rad. Each
+        # branch sees a substituted angle where it is not selected, since torch.where differentiates both.
+        small = theta.abs() < 0.5
+        theta_s = torch.where(small, theta, torch.zeros_like(theta))
+        theta_l = torch.where(small, torch.ones_like(theta), theta)
+        coef_a, coef_b, _ = _so3_small_angle_coefficients(theta_s.abs())
+        a = torch.where(small, 1.0 - theta_s * theta_s * coef_b, torch.sin(theta_l) / theta_l)
+        b = torch.where(small, theta_s * coef_a, 2.0 * torch.sin(0.5 * theta_l) ** 2 / theta_l)
+        x = v[..., 0]
+        y = v[..., 1]
+        t = torch.stack((a * x - b * y, b * x + a * y), -1)
+        return Se2(so2, t)
+
+    def log(self) -> torch.Tensor:
+        """Convert elements of lie group  to elements of lie algebra.
+
+        Example:
+            >>> v = torch.ones((1, 3))
+            >>> s = Se2.exp(v).log()
+            >>> s.shape
+            torch.Size([1, 3])
+            >>> torch.allclose(s, v)
+            True
+            >>> s.requires_grad
+            True
+
+        """
+        theta = self.so2.log()
+        half_theta = 0.5 * theta
+        # V^-1 = [[a, theta / 2], [-theta / 2, a]] with a = (theta / 2) cot(theta / 2), a 0/0 at
+        # theta = 0 that cancels just above it: a = 1 - theta^2 (1 - (theta / 2) cot(theta / 2)) / theta^2
+        # through the cancellation-free So3 coefficient (kornia#4924).
+        _, _, coef_c = _so3_small_angle_coefficients(theta.abs())
+        a = 1.0 - theta * theta * coef_c
+        row0 = torch.stack((a, half_theta), -1)
+        row1 = torch.stack((-half_theta, a), -1)
+        V_inv = torch.stack((row0, row1), -2)
+        # the translation is read at the rotation's precision, so a bfloat16 translation beside a wider rotation works
+        upsilon = V_inv @ self.t.to(theta.dtype)[..., None]
+        if theta.shape != upsilon.shape[:-2]:
+            theta = theta.expand(upsilon.shape[:-2])
+        return torch.stack((upsilon[..., 0, 0], upsilon[..., 1, 0], theta), -1)
+
+    @staticmethod
+    def hat(v: torch.Tensor) -> torch.Tensor:
+        r"""Convert a tangent vector to the se(2) generator. Returns ``v.shape[:-1] + (3, 3)``.
+
+        For :math:`v = (v_x, v_y, \theta)` the matrix is :math:`[[0, -\theta, v_x], [\theta, 0, v_y], [0, 0, 0]]`.
+        :meth:`vee` inverts it, and its matrix exponential is the pose :meth:`exp` returns.
+
+        Args:
+            v: vector of shape ``(B, 3)`` or ``(3,)``.
+
+        Example:
+            >>> v = torch.tensor([1.0, 2.0, 0.5])
+            >>> Se2.hat(v)
+            tensor([[ 0.0000, -0.5000,  1.0000],
+                    [ 0.5000,  0.0000,  2.0000],
+                    [ 0.0000,  0.0000,  0.0000]])
+
+        """
+        # check_v_shape
+        is_batch = KORNIA_CHECK_SHAPE(v, ["B", "3"], raises=False)
+        is_single = KORNIA_CHECK_SHAPE(v, ["3"], raises=False)
+        if not (is_batch or is_single):
+            raise ValueError(f"Invalid input shape, we expect [B, 3], [3] Got: {v.shape}")
+        upsilon = v[..., :2]
+        theta = v[..., 2]
+        top = torch.cat((So2.hat(theta), upsilon.unsqueeze(-1)), -1)
+        return F.pad(top, (0, 0, 0, 1))  # zero bottom row
+
+    @staticmethod
+    def vee(omega: torch.Tensor) -> torch.Tensor:
+        """Read the tangent vector back from a :meth:`hat` matrix.
+
+        It reads the translation from the last column and the angle from the ``[1, 0]`` entry.
+
+        Args:
+            omega: 3x3-matrix built by :meth:`hat`, of shape ``(B, 3, 3)`` or ``(3, 3)``.
+
+        Returns:
+            vector of shape ``(B, 3)`` or ``(3,)``.
+
+        Example:
+            >>> v = torch.ones(3)
+            >>> omega_hat = Se2.hat(v)
+            >>> Se2.vee(omega_hat)
+            tensor([1., 1., 1.])
+
+        """
+        # check_se2_omega_shape
+        is_batch = KORNIA_CHECK_SHAPE(omega, ["B", "3", "3"], raises=False)
+        is_single = KORNIA_CHECK_SHAPE(omega, ["3", "3"], raises=False)
+        if not (is_batch or is_single):
+            raise ValueError(f"Invalid input size, we expect [B, 3, 3] or [3, 3]. Got: {omega.shape}")
+        upsilon = omega[..., :2, 2]
+        theta = So2.vee(omega[..., :2, :2])
+        return torch.cat((upsilon, theta[..., None]), -1)
+
+    @classmethod
+    def identity(
+        cls,
+        batch_size: Optional[int] = None,
+        device: Union[str, torch.device, None] = None,
+        dtype: Union[torch.dtype, None] = None,
+    ) -> Se2:
+        """Create a Se2 group representing an identity rotation and zero translation.
+
+        Args:
+            batch_size: the batch size of the underlying data.
+            device: device to place the result on.
+            dtype: dtype of the result.
+
+        Example:
+            >>> s = Se2.identity(1)
+            >>> s.r
+            Parameter containing:
+            tensor([1.+0.j], requires_grad=True)
+            >>> s.t
+            Parameter containing:
+            tensor([[0., 0.]], requires_grad=True)
+
+        """
+        t: torch.Tensor = torch.tensor([0.0, 0.0], device=device, dtype=dtype)
+        if batch_size is not None:
+            KORNIA_CHECK(batch_size >= 1, msg="batch_size must be positive")
+            t = t.repeat(batch_size, 1)
+        return cls(So2.identity(batch_size, device, dtype), t)
+
+    def matrix(self) -> torch.Tensor:
+        """Return the matrix representation of shape ``(B, 3, 3)``.
+
+        Example:
+            >>> s = Se2(So2.identity(1), torch.ones(1, 2))
+            >>> s.matrix()
+            tensor([[[1., -0., 1.],
+                     [0., 1., 1.],
+                     [0., 0., 1.]]], grad_fn=<CopySlices>)
+
+        """
+        r_matrix = self.r.matrix()
+        b_batch = torch.broadcast_shapes(r_matrix.shape[:-2], self.t.shape[:-1])
+        if r_matrix.shape[:-2] != b_batch:
+            r_matrix = r_matrix.expand(b_batch + (2, 2))
+        t = self.t.to(r_matrix.dtype)
+        if t.shape[:-1] != b_batch:
+            t = t.expand(b_batch + (2,))
+        rt = torch.cat((r_matrix, t[..., None]), -1)
+        rt_3x3 = F.pad(rt, (0, 0, 0, 1))  # add last row torch.zeros
+        rt_3x3[..., -1, -1] = 1.0
+        return rt_3x3
+
+    @classmethod
+    def from_matrix(cls, matrix: torch.Tensor) -> Se2:
+        """Create an Se2 group from a matrix.
+
+        Args:
+            matrix: torch.Tensor of shape ``(B, 3, 3)``.
+
+        Example:
+            >>> s = Se2.from_matrix(torch.eye(3).repeat(2, 1, 1))
+            >>> s.r
+            Parameter containing:
+            tensor([1.+0.j, 1.+0.j], requires_grad=True)
+            >>> s.t
+            Parameter containing:
+            tensor([[0., 0.],
+                    [0., 0.]], requires_grad=True)
+
+        """
+        KORNIA_CHECK_SHAPE(matrix, ["*", "3", "3"])
+        r = So2.from_matrix(matrix[..., :2, :2])
+        t = matrix[..., :2, -1]
+        return cls(r, t)
+
+    def inverse(self) -> Se2:
+        """Return the inverse transformation.
+
+        Example:
+            >>> s = Se2(So2.identity(1), torch.ones(1,2))
+            >>> s_inv = s.inverse()
+            >>> s_inv.r
+            tensor([1.+0.j], grad_fn=<MulBackward0>)
+            >>> s_inv.t
+            tensor([[-1., -1.]], grad_fn=<StackBackward0>)
+
+        """
+        r_inv: So2 = self.r.inverse()
+        z = r_inv.z
+        real, imag = z.real, z.imag
+        x, y = -self.t[..., 0], -self.t[..., 1]
+        t_inv = torch.stack((real * x - imag * y, imag * x + real * y), -1)
+        # the rotation's real dtype, as in ``__mul__``
+        return Se2(r_inv, t_inv.to(r_inv.z.real.dtype))
+
+    @classmethod
+    def random(
+        cls,
+        batch_size: Optional[int] = None,
+        device: Union[str, torch.device, None] = None,
+        dtype: Union[torch.dtype, None] = None,
+    ) -> Se2:
+        """Create a Se2 group from ``So2.random`` and a translation drawn from :math:`U[0, 1)`.
+
+        Args:
+            batch_size: the batch size of the underlying data.
+            device: device to place the result on.
+            dtype: dtype of the result.
+
+        Example:
+            >>> s = Se2.random()
+            >>> s = Se2.random(batch_size=3)
+
+        """
+        r = So2.random(batch_size, device, dtype)
+        shape: tuple[int, ...]
+        if batch_size is None:
+            shape = (2,)
+        else:
+            KORNIA_CHECK(batch_size >= 1, msg="batch_size must be positive")
+            shape = (batch_size, 2)
+        return cls(r, torch.rand(shape, device=device, dtype=dtype))
+
+    @classmethod
+    def trans(cls, x: torch.Tensor, y: torch.Tensor) -> Se2:
+        """Construct a translation only Se2 instance.
+
+        Args:
+            x: the x-axis translation.
+            y: the y-axis translation.
+
+        """
+        KORNIA_CHECK(x.shape == y.shape)
+        KORNIA_CHECK_SAME_DEVICES([x, y])
+        batch_size = x.shape[0] if len(x.shape) > 0 else None
+        rotation = So2.identity(batch_size, x.device, x.dtype)
+        return cls(rotation, torch.stack((x, y), -1))
+
+    @classmethod
+    def trans_x(cls, x: torch.Tensor) -> Se2:
+        """Construct a x-axis translation.
+
+        Args:
+            x: the x-axis translation.
+
+        """
+        zs = torch.zeros_like(x)
+        return cls.trans(x, zs)
+
+    @classmethod
+    def trans_y(cls, y: torch.Tensor) -> Se2:
+        """Construct a y-axis translation.
+
+        Args:
+            y: the y-axis translation.
+
+        """
+        zs = torch.zeros_like(y)
+        return cls.trans(zs, y)
+
+    def adjoint(self) -> torch.Tensor:
+        """Return the adjoint matrix of shape ``(B, 3, 3)``.
+
+        Example:
+            >>> s = Se2.identity()
+            >>> s.adjoint()
+            tensor([[1., -0., 0.],
+                    [0., 1., -0.],
+                    [0., 0., 1.]], grad_fn=<CopySlices>)
+
+        """
+        rt = self.matrix()
+        b_batch = rt.shape[:-2]
+        t = self.t
+        if t.shape[:-1] != b_batch:
+            t = t.expand(b_batch + (2,))
+        rt[..., 0:2, 2] = torch.stack((t[..., 1], -t[..., 0]), -1)
+        return rt

@@ -1,0 +1,369 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+import math
+
+import pytest
+import torch
+from torch.autograd import gradcheck
+
+import kornia
+
+from testing.base import BaseTester
+
+
+class TestRgbToHsv(BaseTester):
+    @pytest.mark.parametrize("shape", [(1, 3, 4, 4), (2, 3, 2, 4), (3, 3, 4, 1), (3, 2, 1)])
+    def test_cardinality(self, device, dtype, shape):
+        img = torch.ones(shape, device=device, dtype=dtype)
+        assert kornia.color.rgb_to_hsv(img).shape == shape
+
+    def test_exception(self, device, dtype):
+        with pytest.raises(TypeError):
+            assert kornia.color.rgb_to_hsv([0.0])
+
+        img = torch.ones(1, 1, device=device, dtype=dtype)
+        with pytest.raises(ValueError):
+            assert kornia.color.rgb_to_hsv(img)
+
+        img = torch.ones(2, 1, 1, device=device, dtype=dtype)
+        with pytest.raises(ValueError):
+            assert kornia.color.rgb_to_hsv(img)
+
+    def test_hue_period_endpoint(self, device, dtype):
+        # A tiny negative hue can round to the excluded upper endpoint after modulo.
+        delta = torch.finfo(dtype).eps
+        image = torch.tensor([[1.0, 1.0, 1.0], [0.0, delta, 0.0], [delta, 0.0, 0.0]], device=device, dtype=dtype)
+        image = image.reshape(1, 3, 1, 3)
+        hsv = kornia.color.rgb_to_hsv(image)
+        hue = hsv[:, 0]
+        assert hue[0, 0, 0] == 0
+        assert hue[0, 0, 1] > 0
+        assert hue[0, 0, 2] == 0
+        assert torch.all((hue >= 0) & (hue < 2 * math.pi))
+        self.assert_close(kornia.color.hsv_to_rgb(hsv), image)
+        # This hue is the largest below one turn, 1 - delta / 2. In float16, 2π * (1 - 2**-11) rounds to 6.28125,
+        # float16's 2π, only when scaled to radians; the comparison rounds 2π to the dtype, as adjust_hue_raw does.
+        near_seam = torch.tensor([1.0, 0.0, 3 * delta], device=device, dtype=dtype).view(1, 3, 1, 1)
+        assert kornia.color.rgb_to_hsv(near_seam)[0, 0, 0, 0] < 2 * math.pi
+
+    def test_unit(self, device, dtype):
+        data = torch.tensor(
+            [
+                [
+                    [0.3944633, 0.8597369, 0.1670904, 0.2825457, 0.0953912],
+                    [0.1251704, 0.8020709, 0.8933256, 0.9170977, 0.1497008],
+                    [0.2711633, 0.1111478, 0.0783281, 0.2771807, 0.5487481],
+                    [0.0086008, 0.8288748, 0.9647092, 0.8922020, 0.7614344],
+                    [0.2898048, 0.1282895, 0.7621747, 0.5657831, 0.9918593],
+                ],
+                [
+                    [0.5414237, 0.9962701, 0.8947155, 0.5900949, 0.9483274],
+                    [0.0468036, 0.3933847, 0.8046577, 0.3640994, 0.0632100],
+                    [0.6171775, 0.8624780, 0.4126036, 0.7600935, 0.7279997],
+                    [0.4237089, 0.5365476, 0.5591233, 0.1523191, 0.1382165],
+                    [0.8932794, 0.8517839, 0.7152701, 0.8983801, 0.5905426],
+                ],
+                [
+                    [0.2869580, 0.4700376, 0.2743714, 0.8135023, 0.2229074],
+                    [0.9306560, 0.3734594, 0.4566821, 0.7599275, 0.7557513],
+                    [0.7415742, 0.6115875, 0.3317572, 0.0379378, 0.1315770],
+                    [0.8692724, 0.0809556, 0.7767404, 0.8742208, 0.1522012],
+                    [0.7708948, 0.4509611, 0.0481175, 0.2358997, 0.6900532],
+                ],
+            ],
+            device=device,
+            dtype=dtype,
+        )
+
+        # OpenCV
+        expected = torch.tensor(
+            [
+                [
+                    [1.6519808, 1.31889750, 2.24879380, 3.58221600, 2.25095400],
+                    [4.2816400, 0.04868213, 0.83454597, 5.53361700, 4.31957400],
+                    [3.4185164, 2.79190370, 2.88832240, 1.74746920, 1.36192720],
+                    [3.6837196, 0.63789610, 5.72131160, 5.26143740, 6.25968700],
+                    [2.9292210, 2.56143520, 0.97840965, 1.57294110, 6.02352240],
+                ],
+                [
+                    [0.4699935, 0.52820253, 0.81324730, 0.65267974, 0.89941100],
+                    [0.9497089, 0.53438100, 0.48878422, 0.60298723, 0.91636120],
+                    [0.6343409, 0.87112963, 0.81016120, 0.95008780, 0.81926220],
+                    [0.9901055, 0.90233060, 0.42042294, 0.82927720, 0.81847864],
+                    [0.6755719, 0.84938710, 0.93686795, 0.73741645, 0.40461043],
+                ],
+                [
+                    [0.5414237, 0.99627006, 0.89471555, 0.81350225, 0.94832740],
+                    [0.9306560, 0.80207086, 0.89332560, 0.91709770, 0.75575125],
+                    [0.7415741, 0.86247796, 0.41260356, 0.76009345, 0.72799970],
+                    [0.8692723, 0.82887480, 0.96470920, 0.89220200, 0.76143440],
+                    [0.8932794, 0.85178390, 0.76217470, 0.89838010, 0.99185926],
+                ],
+            ],
+            device=device,
+            dtype=dtype,
+        )
+
+        self.assert_close(kornia.color.rgb_to_hsv(data), expected)
+
+    def test_channel_ties(self, device, dtype):
+        # Pins the argmax tie-breaking convention (first maximal channel wins) so that
+        # implementation changes cannot silently alter the hue of achromatic/boundary pixels.
+        # Snippet used to generate expected hues (torch, first-occurrence argmax semantics):
+        # gray r=g=b -> h=0; yellow r=g>b -> pi/3; cyan g=b>r -> pi; magenta r=b>g -> 5*pi/3
+        data = torch.tensor(
+            [
+                [[0.5000, 0.5000, 0.3000, 0.6000]],
+                [[0.5000, 0.5000, 0.7000, 0.2000]],
+                [[0.5000, 0.1000, 0.7000, 0.6000]],
+            ],
+            device=device,
+            dtype=dtype,
+        )
+        expected_h = torch.tensor([[0.0, math.pi / 3.0, math.pi, 5.0 * math.pi / 3.0]], device=device, dtype=dtype)
+        hsv = kornia.color.rgb_to_hsv(data)
+        self.assert_close(hsv[..., 0, :, :], expected_h)
+
+    @pytest.mark.parametrize("eps", [0.0, 1e-8, 1e-6, 1e-4])
+    def test_nan_rgb_to_hsv(self, device, dtype, eps):
+        data = torch.zeros(3, 5, 5, device=device, dtype=dtype, requires_grad=True)  # 3x5x5
+        expected = torch.zeros_like(data)  # 3x5x5
+        hsv = kornia.color.rgb_to_hsv(data, eps=eps)
+        self.assert_close(hsv, expected)
+        (gradient,) = torch.autograd.grad(hsv.sum(), data)
+        assert torch.isfinite(gradient).all()
+
+    @pytest.mark.parametrize("eps", [0.0, 1e-8, 1e-4])
+    def test_dark_red_saturation(self, device, dtype, eps):
+        # Dark nonzero colors must retain S = (max - min) / (max + eps).
+        # A blanket dtype-epsilon floor would desaturate this red pixel.
+        value = 2.0**-16
+        data = torch.tensor([[[value]], [[0.0]], [[0.0]]], device=device, dtype=dtype)
+        expected = torch.tensor([[[0.0]], [[value / (value + eps)]], [[value]]], device=device, dtype=dtype)
+        self.assert_close(kornia.color.rgb_to_hsv(data, eps=eps), expected)
+
+    def test_gradcheck(self, device):
+        B, C, H, W = 2, 3, 4, 4
+        img = torch.rand(B, C, H, W, device=device, dtype=torch.float64, requires_grad=True)
+        assert gradcheck(kornia.color.rgb_to_hsv, (img,), raise_exception=True, fast_mode=True)
+
+    def test_jit(self, device, dtype):
+        B, C, H, W = 2, 3, 4, 4
+        img = torch.rand(B, C, H, W, device=device, dtype=dtype)
+        op = kornia.color.rgb_to_hsv
+        op_jit = torch.jit.script(op)
+        self.assert_close(op(img), op_jit(img))
+
+    def test_module(self, device, dtype):
+        data = torch.tensor([[[1e-4]], [[0.0]], [[0.0]]], device=device, dtype=dtype)
+        ops = kornia.color.RgbToHsv().to(device, dtype)
+        fcn = kornia.color.rgb_to_hsv
+        self.assert_close(ops(data), fcn(data))
+
+    def test_dynamo(self, device, dtype, torch_optimizer):
+        B, C, H, W = 2, 3, 4, 4
+        img = torch.rand(B, C, H, W, device=device, dtype=dtype)
+        op = kornia.color.rgb_to_hsv
+        op_optimized = torch_optimizer(op)
+        self.assert_close(op(img), op_optimized(img))
+
+
+class TestHsvToRgb(BaseTester):
+    @pytest.mark.parametrize("shape", [(1, 3, 4, 4), (2, 3, 2, 4), (3, 3, 4, 1), (3, 2, 1)])
+    def test_cardinality(self, device, dtype, shape):
+        img = torch.ones(shape, device=device, dtype=dtype)
+        assert kornia.color.hsv_to_rgb(img).shape == shape
+
+    def test_exception(self, device, dtype):
+        with pytest.raises(TypeError):
+            assert kornia.color.hsv_to_rgb([0.0])
+
+        img = torch.ones(1, 1, device=device, dtype=dtype)
+        with pytest.raises(ValueError):
+            assert kornia.color.hsv_to_rgb(img)
+
+        img = torch.ones(2, 1, 1, device=device, dtype=dtype)
+        with pytest.raises(ValueError):
+            assert kornia.color.hsv_to_rgb(img)
+
+    def test_unit(self, device, dtype):
+        data = torch.tensor(
+            [
+                [
+                    [
+                        [3.5433271, 5.6390061, 1.3766849, 2.5384088, 4.6848912],
+                        [5.7209363, 5.3262630, 6.2059994, 4.1164689, 2.3872600],
+                        [0.6370091, 3.6186798, 5.9170871, 2.8275447, 5.4289737],
+                        [0.2751994, 1.6632686, 1.0049511, 0.7046204, 1.3791083],
+                        [0.7863123, 4.4852505, 4.3064494, 2.5573561, 5.9083076],
+                    ],
+                    [
+                        [0.5026655, 0.9453601, 0.5929778, 0.2632897, 0.4590443],
+                        [0.6201433, 0.5610679, 0.9653260, 0.0830478, 0.5000827],
+                        [0.6067343, 0.6422323, 0.6777940, 0.7705711, 0.6050767],
+                        [0.5495264, 0.5573426, 0.4683768, 0.2268902, 0.2116482],
+                        [0.6525245, 0.0022379, 0.4909980, 0.1682271, 0.6327152],
+                    ],
+                    [
+                        [0.8471680, 0.9302199, 0.3265766, 0.7944570, 0.7038843],
+                        [0.4833369, 0.2088473, 0.1169234, 0.4966302, 0.6448684],
+                        [0.2713015, 0.5893380, 0.6015301, 0.6801558, 0.2322258],
+                        [0.5704236, 0.6797268, 0.4755683, 0.4811209, 0.5317836],
+                        [0.3236262, 0.0999796, 0.3614958, 0.5117705, 0.8194097],
+                    ],
+                ]
+            ],
+            device=device,
+            dtype=dtype,
+        )
+
+        # OpenCV
+        expected = torch.tensor(
+            [
+                [
+                    [
+                        [0.42132590, 0.93021995, 0.26564622, 0.58528465, 0.53384290],
+                        [0.48333693, 0.20884734, 0.11692339, 0.45538613, 0.32238087],
+                        [0.27130150, 0.21084610, 0.60153013, 0.15604737, 0.23222584],
+                        [0.57042360, 0.45685310, 0.47556830, 0.48112088, 0.49611038],
+                        [0.32362622, 0.09981924, 0.20394461, 0.42567685, 0.81940967],
+                    ],
+                    [
+                        [0.68380290, 0.05082710, 0.32657660, 0.79445700, 0.38077020],
+                        [0.18359877, 0.09166980, 0.00405421, 0.45823452, 0.64486840],
+                        [0.20682439, 0.41690278, 0.19381660, 0.68015575, 0.09171140],
+                        [0.33933756, 0.67972680, 0.46658220, 0.44541004, 0.53178360],
+                        [0.27101707, 0.09975589, 0.18400209, 0.51177055, 0.30095676],
+                    ],
+                    [
+                        [0.84716797, 0.59178180, 0.13292392, 0.67397410, 0.70388430],
+                        [0.34453064, 0.19874583, 0.01237347, 0.49663020, 0.41256943],
+                        [0.10669357, 0.58933800, 0.33635240, 0.52297890, 0.20633064],
+                        [0.25696078, 0.30088606, 0.25282317, 0.37195927, 0.41923255],
+                        [0.11245217, 0.09997964, 0.36149580, 0.46373847, 0.48655340],
+                    ],
+                ]
+            ],
+            device=device,
+            dtype=dtype,
+        )
+
+        f = kornia.color.hsv_to_rgb
+        self.assert_close(f(data), expected)
+
+        data[:, 0] += 2 * math.pi
+        self.assert_close(f(data), expected, low_tolerance=True)
+
+        data[:, 0] -= 4 * math.pi
+        self.assert_close(f(data), expected, low_tolerance=True)
+
+    def test_sextant_boundaries(self, device, dtype):
+        # Pins outputs at exact sextant-boundary hues (h = k*pi/3 for k=0..6, s=0.6, v=0.8) plus
+        # s=0 gray and v=0 black edge cases, so a branchless rewrite of the sextant selection
+        # cannot silently swap a p/q/t/v value in any of the six sextants.
+        # Snippet used to generate expected (current stack+gather implementation):
+        # h = torch.tensor([k * math.pi / 3.0 for k in range(7)], dtype=torch.float64)
+        # s = torch.full((7,), 0.6, dtype=torch.float64)
+        # v = torch.full((7,), 0.8, dtype=torch.float64)
+        # data = torch.stack([h, s, v], dim=1).view(7, 3, 1, 1)
+        # expected = kornia.color.hsv_to_rgb(data)  # <-- print and paste below
+        h = torch.tensor([k * math.pi / 3.0 for k in range(7)], device=device, dtype=dtype)
+        s = torch.full((7,), 0.6, device=device, dtype=dtype)
+        v = torch.full((7,), 0.8, device=device, dtype=dtype)
+        data = torch.stack([h, s, v], dim=1).view(7, 3, 1, 1)
+        expected = torch.tensor(
+            [
+                [0.8, 0.32, 0.32],
+                [0.8, 0.8, 0.32],
+                [0.32, 0.8, 0.32],
+                [0.32, 0.8, 0.8],
+                [0.32, 0.32, 0.8],
+                [0.8, 0.32, 0.8],
+                [0.8, 0.32, 0.32],
+            ],
+            device=device,
+            dtype=dtype,
+        ).view(7, 3, 1, 1)
+        # k=6 (h=2*pi) rounds imprecisely at float16 and can land a hair over the sextant-0
+        # boundary; loosen tolerance rather than special-case the dtype.
+        self.assert_close(kornia.color.hsv_to_rgb(data), expected, low_tolerance=True)
+
+        # Mid-sextant hues (f=0.25): at exact boundaries f=0 collapses q==v and t==p, so a p/t or
+        # q/v swap would go unnoticed there; with f=0.25 all four of p=0.32, q=0.68, t=0.44, v=0.8
+        # are distinct and every sextant's full selection is pinned.
+        # Snippet used to generate expected (current stack+gather implementation):
+        # hm = torch.tensor([(k + 0.25) * math.pi / 3.0 for k in range(6)], dtype=torch.float64)
+        # data_mid = torch.stack([hm, torch.full((6,), 0.6), torch.full((6,), 0.8)], 1).view(6, 3, 1, 1)
+        # expected_mid = kornia.color.hsv_to_rgb(data_mid)  # <-- print and paste below
+        hm = torch.tensor([(k + 0.25) * math.pi / 3.0 for k in range(6)], device=device, dtype=dtype)
+        data_mid = torch.stack([hm, torch.full_like(hm, 0.6), torch.full_like(hm, 0.8)], dim=1).view(6, 3, 1, 1)
+        expected_mid = torch.tensor(
+            [
+                [0.8, 0.44, 0.32],
+                [0.68, 0.8, 0.32],
+                [0.32, 0.8, 0.44],
+                [0.32, 0.68, 0.8],
+                [0.44, 0.32, 0.8],
+                [0.8, 0.32, 0.68],
+            ],
+            device=device,
+            dtype=dtype,
+        ).view(6, 3, 1, 1)
+        self.assert_close(kornia.color.hsv_to_rgb(data_mid), expected_mid, low_tolerance=True)
+
+        # s=0 gray: output must equal v on every channel regardless of hue
+        hg = torch.tensor([0.0, math.pi / 2, math.pi, 3 * math.pi / 2, 2 * math.pi - 0.01], device=device, dtype=dtype)
+        sg = torch.zeros(5, device=device, dtype=dtype)
+        vg = torch.tensor([0.0, 0.25, 0.5, 0.75, 1.0], device=device, dtype=dtype)
+        data_gray = torch.stack([hg, sg, vg], dim=1).view(5, 3, 1, 1)
+        expected_gray = vg.view(5, 1, 1, 1).expand(5, 3, 1, 1)
+        self.assert_close(kornia.color.hsv_to_rgb(data_gray), expected_gray)
+
+        # v=0 black: output must be zero regardless of hue/saturation
+        hk = torch.tensor([0.0, math.pi / 2, math.pi, 3 * math.pi / 2, 2 * math.pi - 0.01], device=device, dtype=dtype)
+        sk = torch.tensor([0.0, 0.3, 0.6, 0.9, 1.0], device=device, dtype=dtype)
+        vk = torch.zeros(5, device=device, dtype=dtype)
+        data_black = torch.stack([hk, sk, vk], dim=1).view(5, 3, 1, 1)
+        expected_black = torch.zeros(5, 3, 1, 1, device=device, dtype=dtype)
+        self.assert_close(kornia.color.hsv_to_rgb(data_black), expected_black)
+
+    def test_gradcheck(self, device):
+        B, C, H, W = 2, 3, 4, 4
+        img = torch.rand(B, C, H, W, device=device, dtype=torch.float64, requires_grad=True)
+        assert gradcheck(kornia.color.hsv_to_rgb, (img,), raise_exception=True, fast_mode=True)
+
+    def test_jit(self, device, dtype):
+        B, C, H, W = 2, 3, 4, 4
+        img = torch.rand(B, C, H, W, device=device, dtype=dtype)
+        op = kornia.color.hsv_to_rgb
+        op_jit = torch.jit.script(op)
+        self.assert_close(op(img), op_jit(img))
+
+    def test_module(self, device, dtype):
+        B, C, H, W = 2, 3, 4, 4
+        img = torch.ones(B, C, H, W, device=device, dtype=dtype)
+        ops = kornia.color.HsvToRgb().to(device, dtype)
+        fcn = kornia.color.hsv_to_rgb
+        self.assert_close(ops(img), fcn(img))
+
+    def test_dynamo(self, device, dtype, torch_optimizer):
+        B, C, H, W = 2, 3, 4, 4
+        img = torch.rand(B, C, H, W, device=device, dtype=dtype)
+        op = kornia.color.hsv_to_rgb
+        op_optimized = torch_optimizer(op)
+        self.assert_close(op(img), op_optimized(img))

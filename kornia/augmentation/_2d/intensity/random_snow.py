@@ -1,0 +1,116 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from typing import Any, Dict, Optional, Tuple
+
+import torch
+
+from kornia.augmentation import random_generator as rg
+from kornia.augmentation._2d.intensity.base import IntensityAugmentationBase2D
+from kornia.color import hls_to_rgb, rgb_to_hls
+from kornia.core.check import KORNIA_CHECK
+from kornia.core.utils import _clamp_unit_range, _to_device_nonblocking
+
+
+class RandomSnow(IntensityAugmentationBase2D):
+    r"""Create an HLS snow effect on selected RGB images.
+
+    ``output = RandomSnow(snow_coefficient, brightness, ...)(input)`` brightens pixels of selected ``(B, 3, H, W)``
+    images according to a sampled snow threshold.
+
+    See the Convention block on :class:`~kornia.augmentation.IntensityAugmentationBase2D`.
+
+    Args:
+        snow_coefficient: A tuple of floats (lower and upper bound) between 0 and 1 that control
+        the amount of snow to add to the image, the larger value corresponds to the more snow.
+        brightness: A tuple of floats (lower and upper bound) of ``1`` or greater that controls the
+        brightness of the snow.
+        same_on_batch: If True, apply the same transformation to each image in a batch. Default: False.
+        p: Probability of applying the transformation. Default: 1.0.
+        keepdim: Keep the output torch.Tensor with the same shape as input. Default: False.
+
+    Shape:
+        - Input: ``(C, H, W)`` or ``(B, C, H, W)``
+        - Output: ``(B, C, H, W)``
+
+    Convention:
+        - input values are clamped into ``[0, 1]`` before the operation, and the result is clamped
+          into the same range. This applies only to samples selected by the probability gate.
+        - the input must have three channels: the effect is computed in HLS, and any other channel count
+          raises on the forward pass.
+        - ``snow_coefficient`` is checked against ``[0, 1]`` at construction, where ``brightness`` must be
+          ``1`` or greater.
+        - a pixel whose lightness is below ``snow_coefficient`` has its lightness scaled by
+          ``brightness``; it becomes white once that lightness reaches ``1``.
+
+    See Also:
+        - :class:`RandomRain`: creates rain streaks rather than an HLS snow effect.
+
+    Examples:
+        >>> inputs = torch.rand(2, 3, 4, 4)
+        >>> snow = kornia.augmentation.RandomSnow(p=1.0, snow_coefficient=(0.1, 0.6), brightness=(1.0, 5.0))
+        >>> output = snow(inputs)
+        >>> output.shape
+        torch.Size([2, 3, 4, 4])
+
+    """
+
+    def __init__(
+        self,
+        snow_coefficient: Tuple[float, float] = (0.5, 0.5),
+        brightness: Tuple[float, float] = (2, 2),
+        same_on_batch: bool = False,
+        p: float = 1.0,
+        keepdim: bool = False,
+    ) -> None:
+        super().__init__(p=p, same_on_batch=same_on_batch, keepdim=keepdim)
+        KORNIA_CHECK(all(0 <= el <= 1 for el in snow_coefficient), "Snow coefficient values must be between 0 and 1.")
+        KORNIA_CHECK(all(1 <= el for el in brightness), "Brightness values must be 1 or greater.")
+
+        self._param_generator = rg.PlainUniformGenerator(
+            (snow_coefficient, "snow_coefficient", 0.5, (0.0, 1.0)), (brightness, "brightness", None, None)
+        )
+
+    def apply_transform(
+        self,
+        input: torch.Tensor,
+        params: Dict[str, torch.Tensor],
+        flags: Dict[str, Any],
+        transform: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        input = _clamp_unit_range(input)
+        KORNIA_CHECK(input.shape[1] == 3, "Number of color channels should be 3.")
+        KORNIA_CHECK(len(input.shape) in (3, 4), "Wrong input dimension.")
+
+        if len(input.shape) == 3:
+            input = input[None, :, :, :]
+        input_HLS = rgb_to_hls(input)
+
+        mask = torch.zeros_like(input_HLS)
+        # Retrieve generated parameters
+        snow_coefficient = _to_device_nonblocking(params["snow_coefficient"], input.device, input.dtype)
+        brightness = _to_device_nonblocking(params["brightness"], input.device, input.dtype)
+        snow_coefficient = snow_coefficient[:, None, None, None]
+        brightness = brightness[:, None, None, None]
+
+        mask[:, 1, :, :] = torch.where(input_HLS[:, 1, :, :] < snow_coefficient[:, 0, :, :], 1, 0)
+
+        # Increase Light channel of the image by given brightness for areas based on snow coefficient.
+        new_light = _clamp_unit_range(input_HLS * mask * brightness)
+        input_HLS = input_HLS * (1 - mask) + new_light
+
+        return _clamp_unit_range(hls_to_rgb(input_HLS))

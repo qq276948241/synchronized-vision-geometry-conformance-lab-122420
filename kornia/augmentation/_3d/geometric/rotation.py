@@ -1,0 +1,158 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from typing import Any, Dict, Optional, Tuple, Union
+
+import torch
+
+import kornia
+from kornia.augmentation import random_generator as rg
+from kornia.augmentation._3d.geometric.base import GeometricAugmentationBase3D
+from kornia.constants import Resample
+from kornia.core.utils import _to_device_nonblocking
+from kornia.geometry import affine3d
+from kornia.geometry.transform.affwarp import _compute_rotation_matrix3d, _compute_tensor_center3d
+
+
+class RandomRotation3D(GeometricAugmentationBase3D):
+    r"""Rotate 3D volumes by a random axis-angle rotation, applied per sample with probability ``p`` (default 0.5).
+
+    ``output = RandomRotation3D(degrees, ...)(input)`` rotates volumes of shape ``(B, C, D, H, W)``.
+
+    Args:
+        degrees: Range of degrees to select from.
+            If degrees is a number, then yaw, pitch, roll will be generated from the range of (-degrees, +degrees).
+            If degrees is a tuple of (min, max), then yaw, pitch, roll will be generated from the range of (min, max).
+            If degrees is a list of floats [a, b, c], then yaw, pitch, roll will be generated from (-a, a), (-b, b)
+            and (-c, c).
+            If degrees is a list of tuple ((a, b), (m, n), (x, y)), then yaw, pitch, roll will be generated from
+            (a, b), (m, n) and (x, y).
+            Set to 0 to deactivate rotations.
+        resample: resample mode from "nearest" (0) or "bilinear" (1).
+        same_on_batch: apply the same transformation across the batch.
+        align_corners: interpolation flag.
+        p: probability of applying the transformation to each sample.
+        keepdim: whether to keep the output shape the same as input (True) or broadcast it
+          to the batch form (False).
+
+    Shape:
+        - Input: ``(C, D, H, W)`` or ``(B, C, D, H, W)``
+        - Output: ``(B, C, D, H, W)``
+
+    Note:
+        Input torch.Tensor must be float and normalized into [0, 1] for the best differentiability support.
+
+    Convention:
+        See :class:`~kornia.augmentation.GeometricAugmentationBase3D` for the shared 3D geometry contract.
+
+        - each sampled ``degrees`` triple ``(yaw, pitch, roll) = (rx, ry, rz)`` is **one axis-angle vector**
+          in degrees and is converted into a single Rodrigues rotation, not composed as per-axis Euler
+          rotations, exactly as :func:`kornia.geometry.transform.rotate3d` does. The rotation axis
+          is ``(rx, ry, rz) / ||(rx, ry, rz)||`` and the angle is ``||(rx, ry, rz)||`` degrees, so a
+          sampled ``(90, 90, 0)`` turns through ``90 * sqrt(2)`` degrees about ``(1, 1, 0) / sqrt(2)``
+          while a sampled ``(30, 0, 0)`` is a 30-degree turn about ``x``. One non-zero component is
+          therefore the per-axis rotation it names; two or more are not, and neither Euler order
+          reproduces the axis-angle result. To rotate about the axes in turn, compose the rotation
+          matrix yourself and convert it with
+          :func:`~kornia.geometry.conversions.rotation_matrix_to_axis_angle`, which returns radians.
+        - A positive roll turns a displayed ``H x W`` slice clockwise, as
+          :func:`kornia.geometry.transform.rotate3d` does; :class:`RandomAffine3D`, the 2D
+          :class:`~kornia.augmentation.RandomRotation` and
+          :func:`kornia.geometry.transform.rotate` turn it counter-clockwise
+          (`#4408 <https://github.com/kornia/kornia/issues/4408>`_).
+        - the default interpolation is bilinear with ``align_corners=False``.
+
+    See Also:
+        - :class:`RandomAffine3D`: samples a combined 3D affine transformation.
+        - :class:`RandomRotation`: rotates 2D images by a sampled angle.
+
+    Examples:
+        >>> import torch
+        >>> rng = torch.manual_seed(0)
+        >>> input = torch.rand(1, 1, 3, 3, 3)
+        >>> aug = RandomRotation3D((15., 20., 20.), p=1.0)
+        >>> aug(input), aug.transform_matrix
+        (tensor([[[[[0.3819, 0.4886, 0.2111],
+                   [0.1196, 0.3833, 0.4722],
+                   [0.3432, 0.5951, 0.4223]],
+        <BLANKLINE>
+                  [[0.5553, 0.4374, 0.2780],
+                   [0.2423, 0.1689, 0.4009],
+                   [0.4516, 0.6376, 0.7327]],
+        <BLANKLINE>
+                  [[0.1605, 0.3112, 0.3673],
+                   [0.4931, 0.4620, 0.5700],
+                   [0.3505, 0.4685, 0.8092]]]]]), tensor([[[ 0.9722,  0.1131, -0.2049,  0.1196],
+                 [-0.0603,  0.9669,  0.2478, -0.1545],
+                 [ 0.2262, -0.2286,  0.9469,  0.0556],
+                 [ 0.0000,  0.0000,  0.0000,  1.0000]]]))
+
+    To apply the exact augmenation again, you may take the advantage of the previous parameter state:
+        >>> input = torch.rand(1, 3, 32, 32, 32)
+        >>> aug = RandomRotation3D((15., 20., 20.), p=1.)
+        >>> (aug(input) == aug(input, params=aug._params)).all()
+        tensor(True)
+
+    """
+
+    def __init__(
+        self,
+        degrees: Union[
+            torch.Tensor,
+            float,
+            Tuple[float, float, float],
+            Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]],
+        ],
+        resample: Union[str, int, Resample] = Resample.BILINEAR.name,
+        same_on_batch: bool = False,
+        align_corners: bool = False,
+        p: float = 0.5,
+        keepdim: bool = False,
+    ) -> None:
+        super().__init__(p=p, same_on_batch=same_on_batch, keepdim=keepdim)
+        self.flags = {"resample": Resample.get(resample), "align_corners": align_corners}
+        self._param_generator = rg.RotationGenerator3D(degrees)
+
+    def compute_transformation(
+        self, input: torch.Tensor, params: Dict[str, torch.Tensor], flags: Dict[str, Any]
+    ) -> torch.Tensor:
+        yaw: torch.Tensor = _to_device_nonblocking(params["yaw"], input.device, input.dtype)
+        pitch: torch.Tensor = _to_device_nonblocking(params["pitch"], input.device, input.dtype)
+        roll: torch.Tensor = _to_device_nonblocking(params["roll"], input.device, input.dtype)
+
+        center: torch.Tensor = _compute_tensor_center3d(input)
+        rotation_mat: torch.Tensor = _compute_rotation_matrix3d(yaw, pitch, roll, center.expand(yaw.shape[0], -1))
+
+        # rotation_mat is B x 3 x 4 and we need a B x 4 x 4 matrix
+        trans_mat: torch.Tensor = kornia.core.ops.eye_like(4, input)
+        trans_mat[:, 0] = rotation_mat[:, 0]
+        trans_mat[:, 1] = rotation_mat[:, 1]
+        trans_mat[:, 2] = rotation_mat[:, 2]
+
+        return trans_mat
+
+    def apply_transform(
+        self,
+        input: torch.Tensor,
+        params: Dict[str, torch.Tensor],
+        flags: Dict[str, Any],
+        transform: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if not isinstance(transform, torch.Tensor):
+            raise TypeError(f"Expected the transform to be a torch.Tensor. Got {type(transform)}")
+
+        return affine3d(input, transform[..., :3, :4], flags["resample"].name.lower(), "zeros", flags["align_corners"])

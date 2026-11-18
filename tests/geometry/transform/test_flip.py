@@ -1,0 +1,224 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+import pytest
+import torch
+
+import kornia
+
+from testing.base import BaseTester
+
+
+class TestVflip(BaseTester):
+    def test_smoke(self):
+        f = kornia.geometry.transform.Vflip()
+        repr = "Vflip"
+        assert str(f) == repr
+
+    def test_vflip(self, device, dtype):
+        f = kornia.geometry.transform.Vflip()
+        input = torch.tensor([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 1.0]], device=device, dtype=dtype)  # 3 x 3
+
+        expected = torch.tensor(
+            [[0.0, 1.0, 1.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]], device=device, dtype=dtype
+        )  # 3 x 3
+
+        self.assert_close(f(input), expected)
+
+    def test_batch_vflip(self, device, dtype):
+        input = torch.tensor([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 1.0]], device=device, dtype=dtype)  # 3 x 3
+
+        input = input.repeat(2, 1, 1)  # 2 x 3 x 3
+
+        f = kornia.geometry.transform.Vflip()
+        expected = torch.tensor(
+            [[[0.0, 1.0, 1.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]], device=device, dtype=dtype
+        )  # 1 x 3 x 3
+
+        expected = expected.repeat(2, 1, 1)  # 2 x 3 x 3
+
+        self.assert_close(f(input), expected)
+
+    def test_jit(self, device, dtype):
+        @torch.jit.script
+        def op_script(data: torch.Tensor) -> torch.Tensor:
+            return kornia.geometry.transform.vflip(data)
+
+        input = torch.tensor([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 1.0]], device=device, dtype=dtype)  # 3 x 3
+
+        # Build jit trace
+        op_trace = torch.jit.trace(op_script, (input,))
+
+        # Create new inputs
+        input = torch.tensor([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [5.0, 5.0, 0.0]], device=device, dtype=dtype)  # 3 x 3
+
+        input = input.repeat(2, 1, 1)  # 2 x 3 x 3
+
+        expected = torch.tensor(
+            [[[5.0, 5.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]], device=device, dtype=dtype
+        )  # 3 x 3
+
+        expected = expected.repeat(2, 1, 1)
+
+        actual = op_trace(input)
+
+        self.assert_close(actual, expected)
+
+    def test_gradcheck(self, device):
+        input = torch.tensor([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 1.0]], device=device, dtype=torch.float64)
+        self.gradcheck(kornia.geometry.transform.Vflip(), (input,))
+
+    @pytest.mark.parametrize("op", ["vflip", "rot180"])
+    def test_convention_rank1_raises(self, op, device, dtype):
+        # vflip and rot180 need dim -2, so they require rank >= 2, unlike hflip
+        # (TestHflip.test_convention_rank1_supported).
+        x = torch.tensor([0.0, 1.0, 2.0, 3.0], device=device, dtype=dtype)
+        with pytest.raises((IndexError, RuntimeError)):
+            getattr(kornia.geometry.transform, op)(x)
+
+
+class TestHflip(BaseTester):
+    def test_smoke(self):
+        f = kornia.geometry.transform.Hflip()
+        repr = "Hflip"
+        assert str(f) == repr
+
+    def test_hflip(self, device, dtype):
+        f = kornia.geometry.transform.Hflip()
+        input = torch.tensor([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 1.0]], device=device, dtype=dtype)  # 3 x 3
+
+        expected = torch.tensor(
+            [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [1.0, 1.0, 0.0]], device=device, dtype=dtype
+        )  # 3 x 3
+
+        self.assert_close(f(input), expected)
+
+    def test_batch_hflip(self, device, dtype):
+        input = torch.tensor(
+            [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 1.0]], device=device, dtype=dtype
+        )  # 1 x 3 x 3
+
+        input = input.repeat(2, 1, 1)  # 2 x 3 x 3
+
+        f = kornia.geometry.transform.Hflip()
+        expected = torch.tensor(
+            [[[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [1.0, 1.0, 0.0]]], device=device, dtype=dtype
+        )  # 3 x 3
+
+        expected = expected.repeat(2, 1, 1)  # 2 x 3 x 3
+
+        self.assert_close(f(input), expected)
+
+    def test_jit(self, device, dtype):
+        @torch.jit.script
+        def op_script(data: torch.Tensor) -> torch.Tensor:
+            return kornia.geometry.transform.hflip(data)
+
+        input = torch.tensor([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 1.0]], device=device, dtype=dtype)  # 3 x 3
+
+        # Build jit trace
+        op_trace = torch.jit.trace(op_script, (input,))
+
+        # Create new inputs
+        input = torch.tensor([[0.0, 0.0, 0.0], [5.0, 5.0, 0.0], [0.0, 0.0, 0.0]], device=device, dtype=dtype)  # 3 x 3
+
+        input = input.repeat(2, 1, 1)  # 2 x 3 x 3
+
+        expected = torch.tensor(
+            [[[0.0, 0.0, 0.0], [0.0, 5.0, 5.0], [0.0, 0.0, 0.0]]], device=device, dtype=dtype
+        )  # 3 x 3
+
+        expected = expected.repeat(2, 1, 1)
+
+        actual = op_trace(input)
+
+        self.assert_close(actual, expected)
+
+    def test_gradcheck(self, device):
+        input = torch.tensor([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 1.0]], device=device, dtype=torch.float64)
+        self.gradcheck(kornia.geometry.transform.Hflip(), (input,))
+
+    def test_convention_rank1_supported(self, device, dtype):
+        # hflip flips dim -1 and accepts a rank-1 tensor, while vflip/rot180 require rank >= 2
+        # (TestVflip.test_convention_rank1_raises). Rank 0 is outside the contract and unpinned.
+        x = torch.tensor([0.0, 1.0, 2.0, 3.0], device=device, dtype=dtype)
+        # Snippet used to generate expected: x.flip(-1) -> tensor([3., 2., 1., 0.])
+        expected = torch.tensor([3.0, 2.0, 1.0, 0.0], device=device, dtype=dtype)
+        self.assert_close(kornia.geometry.transform.hflip(x), expected)
+
+
+class TestRot180(BaseTester):
+    def test_smoke(self):
+        f = kornia.geometry.transform.Rot180()
+        repr = "Rot180"
+        assert str(f) == repr
+
+    def test_rot180(self, device, dtype):
+        f = kornia.geometry.transform.Rot180()
+        input = torch.tensor([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 1.0]], device=device, dtype=dtype)  # 3 x 3
+
+        expected = torch.tensor(
+            [[1.0, 1.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]], device=device, dtype=dtype
+        )  # 3 x 3
+
+        self.assert_close(f(input), expected)
+
+    def test_batch_rot180(self, device, dtype):
+        input = torch.tensor([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 1.0]], device=device, dtype=dtype)  # 3 x 3
+
+        input = input.repeat(2, 1, 1)  # 2 x 3 x 3
+
+        f = kornia.geometry.transform.Rot180()
+        expected = torch.tensor(
+            [[1.0, 1.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]], device=device, dtype=dtype
+        )  # 1 x 3 x 3
+
+        expected = expected.repeat(2, 1, 1)  # 2 x 3 x 3
+
+        self.assert_close(f(input), expected)
+
+    def test_jit(self, device, dtype):
+        @torch.jit.script
+        def op_script(data: torch.Tensor) -> torch.Tensor:
+            return kornia.geometry.transform.rot180(data)
+
+        input = torch.tensor([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 1.0]], device=device, dtype=dtype)  # 3 x 3
+
+        # Build jit trace
+        op_trace = torch.jit.trace(op_script, (input,))
+
+        # Create new inputs
+        input = torch.tensor([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [5.0, 5.0, 0.0]], device=device, dtype=dtype)  # 3 x 3
+
+        input = input.repeat(2, 1, 1)  # 2 x 3 x 3
+
+        expected = torch.tensor(
+            [[[0.0, 5.0, 5.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]], device=device, dtype=dtype
+        )  # 3 x 3
+
+        expected = expected.repeat(2, 1, 1)
+
+        actual = op_trace(input)
+
+        self.assert_close(actual, expected)
+
+    def test_gradcheck(self, device):
+        input = torch.tensor(
+            [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 1.0]], device=device, dtype=torch.float64
+        )  # 3 x 3
+
+        self.gradcheck(kornia.geometry.transform.Rot180(), (input,))

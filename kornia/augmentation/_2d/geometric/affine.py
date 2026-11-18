@@ -1,0 +1,203 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+import math
+from typing import Any, Dict, Optional, Tuple, Union
+
+import torch
+
+from kornia.augmentation import random_generator as rg
+from kornia.augmentation._2d.geometric.base import GeometricAugmentationBase2D
+from kornia.constants import Resample, SamplePadding
+from kornia.core.utils import _as_tensor_nonblocking
+from kornia.geometry.transform import get_affine_matrix2d, warp_affine
+
+
+class RandomAffine(GeometricAugmentationBase2D):
+    r"""Warp images by a random 2D affine transformation, applied per sample with probability ``p`` (default 0.5).
+
+    ``output = RandomAffine(degrees, ...)(input)`` warps each image of shape ``(B, C, H, W)`` with one sampled
+    affine transform about its center.
+
+    .. image:: _static/img/RandomAffine.png
+
+    .. note::
+        Unlike torchvision's ``RandomAffine``, which transforms every image, this class transforms each sample with
+        probability ``p``, 0.5 by default; with ``same_on_batch=True`` one draw decides for the whole batch. Pass
+        ``p=1.0`` to transform every sample.
+
+    Args:
+        degrees: Range of degrees to select from.
+            If degrees is a number instead of sequence like (min, max), the range of degrees
+            will be (-degrees, +degrees). Set to 0 to deactivate rotations.
+        translate: tuple of maximum absolute fraction for horizontal
+            and vertical translations. For example translate=(a, b), then horizontal shift
+            is randomly sampled in the range -img_width * a < dx < img_width * a and vertical shift is
+            randomly sampled in the range -img_height * b < dy < img_height * b. Will not translate by default.
+        scale: scaling factor interval.
+            If (a, b) represents isotropic scaling, the scale is randomly sampled from the range a <= scale <= b.
+            If (a, b, c, d), the scale is randomly sampled from the range a <= scale_x <= b, c <= scale_y <= d.
+            Will keep original scale by default.
+        shear: Range of degrees to select from.
+            If float, a shear parallel to the x axis in the range (-shear, +shear) will be applied.
+            If (a, b), a shear parallel to the x axis in the range (a, b) will be applied.
+            If (a, b, c, d), then x-axis shear in (shear[0], shear[1]) and y-axis shear in (shear[2], shear[3])
+            will be applied. Will not apply shear by default.
+        resample: resample mode from "nearest" (0) or "bilinear" (1).
+        padding_mode: padding mode from "torch.zeros" (0), "border" (1), "reflection" (2) or "fill" (3).
+        fill_value: the value to be filled in the padding area when padding_mode="fill".
+            Can be a float, int, or a torch.Tensor of shape (C) or (1).
+        same_on_batch: apply the same transformation across the batch.
+        align_corners: interpolation flag.
+        p: probability of applying the transformation to each sample.
+        keepdim: whether to keep the output shape the same as input (True) or broadcast it to the batch form (False).
+
+    Shape:
+        - Input: ``(C, H, W)`` or ``(B, C, H, W)``, Optional: ``(B, 3, 3)``
+        - Output: ``(B, C, H, W)``
+
+    Convention:
+        - See :class:`~kornia.augmentation.GeometricAugmentationBase2D` for coordinates, defaults and inverse.
+        - ``translate=(a, b)`` samples pixel offsets from ``[-a W, a W]`` and ``[-b H, b H]``; positive offsets
+          move content right and down.
+        - a positive ``degrees`` rotates the displayed image clockwise, unlike :class:`RandomRotation`
+          (:doc:`/get-started/conventions`, `#4408 <https://github.com/kornia/kornia/issues/4408>`_).
+        - ``shear`` draws degrees, converted to radians and applied about the image center with the sign and the
+          x-then-y order of :func:`~kornia.geometry.transform.get_shear_matrix2d`, as
+          :class:`~kornia.geometry.transform.Affine` applies its ``shear``.
+        - in :class:`~kornia.augmentation.container.AugmentationSequential`, a ``fill_value`` with more than one
+          element pads only the image: masks are padded with zero, forward and inverse, unless
+          ``extra_args[DataKey.MASK]`` sets their ``fill_value``; a one-element ``fill_value`` applies to both.
+
+    .. note::
+        This function internally uses :func:`kornia.geometry.transform.warp_affine`.
+
+    See Also:
+        - :class:`RandomRotation`: samples rotation without translation, scaling or shear.
+        - :class:`RandomPerspective`: samples a projective four-corner warp.
+        - :class:`RandomAffine3D`: applies the corresponding sampled transform to volumes.
+
+    Examples:
+        >>> import torch
+        >>> rng = torch.manual_seed(0)
+        >>> input = torch.rand(1, 1, 3, 3)
+        >>> aug = RandomAffine((-15., 20.), p=1.)
+        >>> out = aug(input)
+        >>> out, aug.transform_matrix
+        (tensor([[[[0.3961, 0.7310, 0.1574],
+                  [0.1781, 0.3074, 0.5648],
+                  [0.4804, 0.8379, 0.4234]]]]), tensor([[[ 0.9923, -0.1241,  0.1319],
+                 [ 0.1241,  0.9923, -0.1164],
+                 [ 0.0000,  0.0000,  1.0000]]]))
+        >>> aug.inverse(out)
+        tensor([[[[0.3890, 0.6573, 0.1865],
+                  [0.2063, 0.3074, 0.5459],
+                  [0.3892, 0.7896, 0.4224]]]])
+        >>> input
+        tensor([[[[0.4963, 0.7682, 0.0885],
+                  [0.1320, 0.3074, 0.6341],
+                  [0.4901, 0.8964, 0.4556]]]])
+
+    To apply the exact augmenation again, you may take the advantage of the previous parameter state:
+        >>> input = torch.randn(1, 3, 32, 32)
+        >>> aug = RandomAffine((-15., 20.), p=1.)
+        >>> (aug(input) == aug(input, params=aug._params)).all()
+        tensor(True)
+
+    """
+
+    def __init__(
+        self,
+        degrees: Union[torch.Tensor, float, Tuple[float, float]],
+        translate: Optional[Union[torch.Tensor, Tuple[float, float]]] = None,
+        scale: Optional[Union[torch.Tensor, Tuple[float, float], Tuple[float, float, float, float]]] = None,
+        shear: Optional[Union[torch.Tensor, float, Tuple[float, float]]] = None,
+        resample: Union[str, int, Resample] = Resample.BILINEAR.name,
+        same_on_batch: bool = False,
+        align_corners: bool = False,
+        padding_mode: Union[str, int, SamplePadding] = SamplePadding.ZEROS.name,
+        fill_value: Optional[Union[float, int, torch.Tensor]] = None,  # Updated type hint
+        p: float = 0.5,
+        keepdim: bool = False,
+    ) -> None:
+        super().__init__(p=p, same_on_batch=same_on_batch, keepdim=keepdim)
+        self._param_generator: rg.AffineGenerator = rg.AffineGenerator(degrees, translate, scale, shear)
+
+        if fill_value is not None and not isinstance(fill_value, torch.Tensor):
+            fill_value = torch.as_tensor(fill_value)
+
+        self.flags = {
+            "resample": Resample.get(resample),
+            "padding_mode": SamplePadding.get(padding_mode),
+            "align_corners": align_corners,
+            "fill_value": fill_value,
+        }
+
+    def compute_transformation(
+        self, input: torch.Tensor, params: Dict[str, torch.Tensor], flags: Dict[str, Any]
+    ) -> torch.Tensor:
+        # ``torch.deg2rad`` lowers as ``aten::deg2rad`` which the legacy ONNX exporter
+        # does not support at opset 20. Multiply by ``pi/180`` explicitly same value,
+        # but only basic arithmetic ops in the trace.
+        deg2rad_factor: float = math.pi / 180.0
+        shear_x = _as_tensor_nonblocking(params["shear_x"], input.device, input.dtype) * deg2rad_factor
+        shear_y = _as_tensor_nonblocking(params["shear_y"], input.device, input.dtype) * deg2rad_factor
+        return get_affine_matrix2d(
+            _as_tensor_nonblocking(params["translations"], input.device, input.dtype),
+            _as_tensor_nonblocking(params["center"], input.device, input.dtype),
+            _as_tensor_nonblocking(params["scale"], input.device, input.dtype),
+            _as_tensor_nonblocking(params["angle"], input.device, input.dtype),
+            shear_x,
+            shear_y,
+        )
+
+    def apply_transform(
+        self,
+        input: torch.Tensor,
+        params: Dict[str, torch.Tensor],
+        flags: Dict[str, Any],
+        transform: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        _, _, height, width = input.shape
+        if not isinstance(transform, torch.Tensor):
+            raise TypeError(f"Expected the `transform` be a torch.Tensor. Got {type(transform)}.")
+
+        return warp_affine(
+            input,
+            transform[:, :2, :],
+            (height, width),
+            flags["resample"].name.lower(),
+            align_corners=flags["align_corners"],
+            padding_mode=flags["padding_mode"].name.lower(),
+            fill_value=flags["fill_value"],  # <--- PASS IT DOWN
+        )
+
+    def inverse_transform(
+        self,
+        input: torch.Tensor,
+        flags: Dict[str, Any],
+        transform: Optional[torch.Tensor] = None,
+        size: Optional[Tuple[int, int]] = None,
+    ) -> torch.Tensor:
+        if not isinstance(transform, torch.Tensor):
+            raise TypeError(f"Expected the `transform` be a torch.Tensor. Got {type(transform)}.")
+        return self.apply_transform(
+            input,
+            params=self._params,
+            transform=torch.as_tensor(transform, device=input.device, dtype=input.dtype),
+            flags=flags,
+        )

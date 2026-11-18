@@ -1,0 +1,284 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar, Union
+
+import torch
+from torch import nn
+
+from kornia.augmentation.base import _AugmentationBase
+from kornia.core.utils import _to_device_nonblocking
+
+T = TypeVar("T", bound="OperationBase")
+
+
+def _identity(x: torch.Tensor) -> torch.Tensor:
+    return x
+
+
+class _RandomSign:
+    """Multiply the magnitude mapping by a random sign per row; a class rather than a closure, so wrappers pickle."""
+
+    def __init__(self, fn: Callable[[torch.Tensor], torch.Tensor]) -> None:
+        self.fn = fn
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        # a sign, not a mask: multiplying by the bool would zero half the
+        # magnitudes instead of negating them
+        sign = torch.where(torch.rand((x.shape[0],), device=x.device) > 0.5, 1.0, -1.0)
+        return self.fn(x) * sign.to(x.dtype)
+
+
+class OperationBase(nn.Module):
+    """Wrap one augmentation module for use in an automatic augmentation policy.
+
+    ``output = OperationBase(op)(input)`` applies a wrapped shape-preserving augmentation to floating
+    images of shape ``(B, C, H, W)``. To control a magnitude, pass a list such as
+    ``initial_magnitude=[("brightness_factor", 0.5)]`` for a brightness operation. Use
+    :class:`~kornia.augmentation.auto.PolicySequential` to compose operations into a policy.
+
+    Args:
+        operation: Kornia augmentation module.
+        initial_magnitude: targeted magnitude parameter name and its initial magnitude value.
+            The magnitude parameter name shall align with the attribute inside the random_generator
+            in each augmentation. If None, the augmentation will be randomly applied according to
+            the augmentation sampling range.
+        temperature: retained for API compatibility.
+        is_batch_operation: initialize the legacy ``probability`` from ``p_batch`` instead of ``p``; sampling still
+            uses the wrapped gates.
+
+    Convention:
+        - ``probability`` is initialized from the wrapped augmentation's ``p`` (``p_batch`` for a batch operation),
+          clamped to ``[1e-7, 1 - 1e-7]`` and kept in ``state_dict()`` for checkpoint compatibility, but it takes
+          no part in sampling and receives no gradient: the gate is drawn from the wrapped augmentation's own
+          ``p`` and ``p_batch`` as a hard ``0`` or ``1``. ``magnitude``, where the operation has one, is clamped to
+          the wrapped generator's range and receives a gradient where the wrapped augmentation is differentiable
+          in it; ``forward_parameters`` substitutes it into the wrapped augmentation's draw. The substituted factor
+          is on the device of the magnitude, while the other parameters stay where the generator returns them.
+        - ``forward`` linearly blends the wrapped output with the input using ``batch_prob``. The wrapped
+          augmentation transforms every row whose gate is above ``0``, so the same supplied fractional
+          ``batch_prob`` produces the same soft blend whatever the wrapped ``p`` or ``p_batch``. Below ``p = 1`` the
+          wrapped augmentation skips a row with gate ``0``, so that row's matrix stays the identity.
+          Consequently, a wrapped operation that changes spatial dimensions cannot be used, even when
+          ``is_batch_operation=True``.
+        - ``magnitude_range`` is read-only and reads the wrapped generator on each access. A range that is an
+          ``nn.Parameter`` belongs to the generator, so ``state_dict()`` and ``named_parameters()`` have no
+          ``magnitude_range`` entry for it; a checkpoint or pickle that still has the former entry loads.
+        - a symmetric magnitude applies the magnitude mapping first and then a random sign per row, so a mapping
+          that quantizes to zero stays zero (``Posterize`` maps ``0.5`` to ``0`` bits with ``magnitude_range=(0, 8)``).
+        - the concrete classes in ``kornia.augmentation.auto.operations.ops`` wrap public 2D augmentations and
+          inherit their input, dtype, RNG and replay contracts. A wrapper pickles, with either sign setting, when
+          its magnitude mapping is picklable.
+
+    See Also:
+        - :class:`~kornia.augmentation.auto.PolicySequential`: runs the operations of a policy in order.
+        - :class:`~kornia.augmentation.auto.operations.ops.Rotate`: is a concrete geometric policy operation.
+
+    """
+
+    def __init__(
+        self,
+        operation: _AugmentationBase,
+        initial_magnitude: Optional[List[Tuple[str, Optional[float]]]] = None,
+        temperature: float = 0.1,
+        is_batch_operation: bool = False,
+        magnitude_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+        symmetric_megnitude: bool = False,
+    ) -> None:
+        super().__init__()
+        if not isinstance(operation, _AugmentationBase):
+            raise ValueError(f"Only Kornia augmentations supported. Got {operation}.")
+
+        self.op = operation
+
+        self._init_magnitude(initial_magnitude)
+
+        # Keep the legacy probability state for API and checkpoint compatibility.
+        self.probability_range = (1e-7, 1 - 1e-7)
+        self._is_batch_operation = is_batch_operation
+        if is_batch_operation:
+            self._probability = nn.Parameter(torch.empty(1).fill_(self.op.p_batch))
+        else:
+            self._probability = nn.Parameter(torch.empty(1).fill_(self.op.p))
+
+        if temperature < 0:
+            raise ValueError(f"Expect temperature value greater than 0. Got {temperature}.")
+        self.register_buffer("temperature", torch.empty(1).fill_(temperature))
+
+        self.symmetric_megnitude = symmetric_megnitude
+        self._magnitude_fn = self._init_magnitude_fn(magnitude_fn)
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        super().__setstate__(state)
+        # A module pickled when ``magnitude_range`` was an attribute brings it back, and ``_parameters`` would go on
+        # demanding the key below from every later load. The property reads the generator's range, which is the same one
+        # unless the attribute was assigned; an assigned range is dropped.
+        self._parameters.pop("magnitude_range", None)
+        self.__dict__.pop("magnitude_range", None)
+
+    def _load_from_state_dict(self, state_dict: Dict[str, Any], prefix: str, *args: Any, **kwargs: Any) -> None:
+        # ``magnitude_range`` was an attribute, so ``nn.Module`` registered a parameter range under that name as well.
+        # Checkpoints from then hold the same values under the generator's own key, unless a parameter was assigned to
+        # the attribute. The generator's key is the one that loads.
+        state_dict.pop(f"{prefix}magnitude_range", None)
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
+    def _init_magnitude_fn(
+        self, magnitude_fn: Optional[Callable[[torch.Tensor], torch.Tensor]]
+    ) -> Callable[[torch.Tensor], torch.Tensor]:
+        if magnitude_fn is None:
+            magnitude_fn = _identity
+
+        if self.symmetric_megnitude:
+            return _RandomSign(magnitude_fn)
+
+        return magnitude_fn
+
+    def _init_magnitude(self, initial_magnitude: Optional[List[Tuple[str, Optional[float]]]]) -> None:
+        if isinstance(initial_magnitude, (list, tuple)):
+            if not all(isinstance(ini_mag, (list, tuple)) and len(ini_mag) == 2 for ini_mag in initial_magnitude):
+                raise ValueError(f"`initial_magnitude` shall be a list of 2-element tuples. Got {initial_magnitude}")
+            if len(initial_magnitude) != 1:
+                raise NotImplementedError("Multi magnitudes operations are not yet supported.")
+
+        if initial_magnitude is None:
+            self._factor_name = None
+            self._magnitude = None
+        else:
+            self._factor_name = initial_magnitude[0][0]
+            if self.op._param_generator is None:
+                raise ValueError(f"No valid magnitude `{self._factor_name}` found in `{self.op._param_generator}`.")
+            # Reject a name the generator does not have now, rather than at the first call of ``magnitude_range``.
+            getattr(self.op._param_generator, self._factor_name)
+
+            self._magnitude = None
+            if initial_magnitude[0][1] is not None:
+                self._magnitude = nn.Parameter(torch.empty(1).fill_(initial_magnitude[0][1]))
+
+    def forward_parameters(
+        self, batch_shape: torch.Size, mag: Optional[torch.Tensor] = None
+    ) -> Dict[str, torch.Tensor]:
+        """Sample parameters for the wrapped augmentation op.
+
+        Args:
+            batch_shape: Input batch shape used for sampling.
+            mag: Optional magnitude override. When set, it replaces the sampled
+                factor before the magnitude mapping function is applied.
+
+        Returns:
+            Parameter dictionary consumed by :meth:`forward`.
+        """
+        if mag is None:
+            mag = self.magnitude
+
+        params = self.op.forward_parameters(batch_shape)
+
+        if mag is not None:
+            if self._factor_name is None:
+                raise RuntimeError("No factor found in the params while `mag` is provided.")
+            # The generator returns its draw on its own device (the CPU by default, even after ``.to()``), so build the
+            # replacement on the device of ``mag``: this copies nothing and waits for nothing.
+            draw = params[self._factor_name]
+            device = mag.device if isinstance(mag, torch.Tensor) else draw.device
+            params[self._factor_name] = torch.zeros_like(draw, device=device) + mag
+
+        if self._factor_name is not None:
+            params[self._factor_name] = self._magnitude_fn(params[self._factor_name])
+
+        return params
+
+    def forward(self, input: torch.Tensor, params: Optional[Dict[str, torch.Tensor]] = None) -> torch.Tensor:
+        """Apply the operation with soft probabilistic blending.
+
+        Args:
+            input: Input tensor.
+            params: Optional precomputed parameters. If omitted, parameters are
+                sampled from ``input.shape``.
+
+        Returns:
+            Tensor blended with the wrapped augmentation's output according to
+            ``batch_prob``.
+        """
+        if params is None:
+            params = self.forward_parameters(input.shape)
+
+        batch_prob = _to_device_nonblocking(
+            params["batch_prob"][(...,) + ((None,) * (len(input.shape) - 1))], input.device, input.dtype
+        )
+
+        # The wrapped augmentation transforms every row the blend gives a weight, so a fractional gate is not
+        # gated again by its ``p``. A row of weight 0 stays untouched, so its matrix, annotations and cost do not
+        # change for the hard 0/1 gates that sampling draws.
+        wrapped_params = params.copy()
+        wrapped_params["batch_prob"] = (params["batch_prob"] > 0).to(params["batch_prob"].dtype)
+
+        return batch_prob * self.op(input, params=wrapped_params) + (1 - batch_prob) * input
+
+    @property
+    def transform_matrix(self) -> Optional[torch.Tensor]:
+        """Return the latest transform matrix from the wrapped op, if available.
+
+        Returns:
+            Transform matrix tensor or ``None`` for non-geometric operations.
+        """
+        if hasattr(self.op, "transform_matrix"):
+            return self.op.transform_matrix
+        return None
+
+    @property
+    def magnitude_range(self) -> Optional[Union[torch.Tensor, Tuple[float, float]]]:
+        """Return the wrapped generator's range for the magnitude, as it holds it at this moment.
+
+        It is read on every access rather than stored: ``.to()`` replaces the tensors of the generator, so a reference
+        kept here would go on pointing at the tensor from before the move.
+
+        Returns:
+            A tensor of shape ``(2,)`` on the device the generator keeps it on, or the ``(low, high)`` pair of a
+            generator that keeps the constructor's numbers. ``None`` when this operation has no magnitude.
+        """
+        if self._factor_name is None:
+            return None
+        return getattr(self.op._param_generator, self._factor_name)
+
+    @property
+    def magnitude(self) -> Optional[torch.Tensor]:
+        """Return the learned magnitude value for the operation.
+
+        Returns:
+            Magnitude tensor, clamped to ``magnitude_range`` when defined; otherwise
+            the raw learnable value. Returns ``None`` when this operation has no
+            magnitude parameter.
+        """
+        if self._magnitude is None:
+            return None
+        mag = self._magnitude
+        bounds = self.magnitude_range
+        if bounds is None:
+            return mag
+        # ``set_rng_device_and_dtype`` can move a range without moving this parameter.
+        if isinstance(bounds, torch.Tensor):
+            bounds = _to_device_nonblocking(bounds, mag.device)
+        return mag.clamp(*bounds)
+
+    @property
+    def probability(self) -> torch.Tensor:
+        """Return the operation probability after applying configured bounds.
+
+        Returns:
+            Probability tensor clamped to ``probability_range``.
+        """
+        return self._probability.clamp(*self.probability_range)

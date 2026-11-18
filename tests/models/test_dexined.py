@@ -1,0 +1,160 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+import pickle
+
+import pytest
+import torch
+
+from kornia.models.dexined import DexiNed
+
+from testing.base import BaseTester
+from testing.pickle_payload import CreatesMarkerOnLoad, load_without_running_payload
+
+
+class TestDexiNed(BaseTester):
+    def test_smoke(self, device, dtype):
+        img = torch.rand(2, 3, 32, 32, device=device, dtype=dtype)
+        net = DexiNed(pretrained=False).to(device, dtype)
+        feat = net.get_features(img)
+        assert len(feat) == 6
+        out = net(img)
+        assert out.shape == (2, 1, 32, 32)
+
+    @pytest.mark.slow
+    @pytest.mark.parametrize("data", ["dexined"], indirect=True)
+    def test_inference(self, device, dtype, data):
+        model = DexiNed(pretrained=False)
+        model.load_state_dict(data, strict=True)
+        model = model.to(device, dtype)
+        model.eval()
+
+        img = torch.tensor([[[[0.0, 255.0, 0.0], [0.0, 255.0, 0.0], [0.0, 255.0, 0.0]]]], device=device, dtype=dtype)
+        img = img.repeat(1, 3, 1, 1)
+
+        expect = torch.tensor(
+            [[[[-0.3709, 0.0519, -0.2839], [0.0627, 0.6587, -0.1276], [-0.1840, -0.3917, -0.8240]]]],
+            device=device,
+            dtype=dtype,
+        )
+
+        out = model(img)
+        self.assert_close(out, expect, atol=1e-3, rtol=1e-2)
+
+    def test_backward(self, device, dtype):
+        net = DexiNed(pretrained=False).to(device, dtype)
+        # The in-place error does not depend on the size. At 24x36 the smallest training-mode BatchNorm maps are 2x3.
+        # 16x24 reaches 1x2, where BatchNorm normalises two values and the float16 input gradient overflows for some
+        # seeds; 8x12 reaches 1x1, which raises.
+        img = torch.rand(1, 3, 24, 36, device=device, dtype=dtype, requires_grad=True)
+        net(img).sum().backward()
+        assert img.grad is not None
+        assert torch.isfinite(img.grad).all()
+
+        # Evaluation mode with frozen weights: the gradient with respect to the input only.
+        net.eval().requires_grad_(False)
+        img = torch.rand(1, 3, 24, 36, device=device, dtype=dtype, requires_grad=True)
+        net(img).sum().backward()
+        assert img.grad is not None
+        assert torch.isfinite(img.grad).all()
+
+    @pytest.mark.slow
+    def test_gradcheck(self, device):
+        # A full gradcheck: fast mode checks one random projection of the Jacobian and passes a dense layer whose input
+        # is detached from the graph. 8x12 keeps it to about 16 s; in evaluation mode BatchNorm accepts the
+        # 1x1 deepest maps.
+        net = DexiNed(pretrained=False).to(device, torch.float64).eval()
+        img = torch.rand(1, 3, 8, 12, device=device, dtype=torch.float64)
+        self.gradcheck(net, (img,), fast_mode=False)
+
+    def test_a_model_pickled_from_the_filters_path_loads(self):
+        import pickle
+
+        # A whole model pickled from the old module names its classes there, the private blocks included: pickling
+        # every class under that module name and loading it back resolves each name in kornia.filters.dexined.
+        model = DexiNed(pretrained=False).eval()
+        classes = {type(m) for m in model.modules() if type(m).__module__ == "kornia.models.dexined"}
+        assert {cls.__name__ for cls in classes} >= {"DexiNed", "_DenseBlock", "_DenseLayer"}
+        for cls in classes:
+            # Protocol 0 writes the module name as a text line, so it can be rewritten in place.
+            pickled = pickle.dumps(cls, protocol=0).replace(b"kornia.models.dexined", b"kornia.filters.dexined")
+            assert pickle.loads(pickled) is cls  # noqa: S301
+
+
+class TestDexiNedLoadFromFile:
+    """``load_from_file`` reads a local file itself; the hub cache is keyed by base name (#5477)."""
+
+    @staticmethod
+    def _hub_with_a_cached_decoy(tmp_path, monkeypatch, name):
+        hub = tmp_path / "hub"
+        monkeypatch.setattr(torch.hub, "get_dir", lambda: str(hub))
+        (hub / "checkpoints").mkdir(parents=True)
+        torch.save({"w": torch.zeros(3)}, hub / "checkpoints" / name)
+
+    @staticmethod
+    def _record_load_state_dict(model, monkeypatch):
+        loaded = []
+        monkeypatch.setattr(
+            model, "load_state_dict", lambda state_dict, strict=True: loaded.append((state_dict, strict))
+        )
+        return loaded
+
+    @pytest.mark.parametrize("spelling", ["absolute", "home"])
+    def test_a_local_file_is_loaded_even_when_the_cache_holds_its_name(self, spelling, tmp_path, monkeypatch):
+        self._hub_with_a_cached_decoy(tmp_path, monkeypatch, "dexined.pth")
+        local = tmp_path / "weights" / "dexined.pth"
+        local.parent.mkdir()
+        torch.save({"w": torch.ones(3)}, local)
+        if spelling == "home":
+            monkeypatch.setenv("HOME", str(tmp_path))
+            monkeypatch.setenv("USERPROFILE", str(tmp_path))
+            path_file = "~/weights/dexined.pth"
+        else:
+            path_file = str(local)
+        model = DexiNed(pretrained=False).train()
+        loaded = self._record_load_state_dict(model, monkeypatch)
+
+        model.load_from_file(path_file)
+
+        assert len(loaded) == 1
+        state_dict, strict = loaded[0]
+        assert strict is True
+        assert torch.equal(state_dict["w"], torch.ones(3))
+        assert not model.training
+
+    def test_a_string_that_names_no_file_is_still_treated_as_a_url(self, tmp_path, monkeypatch):
+        self._hub_with_a_cached_decoy(tmp_path, monkeypatch, "dexined.pth")
+        model = DexiNed(pretrained=False)
+        loaded = self._record_load_state_dict(model, monkeypatch)
+
+        with pytest.raises(ValueError, match="scheme"):
+            model.load_from_file(str(tmp_path / "missing" / "dexined.pth"))
+
+        assert loaded == []
+
+    def test_a_pickled_callable_in_a_local_file_is_refused_and_never_run(self, tmp_path, monkeypatch):
+        # The local branch loads with ``weights_only=True``, as the hub branch does.
+        marker = tmp_path / "marker"
+        path = tmp_path / "dexined.pth"
+        torch.save({"w": torch.ones(3), "extra": CreatesMarkerOnLoad(marker)}, path)
+        model = DexiNed(pretrained=False)
+        loaded = self._record_load_state_dict(model, monkeypatch)
+
+        with pytest.raises(pickle.UnpicklingError):
+            load_without_running_payload(marker, lambda: model.load_from_file(str(path)))
+
+        assert loaded == []

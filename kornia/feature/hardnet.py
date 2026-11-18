@@ -1,0 +1,287 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from typing import Dict
+
+import torch
+from torch import nn
+
+from kornia.core.check import KORNIA_CHECK_SHAPE
+from kornia.core.download import hf_url, load_state_dict_from_url
+from kornia.core.utils import _is_tracing_or_exporting, _l2_normalize, is_mps_tensor_safe
+from kornia.feature._layout import _patch_conv_layout
+
+urls: Dict[str, str | list[str]] = {}
+urls["hardnet++"] = [
+    hf_url("hardnet", "HardNetPP.pth"),
+    "https://github.com/DagnyT/hardnet/raw/master/pretrained/pretrained_all_datasets/HardNet++.pth",
+]
+urls["liberty_aug"] = [
+    hf_url("hardnet", "checkpoint_liberty_with_aug.pth"),
+    "https://github.com/DagnyT/hardnet/raw/master/pretrained/train_liberty_with_aug/checkpoint_liberty_with_aug.pth",
+]
+urls["hardnet8v2"] = [
+    hf_url("hardnet", "hardnet8v2.pt"),
+    "https://cmp.felk.cvut.cz/~mishkdmy/hardnet8v2.pt",
+]
+
+
+class HardNet(nn.Module):
+    r"""Describe 32 x 32 grayscale patches with the learned 128-D HardNet CNN.
+
+    ``hardnet = HardNet()`` builds the network with its pretrained weights, in eval mode, and
+    ``descs = hardnet(patches)`` takes grayscale patches ``(B, 1, 32, 32)`` and returns unit-norm descriptors
+    ``(B, 128)``. Each patch is standardised first, so its intensity range does not matter. To describe LAFs on an
+    image, use :class:`LAFDescriptor`, which holds a pretrained HardNet by default; the HardNet local features such as
+    :class:`DoGHardNet` and :class:`KeyNetHardNet` use it that way. :class:`HardNet8` is the wider follow-up network,
+    with the same patches and output size. This is based on the original code from paper "Working hard to know your
+    neighbor's margins: Local descriptor learning loss". See :cite:`HardNet2017` for more details.
+
+    Convention:
+        - Patches are ``(B, 1, 32, 32)``, one grayscale channel, and another shape raises; ``patch_size`` is a class
+          attribute. :func:`~kornia.feature.get_laf_descriptors` extracts such patches from LAFs at its default
+          ``patch_size``, sampled as :func:`~kornia.feature.extract_patches_from_pyramid` describes
+          (see :ref:`Local features <local-features-conventions>`).
+          :class:`~kornia.feature.HardNet8`, :class:`~kornia.feature.SOSNet`, :class:`~kornia.feature.TFeat` and
+          :class:`~kornia.feature.HyNet` take the same patches.
+        - The intensity range does not matter: HardNet and HardNet8 standardise each patch to zero mean and unit
+          standard deviation, and SOSNet and TFeat start with an ``InstanceNorm2d``, so :math:`a x + b` with
+          :math:`a > 0` gives the same descriptor unless it leaves the patch nearly flat. That InstanceNorm adds
+          ``1e-5`` to the variance, so for SOSNet and TFeat a low-contrast patch in ``[0, 1]`` can already give a
+          different descriptor than the same patch in ``[0, 255]``. HyNet is invariant to a scale only; see its
+          Convention block.
+        - The descriptors have unit L2 norm, except TFeat's (see its Convention block); with ``pretrained=False``
+          and ``.eval()`` (the initial BatchNorm statistics), HardNet and HardNet8 map a flat patch to an all-zero
+          descriptor.
+        - ``pretrained=True``, the default, downloads the trained weights (Liberty with augmentation for HardNet,
+          ``hardnet8v2`` for HardNet8) and returns the model in evaluation mode. ``pretrained=False`` gives random
+          weights in training mode; call ``.eval()`` before inference.
+
+    Args:
+        pretrained: Download and set pretrained weights to the model.
+
+    Returns:
+        torch.Tensor: HardNet descriptor of the patches.
+
+    Shape:
+        - Input: ``(B, 1, 32, 32)``
+        - Output: ``(B, 128)``
+
+    See Also:
+        - :class:`HardNet8`: the follow-up network, wider, with a PCA from 512 to 128 dimensions.
+        - :class:`SOSNet`: the same convolution stack, trained with second-order similarity regularisation.
+        - :class:`HyNet`: a descriptor of the same patches, with FRN layers that subtract no mean.
+        - :class:`TFeat`: a shallow network for the same patches, without L2 normalisation.
+        - :class:`SIFTDescriptor`: handcrafted SIFT histograms of patches, with no weights.
+        - :class:`LAFDescriptor`: runs this network, by default, on a patch per LAF of an image.
+
+    Examples:
+        >>> input = torch.rand(16, 1, 32, 32)
+        >>> hardnet = HardNet(pretrained=False).eval()
+        >>> descs = hardnet(input) # 16x128
+
+    """
+
+    patch_size = 32
+
+    def __init__(self, pretrained: bool = True) -> None:
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32, affine=False),
+            nn.ReLU(),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32, affine=False),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(64, affine=False),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(64, affine=False),
+            nn.ReLU(),
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(128, affine=False),
+            nn.ReLU(),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(128, affine=False),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Conv2d(128, 128, kernel_size=8, bias=False),
+            nn.BatchNorm2d(128, affine=False),
+        )
+
+        # use torch.hub to load pretrained model
+        if pretrained:
+            pretrained_dict = load_state_dict_from_url(urls["liberty_aug"], map_location=torch.device("cpu"))
+            self.load_state_dict(pretrained_dict["state_dict"], strict=True)
+            self.eval()
+
+    @staticmethod
+    def _normalize_input(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+        """Standardise each patch to zero mean and unit standard deviation."""
+        if is_mps_tensor_safe(x) or _is_tracing_or_exporting():
+            # `torch.std_mean` is unsupported on MPS and decomposes to `prims.sum`, which has no ONNX lowering.
+            mp = torch.mean(x, dim=(-3, -2, -1), keepdim=True)
+            sp = torch.std(x, dim=(-3, -2, -1), keepdim=True)
+        else:
+            sp, mp = torch.std_mean(x, dim=(-3, -2, -1), keepdim=True)
+        # WARNING: we need to .detach() input, otherwise the gradients produced by
+        # the patches extractor with F.grid_sample are very noisy, making the detector
+        # training totally unstable.
+        return (x - mp.detach()) / (sp.detach() + eps)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        """Compute HardNet descriptors for grayscale 32x32 patches.
+
+        Args:
+            input: Grayscale patch tensor of shape ``(B, 1, 32, 32)``.
+
+        Returns:
+            L2-normalized descriptor tensor with shape ``(B, 128)``.
+        """
+        KORNIA_CHECK_SHAPE(input, ["B", "1", "32", "32"])
+        x_norm: torch.Tensor = self._normalize_input(input)
+        x_features: torch.Tensor = self.features(_patch_conv_layout(x_norm))
+        x_out = x_features.flatten(1)
+        # A constant patch drives the features to zero; the default `eps` is not representable in
+        # float16, where the normalisation would then return NaN.
+        return _l2_normalize(x_out, dim=1)
+
+
+class HardNet8(nn.Module):
+    r"""Describe 32 x 32 grayscale patches with HardNet8, a wider HardNet with a PCA to 128-D.
+
+    ``hardnet8 = HardNet8()`` builds the network with its pretrained ``hardnet8v2`` weights, in eval mode, and
+    ``descs = hardnet8(patches)`` takes grayscale patches ``(B, 1, 32, 32)`` and returns unit-norm descriptors
+    ``(B, 128)``: the 512 L2-normalised features of the network, projected by the PCA stored with the weights and
+    normalised again. It takes the patches of :class:`HardNet` and returns descriptors of the same size, but they are
+    not interchangeable with HardNet's; pass it to :class:`LAFDescriptor` to describe LAFs on an image. This is based
+    on the original code from paper "Improving the HardNet Descriptor". See :cite:`HardNet2020` for more details.
+
+    Convention:
+        See the Convention block on :class:`~kornia.feature.HardNet`.
+
+    Args:
+        pretrained: Download and set pretrained weights to the model. The 512-d features are projected to 128-d by a
+            PCA stored with the weights; without them, the projection keeps the first 128 features.
+
+    Returns:
+        torch.Tensor: HardNet8 descriptor of the patches.
+
+    Shape:
+        - Input: ``(B, 1, 32, 32)``
+        - Output: ``(B, 128)``
+
+    See Also:
+        - :class:`HardNet`: the original, narrower network, the default descriptor of :class:`LAFDescriptor`.
+        - :class:`SOSNet`: HardNet's convolution stack, trained with second-order similarity regularisation.
+        - :class:`HyNet`: a descriptor of the same patches, with FRN layers that subtract no mean.
+        - :class:`LAFDescriptor`: runs a patch descriptor such as this one on a patch per LAF of an image.
+
+    Examples:
+        >>> input = torch.rand(16, 1, 32, 32)
+        >>> hardnet = HardNet8(pretrained=False).eval()
+        >>> descs = hardnet(input) # 16x128
+
+    """
+
+    patch_size = 32
+
+    def __init__(self, pretrained: bool = True) -> None:
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32, affine=False),
+            nn.ReLU(),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32, affine=False),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(64, affine=False),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(64, affine=False),
+            nn.ReLU(),
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(128, affine=False),
+            nn.ReLU(),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(128, affine=False),
+            nn.ReLU(),
+            nn.Conv2d(128, 256, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(256, affine=False),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Conv2d(256, 512, kernel_size=8, bias=False),
+            nn.BatchNorm2d(512, affine=False),
+        )
+        self.features.apply(self.weights_init)
+        # Placeholder PCA until a checkpoint replaces it: keep the first 128 of the 512 features. An all-ones
+        # projection would collapse every descriptor to +-(1, ..., 1) / sqrt(128), with a zero gradient.
+        self.register_buffer("components", torch.eye(512, 128, dtype=torch.float))
+        self.register_buffer("mean", torch.zeros(512, dtype=torch.float))
+
+        # use torch.hub to load pretrained model
+        if pretrained:
+            pretrained_dict = load_state_dict_from_url(urls["hardnet8v2"], map_location=torch.device("cpu"))
+            self.load_state_dict(pretrained_dict, strict=True)
+            self.eval()
+
+    @staticmethod
+    def weights_init(m: object) -> None:
+        """Initialize convolutional layers for HardNet8.
+
+        Args:
+            m: Module instance passed by ``nn.Module.apply``.
+        """
+        if isinstance(m, nn.Conv2d):
+            nn.init.orthogonal_(m.weight.data, gain=0.6)
+            if m.bias is not None:
+                nn.init.constant_(m.bias.data, 0.01)
+
+    @staticmethod
+    def _normalize_input(x: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+        """Standardise each patch to zero mean and unit standard deviation."""
+        if is_mps_tensor_safe(x) or _is_tracing_or_exporting():
+            # `torch.std_mean` is unsupported on MPS and decomposes to `prims.sum`, which has no ONNX lowering.
+            mp = torch.mean(x, dim=(-3, -2, -1), keepdim=True)
+            sp = torch.std(x, dim=(-3, -2, -1), keepdim=True)
+        else:
+            sp, mp = torch.std_mean(x, dim=(-3, -2, -1), keepdim=True)
+        # WARNING: we need to .detach() input, otherwise the gradients produced by
+        # the patches extractor with F.grid_sample are very noisy, making the detector
+        # training totally unstable.
+        return (x - mp.detach()) / (sp.detach() + eps)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        """Compute HardNet8 descriptors with PCA projection.
+
+        Args:
+            input: Grayscale patch tensor of shape ``(B, 1, 32, 32)``.
+
+        Returns:
+            L2-normalized descriptor tensor with shape ``(B, 128)``, after the PCA projection.
+        """
+        KORNIA_CHECK_SHAPE(input, ["B", "1", "32", "32"])
+        x_norm: torch.Tensor = self._normalize_input(input)
+        x_features: torch.Tensor = self.features(_patch_conv_layout(x_norm))
+        mean: torch.Tensor = torch.jit.annotate(torch.Tensor, self.mean)
+        components: torch.Tensor = torch.jit.annotate(torch.Tensor, self.components)
+        x_flat = x_features.flatten(1)
+        x_prePCA = _l2_normalize(x_flat, dim=1)
+        pca = torch.mm(x_prePCA - mean, components)
+        return _l2_normalize(pca, dim=1)

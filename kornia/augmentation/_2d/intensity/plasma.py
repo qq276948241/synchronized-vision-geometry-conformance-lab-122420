@@ -1,0 +1,296 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from typing import Any, Dict, Optional, Tuple
+
+import torch
+
+from kornia.augmentation import random_generator as rg
+from kornia.augmentation._2d.intensity.base import IntensityAugmentationBase2D
+from kornia.contrib import diamond_square
+from kornia.core.utils import _clamp_unit_range, _to_device_nonblocking
+from kornia.enhance.adjust import _clip_unit_fresh
+
+
+def _generate_plasma(
+    shape: Tuple[int, ...],
+    roughness: torch.Tensor,
+    device: torch.device,
+    dtype: torch.dtype,
+    channels: Optional[int] = None,
+    same_on_batch: bool = False,
+) -> torch.Tensor:
+    if len(shape) == 4:
+        batch_size, shape_channels, height, width = shape
+    elif len(shape) == 3:
+        batch_size, height, width = shape
+        shape_channels = 1
+    else:
+        raise ValueError(f"Expected a 3D or 4D shape. Got {shape}.")
+
+    num_channels = shape_channels if channels is None else channels
+    share_map = same_on_batch and batch_size > 1
+    map_batch_size = 1 if share_map else batch_size
+    map_roughness = roughness[:1] if share_map else roughness
+    plasma = diamond_square((map_batch_size, num_channels, height, width), map_roughness, device=device, dtype=dtype)
+    return plasma.expand(batch_size, -1, -1, -1) if share_map else plasma
+
+
+def _plasma_for_input(plasma: torch.Tensor, image: torch.Tensor) -> torch.Tensor:
+    return _to_device_nonblocking(plasma[..., : image.shape[-2], : image.shape[-1]], image.device, image.dtype)
+
+
+class RandomPlasmaBrightness(IntensityAugmentationBase2D):
+    r"""Shift brightness by a diamond-square fractal map, applied per sample with probability ``p`` (default 0.5).
+
+    ``output = RandomPlasmaBrightness(roughness, intensity, ...)(input)`` adds a sampled fractal field to each
+    selected image ``(B, C, H, W)`` and clamps it to ``[0, 1]``.
+
+    .. image:: _static/img/RandomPlasmaBrightness.png
+
+    See the Convention block on :class:`~kornia.augmentation.IntensityAugmentationBase2D`.
+
+    This is based on the original paper: TorMentor: Deterministic dynamic-path, data augmentations with fractals.
+    See: :cite:`tormentor` for more details.
+
+    .. note::
+        This function internally uses :func:`kornia.contrib.diamond_square`.
+
+    Args:
+        roughness: value to scale during the recursion in the generation of the fractal map.
+        intensity: value that scales the intensity values of the generated maps.
+        same_on_batch: apply the same transformation across the batch.
+        p: probability of applying the transformation to each sample.
+        keepdim: whether to keep the output shape the same as input (True) or broadcast it
+                 to the batch form (False).
+
+    Convention:
+        - input values are clamped into ``[0, 1]`` before the operation, and the result is clamped
+          into the same range. This applies only to samples selected by the probability gate.
+        - the sampled fractal map is recorded as ``_params["plasma"]``, so a forward replayed with ``params=``
+          reproduces the first output bitwise.
+        - the result is clamped into ``[0, 1]``, so the output stays inside that range even when the input
+          does not.
+        - a one-pixel spatial axis is accepted, down to a ``1 x 1`` image.
+
+    See Also:
+        - :class:`RandomGaussianIllumination`: uses a smooth Gaussian field instead of a fractal field.
+        - :class:`RandomLinearIllumination`: uses a linear illumination ramp.
+
+    Examples:
+        >>> rng = torch.manual_seed(0)
+        >>> img = torch.ones(1, 1, 3, 4)
+        >>> RandomPlasmaBrightness(roughness=(0.1, 0.7), p=1.)(img)
+        tensor([[[[0.3677, 0.5169, 0.4346, 0.6906],
+                  [0.7740, 0.7483, 0.7752, 0.9332],
+                  [1.0000, 0.9797, 0.9848, 1.0000]]]])
+
+    """
+
+    def __init__(
+        self,
+        roughness: Tuple[float, float] = (0.1, 0.7),
+        intensity: Tuple[float, float] = (0.0, 1.0),
+        same_on_batch: bool = False,
+        p: float = 0.5,
+        keepdim: bool = False,
+    ) -> None:
+        super().__init__(p=p, same_on_batch=same_on_batch, p_batch=1.0, keepdim=keepdim)
+        self._param_generator = rg.PlainUniformGenerator(
+            (roughness, "roughness", None, None), (intensity, "intensity", None, None)
+        )
+
+    def generate_parameters(self, shape: Tuple[int, ...]) -> Dict[str, torch.Tensor]:
+        params = super().generate_parameters(shape)
+        roughness = params["roughness"].to(device=self.device, dtype=self.dtype)
+        params["plasma"] = _generate_plasma(shape, roughness, self.device, self.dtype, same_on_batch=self.same_on_batch)
+        return params
+
+    def apply_transform(
+        self,
+        image: torch.Tensor,
+        params: Dict[str, torch.Tensor],
+        flags: Dict[str, Any],
+        transform: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        image = _clamp_unit_range(image)
+        intensity = _to_device_nonblocking(params["intensity"], image.device, image.dtype).view(-1, 1, 1, 1)
+        brightness_map = 2 * _plasma_for_input(params["plasma"], image) - 1
+        brightness_map = brightness_map * intensity
+        return _clip_unit_fresh(image + brightness_map)
+
+
+class RandomPlasmaContrast(IntensityAugmentationBase2D):
+    r"""Scale contrast by a diamond-square fractal map, applied per sample with probability ``p`` (default 0.5).
+
+    ``output = RandomPlasmaContrast(roughness, ...)(input)`` scales contrast locally with a sampled fractal field on
+    selected ``(B, C, H, W)`` images.
+
+    .. image:: _static/img/RandomPlasmaContrast.png
+
+    See the Convention block on :class:`~kornia.augmentation.IntensityAugmentationBase2D`.
+
+    This is based on the original paper: TorMentor: Deterministic dynamic-path, data augmentations with fractals.
+    See: :cite:`tormentor` for more details.
+
+    .. note::
+        This function internally uses :func:`kornia.contrib.diamond_square`.
+
+    Args:
+        roughness: value to scale during the recursion in the generation of the fractal map.
+        same_on_batch: apply the same transformation across the batch.
+        p: probability of applying the transformation to each sample.
+        keepdim: whether to keep the output shape the same as input (True) or broadcast it
+                 to the batch form (False).
+
+    Convention:
+        - input values are clamped into ``[0, 1]`` before the operation, and the result is clamped
+          into the same range. This applies only to samples selected by the probability gate.
+        - the sampled fractal map is recorded as ``_params["plasma"]``, so a forward replayed with ``params=``
+          reproduces the first output bitwise.
+        - the result is clamped into ``[0, 1]``, so the output stays inside that range even when the input
+          does not.
+        - a one-pixel spatial axis is accepted, down to a ``1 x 1`` image.
+
+    See Also:
+        - :class:`RandomPlasmaBrightness`: offsets brightness with a fractal map.
+        - :class:`RandomPlasmaShadow`: uses a fractal map to darken selected areas.
+
+    Examples:
+        >>> rng = torch.manual_seed(0)
+        >>> img = torch.ones(1, 1, 3, 4)
+        >>> RandomPlasmaContrast(roughness=(0.1, 0.7), p=1.)(img)
+        tensor([[[[1.0000, 1.0000, 0.6770, 0.8711],
+                  [1.0000, 1.0000, 1.0000, 1.0000],
+                  [1.0000, 1.0000, 1.0000, 1.0000]]]])
+
+    """
+
+    def __init__(
+        self,
+        roughness: Tuple[float, float] = (0.1, 0.7),
+        same_on_batch: bool = False,
+        p: float = 0.5,
+        keepdim: bool = False,
+    ) -> None:
+        super().__init__(p=p, same_on_batch=same_on_batch, p_batch=1.0, keepdim=keepdim)
+        self._param_generator = rg.PlainUniformGenerator((roughness, "roughness", None, None))
+
+    def generate_parameters(self, shape: Tuple[int, ...]) -> Dict[str, torch.Tensor]:
+        params = super().generate_parameters(shape)
+        roughness = params["roughness"].to(device=self.device, dtype=self.dtype)
+        params["plasma"] = _generate_plasma(shape, roughness, self.device, self.dtype, same_on_batch=self.same_on_batch)
+        return params
+
+    def apply_transform(
+        self,
+        image: torch.Tensor,
+        params: Dict[str, torch.Tensor],
+        flags: Dict[str, Any],
+        transform: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        image = _clamp_unit_range(image)
+        contrast_map = 4 * _plasma_for_input(params["plasma"], image)
+        return _clip_unit_fresh((image - 0.5) * contrast_map + 0.5)
+
+
+class RandomPlasmaShadow(IntensityAugmentationBase2D):
+    r"""Add shadows from a diamond-square fractal map, applied per sample with probability ``p`` (default 0.5).
+
+    ``output = RandomPlasmaShadow(roughness, shade_intensity, ...)(input)`` darkens areas chosen by a sampled
+    fractal field in selected ``(B, C, H, W)`` images.
+
+    .. image:: _static/img/RandomPlasmaShadow.png
+
+    See the Convention block on :class:`~kornia.augmentation.IntensityAugmentationBase2D`.
+
+    This is based on the original paper: TorMentor: Deterministic dynamic-path, data augmentations with fractals.
+    See: :cite:`tormentor` for more details.
+
+    .. note::
+        This function internally uses :func:`kornia.contrib.diamond_square`.
+
+    Args:
+        roughness: value to scale during the recursion in the generation of the fractal map.
+        shade_intensity: value that scales the intensity values of the generated maps.
+        shade_quantity: value to select the pixels to mask.
+        same_on_batch: apply the same transformation across the batch.
+        p: probability of applying the transformation to each sample.
+        keepdim: whether to keep the output shape the same as input (True) or broadcast it
+                 to the batch form (False).
+
+    Convention:
+        - input values are clamped into ``[0, 1]`` before the operation, and the result is clamped
+          into the same range. This applies only to samples selected by the probability gate.
+        - the sampled fractal map is recorded as ``_params["plasma"]`` with a single channel, ``(B, 1, H, W)``: one
+          shade mask is applied to every channel of a sample. A forward replayed with ``params=`` reproduces the
+          first output bitwise.
+        - the result is clamped into ``[0, 1]``, so the output stays inside that range even when the input
+          does not.
+        - a one-pixel spatial axis is accepted, down to a ``1 x 1`` image.
+
+    See Also:
+        - :class:`RandomPlasmaBrightness`: offsets brightness with a fractal map.
+        - :class:`RandomPlasmaContrast`: scales contrast with a fractal map.
+
+    Examples:
+        >>> rng = torch.manual_seed(0)
+        >>> img = torch.ones(1, 1, 3, 4)
+        >>> RandomPlasmaShadow(roughness=(0.1, 0.7), p=1.)(img)
+        tensor([[[[1., 1., 1., 1.],
+                  [1., 1., 1., 1.],
+                  [1., 1., 1., 1.]]]])
+
+    """
+
+    def __init__(
+        self,
+        roughness: Tuple[float, float] = (0.1, 0.7),
+        shade_intensity: Tuple[float, float] = (-1.0, 0.0),
+        shade_quantity: Tuple[float, float] = (0.0, 1.0),
+        same_on_batch: bool = False,
+        p: float = 0.5,
+        keepdim: bool = False,
+    ) -> None:
+        super().__init__(p=p, same_on_batch=same_on_batch, p_batch=1.0, keepdim=keepdim)
+        self._param_generator = rg.PlainUniformGenerator(
+            (roughness, "roughness", None, None),
+            (shade_intensity, "shade_intensity", None, None),
+            (shade_quantity, "shade_quantity", None, None),
+        )
+
+    def generate_parameters(self, shape: Tuple[int, ...]) -> Dict[str, torch.Tensor]:
+        params = super().generate_parameters(shape)
+        roughness = params["roughness"].to(device=self.device, dtype=self.dtype)
+        params["plasma"] = _generate_plasma(
+            shape, roughness, self.device, self.dtype, channels=1, same_on_batch=self.same_on_batch
+        )
+        return params
+
+    def apply_transform(
+        self,
+        image: torch.Tensor,
+        params: Dict[str, torch.Tensor],
+        flags: Dict[str, Any],
+        transform: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        image = _clamp_unit_range(image)
+        shade_intensity = _to_device_nonblocking(params["shade_intensity"], image.device, image.dtype).view(-1, 1, 1, 1)
+        shade_quantity = _to_device_nonblocking(params["shade_quantity"], image.device, image.dtype).view(-1, 1, 1, 1)
+        shade_map = _plasma_for_input(params["plasma"], image)
+        shade_map = (shade_map < shade_quantity).to(image.dtype) * shade_intensity
+        return _clip_unit_fresh(image + shade_map)

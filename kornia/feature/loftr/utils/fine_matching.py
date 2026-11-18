@@ -1,0 +1,117 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from __future__ import annotations
+
+import math
+from typing import Any
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+from kornia.geometry.grid import create_meshgrid
+from kornia.geometry.subpix import dsnt
+
+
+class FineMatching(nn.Module):
+    """FineMatching with s2d paradigm."""
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, feat_f0: torch.Tensor, feat_f1: torch.Tensor, data: dict[str, Any]) -> None:
+        """Run forward.
+
+        Args:
+            feat_f0 (torch.Tensor): [M, WW, C]
+            feat_f1 (torch.Tensor): [M, WW, C]
+            data (dict): with keys ['mkpts0_c', 'mkpts1_c', 'mconf', 'b_ids', 'stride_f'], ``stride_f`` being the
+                pixel stride of the fine feature maps (2 by default)
+        Update:
+            data (dict):{
+                'expec_f' (torch.Tensor): [M, 3],
+                'mkpts0_f' (torch.Tensor): [M, 2],
+                'mkpts1_f' (torch.Tensor): [M, 2]}
+
+        """
+        M, WW, C = feat_f0.shape
+        W = int(math.sqrt(WW))
+        # pixel stride of the fine feature maps (2 by default), for any image size
+        scale = data["stride_f"]
+        self.M, self.W, self.WW, self.C, self.scale = M, W, WW, C, scale
+
+        # corner case: if no coarse matches found
+        if M == 0:
+            if self.training:
+                raise ValueError("M >0, when training, see coarse_matching.py")
+            # logger.warning('No matches found in coarse-level.')
+            data.update(
+                {
+                    "expec_f": torch.empty(0, 3, device=feat_f0.device, dtype=feat_f0.dtype),
+                    "mkpts0_f": data["mkpts0_c"],
+                    "mkpts1_f": data["mkpts1_c"],
+                }
+            )
+            return
+
+        feat_f0_picked = feat_f0[:, WW // 2, :]
+        sim_matrix = torch.einsum("mc,mrc->mr", feat_f0_picked, feat_f1)
+        softmax_temp = 1.0 / C**0.5
+        heatmap = F.softmax(softmax_temp * sim_matrix, dim=1).view(-1, W, W)
+
+        # compute coordinates from heatmap
+        coords_normalized = dsnt.spatial_expectation2d(heatmap[None], True)[0]  # [M, 2]
+        grid_normalized = create_meshgrid(
+            W, W, normalized_coordinates=True, device=heatmap.device, dtype=heatmap.dtype
+        ).reshape(1, -1, 2)  # [1, WW, 2]
+
+        # compute std over <x, y>
+        var = torch.sum(grid_normalized**2 * heatmap.view(-1, WW, 1), dim=1) - coords_normalized**2  # [M, 2]
+        # A clamp floor under sqrt bounds the value, not the gradient: 1e-10 is 0 in float16, and torch < 2.14 passes
+        # clamp's gradient through at the bound, so sqrt'(0) = inf reached the features as nan (#4229). Differentiate
+        # sqrt only above the floor; at or below it the value is still sqrt(floor), with zero gradient.
+        floor = torch.full_like(var, 1e-10)
+        above = var > floor
+        safe_var = torch.where(above, var, torch.ones_like(var))
+        std = torch.sum(torch.where(above, safe_var.sqrt(), floor.sqrt()), -1)  # [M]
+
+        # for fine-level supervision
+        data.update({"expec_f": torch.cat([coords_normalized, std.unsqueeze(1)], -1)})
+
+        # compute absolute kpt coords
+        self.get_fine_match(coords_normalized, data)
+
+    @torch.no_grad()
+    def get_fine_match(self, coords_normed: torch.Tensor, data: dict[str, Any]) -> None:
+        """Extract fine-level correspondences from the refined matching heatmap.
+
+        Args:
+            coords_normed: Normalized coordinate offsets with shape ``(M, 2)``.
+            data: Dictionary containing image features, keypoints, descriptors, and image sizes for matching.
+
+        Returns:
+            None. Updates ``data`` in place with fine-level matches.
+        """
+        W, _, _, scale = self.W, self.WW, self.C, self.scale
+
+        # mkpts0_f and mkpts1_f
+        mkpts0_f = data["mkpts0_c"]
+        scale1 = scale * data["scale1"][data["b_ids"]] if "scale0" in data else scale
+        mkpts1_f = data["mkpts1_c"] + (coords_normed * (W // 2) * scale1)[: len(data["mconf"])]
+
+        data.update({"mkpts0_f": mkpts0_f, "mkpts1_f": mkpts1_f})

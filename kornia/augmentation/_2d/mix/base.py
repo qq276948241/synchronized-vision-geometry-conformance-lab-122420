@@ -1,0 +1,347 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from typing import Any, Dict, List, Optional, Union
+
+import torch
+
+from kornia.augmentation.base import _BasicAugmentationBase
+from kornia.augmentation.utils import (
+    _transform_input,
+    _transform_input_by_shape,
+    _transform_output_shape,
+    _validate_input_dtype,
+)
+from kornia.augmentation.utils.helpers import _boxes_to_padded_tensor
+from kornia.constants import DataKey, DType
+from kornia.core.check import KORNIA_UNWRAP
+from kornia.core.utils import _to_device_nonblocking
+from kornia.geometry.boxes import Boxes
+
+
+def _export_boxes(box: Boxes, mode: str, box_input: Any) -> torch.Tensor:
+    # A list box input comes back as a list of per-sample tensors; a tensor input as one dense tensor.
+    if isinstance(box_input, list):
+        return KORNIA_UNWRAP(box.to_tensor(mode), torch.Tensor)
+    return _boxes_to_padded_tensor(box, mode)
+
+
+class MixAugmentationBaseV2(_BasicAugmentationBase):
+    r"""Build a custom augmentation that mixes samples through data-key handlers.
+
+    ``output = MyAugmentation(...)(input)`` combines batch samples or rearranges image content once a subclass
+    implements ``apply_transform`` and provides parameter generation, either through ``_param_generator`` or
+    by overriding ``generate_parameters``. Implement the additional data-key handlers that the operation supports;
+    the Convention block below describes how each handler uses the probability gate.
+
+    Args:
+        p: probability for applying an augmentation. This param controls the augmentation probabilities
+          element-wise for a batch.
+        p_batch: probability for applying an augmentation to a batch. This param controls the augmentation
+          probabilities batch-wise.
+        same_on_batch: apply the same transformation across the batch.
+        keepdim: whether to keep the output shape the same as input ``True`` or broadcast it
+          to the batch form ``False``.
+        data_keys: the input type sequential for applying augmentations.
+            Accepts "input", "image", "mask", "bbox", "bbox_xyxy", "bbox_xywh", "keypoints", "class", "label".
+
+    Convention:
+        - Sampling, replay, and serialization follow the augmentation-wide contracts in
+          :doc:`/get-started/conventions`.
+        - Image inputs are floating tensors of shape ``(H, W)``, ``(C, H, W)``, or ``(B, C, H, W)`` in
+          ``float16``, ``bfloat16``, ``float32`` or ``float64``, promoted to ``(B, C, H, W)``; ``keepdim=True``
+          restores the rank of an unbatched input. :class:`~kornia.augmentation.RandomTransplantation` and
+          :class:`~kornia.augmentation.RandomTransplantation3D` override ``forward`` and take batched inputs only.
+        - A mix operation is not geometric: ``transform_matrix`` and ``inverse()`` raise ``RuntimeError``.
+        - ``data_keys`` chooses which positional inputs are dispatched. Called directly, a key the concrete class
+          does not implement raises ``NotImplementedError`` (or a class-specific error) before anything is
+          sampled; the two transplantation classes, and any mix child of
+          :class:`~kornia.augmentation.container.AugmentationSequential`, raise it after the parameters are drawn.
+          The concrete class blocks state the supported non-image keys.
+        - ``batch_prob`` gates the result: a selected image is mixed and an unselected image keeps its input
+          values, except where a concrete class changes the output size (see
+          :class:`~kornia.augmentation.RandomMosaic`); the transplantation classes read ``acceptor_indices``
+          instead. The box and class-label handlers use the same gate: an unselected row's label describes an
+          unmixed image (its own class twice, with lambda 0).
+
+    See Also:
+        - :class:`AugmentationBase2D`: base class for single-image 2D augmentations.
+
+    """
+
+    def _validate_data_key(self, key: DataKey) -> None:
+        # Check the handler without executing a transform or requiring subclasses to declare support twice.
+        if key in (DataKey.BBOX, DataKey.BBOX_XYXY, DataKey.BBOX_XYWH):
+            if type(self).apply_transform_boxes is MixAugmentationBaseV2.apply_transform_boxes:
+                raise NotImplementedError
+        elif key == DataKey.KEYPOINTS:
+            if type(self).apply_transform_keypoint is MixAugmentationBaseV2.apply_transform_keypoint:
+                raise NotImplementedError
+        elif key == DataKey.CLASS:
+            if type(self).apply_transform_class is MixAugmentationBaseV2.apply_transform_class:
+                raise NotImplementedError
+        elif key == DataKey.MASK:
+            if type(self).apply_transform_mask is MixAugmentationBaseV2.apply_transform_mask:
+                raise NotImplementedError
+        elif key != DataKey.INPUT:
+            raise NotImplementedError
+
+    def __init__(
+        self,
+        p: float,
+        p_batch: float,
+        same_on_batch: bool = False,
+        keepdim: bool = False,
+        data_keys: Optional[List[Union[str, int, DataKey]]] = None,
+    ) -> None:
+        super().__init__(p, p_batch=p_batch, same_on_batch=same_on_batch, keepdim=keepdim)
+        self.data_keys = [DataKey.INPUT]
+        if data_keys is not None:
+            self.data_keys = [DataKey.get(inp) for inp in data_keys]
+
+    def transform_tensor(
+        self, input: torch.Tensor, *, shape: Optional[torch.Tensor] = None, match_channel: bool = True
+    ) -> torch.Tensor:
+        """Convert any incoming (H, W), (C, H, W) and (B, C, H, W) into (B, C, H, W)."""
+        _validate_input_dtype(input, accepted_dtypes=[torch.bfloat16, torch.float16, torch.float32, torch.float64])
+
+        if shape is None:
+            return _transform_input(input)
+
+        return _transform_input_by_shape(input, reference_shape=shape, match_channel=match_channel)
+
+    def apply_transform(
+        self, input: torch.Tensor, params: Dict[str, torch.Tensor], flags: Dict[str, Any]
+    ) -> torch.Tensor:
+        # NOTE: apply_transform receives the whole torch.Tensor, but returns only altered elements.
+        raise NotImplementedError
+
+    def apply_non_transform(
+        self, input: torch.Tensor, params: Dict[str, torch.Tensor], flags: Dict[str, Any]
+    ) -> torch.Tensor:
+        # For the images where batch_prob == False.
+        return input
+
+    def transform_input(
+        self, input: torch.Tensor, params: Dict[str, torch.Tensor], flags: Dict[str, Any]
+    ) -> torch.Tensor:
+        batch_prob = params["batch_prob"]
+        to_apply = torch.atleast_1d(batch_prob > 0.5)
+        ori_shape = input.shape
+        in_tensor = self.transform_tensor(input)
+
+        # Compute the non-transform branch first; if no element is to be transformed,
+        # short-circuit (mix transforms like RandomJigsaw subset their input internally
+        # and can't operate on an empty subset).
+        non_applied = self.apply_non_transform(in_tensor, params, flags)
+        if not bool(to_apply.any()):
+            output = non_applied
+            return _transform_output_shape(output, ori_shape) if self.keepdim else output
+
+        # Run the transform branch on the full batch (the random-generator contract is
+        # full-batch sized now), then pass it through ``apply_non_transform`` so any
+        # subclass post-processing (e.g. resize to ``output_size`` in ``RandomMosaic``)
+        # is applied uniformly to both branches.
+        applied = self.apply_transform(in_tensor, params, flags)
+        applied_post = self.apply_non_transform(applied, params, flags)
+
+        if applied_post.shape == non_applied.shape and applied_post.shape[0] == to_apply.shape[0]:
+            to_apply_expanded = _to_device_nonblocking(
+                to_apply.view(-1, *([1] * (applied_post.dim() - 1))), applied_post.device
+            )
+            output = torch.where(to_apply_expanded, applied_post, non_applied)
+        else:
+            # Shape-changing mix augmentations (e.g. RandomMosaic when ``output_size``
+            # differs from the input size) cannot be where-blended. Fall back to the
+            # all-applied branch.
+            output = applied_post
+
+        return _transform_output_shape(output, ori_shape) if self.keepdim else output
+
+    def transform_mask(
+        self, input: torch.Tensor, params: Dict[str, torch.Tensor], flags: Dict[str, Any]
+    ) -> torch.Tensor:
+        self._validate_data_key(DataKey.MASK)
+        batch_prob = params["batch_prob"]
+        to_apply = torch.atleast_1d(batch_prob > 0.5)
+        output = input
+        if sum(to_apply) != len(to_apply):
+            output = self.apply_non_transform_mask(input, params, flags)
+        if sum(to_apply) != 0:
+            output = self.apply_transform_mask(input, params, flags)
+        return output
+
+    def transform_boxes(
+        self, input: Union[torch.Tensor, Boxes], params: Dict[str, torch.Tensor], flags: Dict[str, Any]
+    ) -> Boxes:
+        self._validate_data_key(DataKey.BBOX)
+        # input is BxNx4x2 or Boxes.
+        if isinstance(input, torch.Tensor):
+            if not (len(input.shape) == 4 and input.shape[2:] == torch.Size([4, 2])):
+                raise RuntimeError(f"Only BxNx4x2 torch.Tensor is supported. Got {input.shape}.")
+            input = Boxes(input, False, mode="vertices_plus")
+        batch_prob = params["batch_prob"]
+        to_apply = torch.atleast_1d(batch_prob > 0.5)
+        output = input
+        if sum(to_apply) != len(to_apply):
+            output = self.apply_non_transform_boxes(input, params, flags)
+        if sum(to_apply) != 0:
+            output = self.apply_transform_boxes(output, params, flags)
+        return output
+
+    def transform_keypoint(
+        self, input: torch.Tensor, params: Dict[str, torch.Tensor], flags: Dict[str, Any]
+    ) -> torch.Tensor:
+        self._validate_data_key(DataKey.KEYPOINTS)
+        batch_prob = params["batch_prob"]
+        to_apply = torch.atleast_1d(batch_prob > 0.5)
+        output = input
+        if sum(to_apply) != len(to_apply):
+            output = self.apply_non_transform_keypoint(input, params, flags)
+        if sum(to_apply) != 0:
+            output = self.apply_transform_keypoint(input, params, flags)
+        return output
+
+    def transform_class(
+        self, input: torch.Tensor, params: Dict[str, torch.Tensor], flags: Dict[str, Any]
+    ) -> torch.Tensor:
+        self._validate_data_key(DataKey.CLASS)
+        batch_prob = params["batch_prob"]
+        to_apply = torch.atleast_1d(batch_prob > 0.5)
+        if sum(to_apply) == len(to_apply):
+            return self.apply_transform_class(input, params, flags)
+        if sum(to_apply) == 0:
+            return self.apply_non_transform_class(input, params, flags)
+
+        applied = self.apply_transform_class(input, params, flags)
+        non_applied = self.apply_non_transform_class(input, params, flags)
+        if applied.dim() < 2 or applied.shape != non_applied.shape:
+            # Not one row per sample in both handlers (e.g. a subclass returning one label per sample): keep the
+            # transformed labels, as ``transform_input`` keeps the transformed images when it cannot blend.
+            return applied
+
+        # The batch axis is -2 for both RandomMixUpV2 (B, 3) and RandomCutMixV2 (num_mix, B, 3).
+        view_shape = [1] * (applied.dim() - 2) + [-1, 1]
+        mask = _to_device_nonblocking(to_apply.view(*view_shape), applied.device)
+        return torch.where(mask, applied, non_applied)
+
+    def apply_non_transform_mask(
+        self, input: torch.Tensor, params: Dict[str, torch.Tensor], flags: Dict[str, Any]
+    ) -> torch.Tensor:
+        raise NotImplementedError
+
+    def apply_transform_mask(
+        self, input: torch.Tensor, params: Dict[str, torch.Tensor], flags: Dict[str, Any]
+    ) -> torch.Tensor:
+        raise NotImplementedError
+
+    def apply_non_transform_boxes(self, input: Boxes, params: Dict[str, torch.Tensor], flags: Dict[str, Any]) -> Boxes:
+        return input
+
+    def apply_transform_boxes(self, input: Boxes, params: Dict[str, torch.Tensor], flags: Dict[str, Any]) -> Boxes:
+        raise NotImplementedError
+
+    def apply_non_transform_keypoint(
+        self, input: torch.Tensor, params: Dict[str, torch.Tensor], flags: Dict[str, Any]
+    ) -> torch.Tensor:
+        return input
+
+    def apply_transform_keypoint(
+        self, input: torch.Tensor, params: Dict[str, torch.Tensor], flags: Dict[str, Any]
+    ) -> torch.Tensor:
+        raise NotImplementedError
+
+    def apply_non_transform_class(
+        self, input: torch.Tensor, params: Dict[str, torch.Tensor], flags: Dict[str, Any]
+    ) -> torch.Tensor:
+        return input
+
+    def apply_transform_class(
+        self, input: torch.Tensor, params: Dict[str, torch.Tensor], flags: Dict[str, Any]
+    ) -> torch.Tensor:
+        raise NotImplementedError
+
+    def forward(
+        self,
+        *input: torch.Tensor,
+        params: Optional[Dict[str, torch.Tensor]] = None,
+        data_keys: Optional[List[Union[str, int, DataKey]]] = None,
+    ) -> Union[torch.Tensor, List[torch.Tensor]]:
+        keys: List[DataKey]
+        keys = self.data_keys if data_keys is None else [DataKey.get(inp) for inp in data_keys]
+
+        for key in keys:
+            self._validate_data_key(key)
+
+        if params is None:
+            in_tensor_idx: int = keys.index(DataKey.INPUT)
+            in_tensor: torch.Tensor = input[in_tensor_idx]
+            in_tensor = self.transform_tensor(in_tensor)
+            self._params = self.forward_parameters(in_tensor.shape)
+            self._params.update({"dtype": torch.full((), DType.get(in_tensor.dtype).value, dtype=torch.long)})
+        elif DataKey.INPUT in keys:
+            # The class handlers read ``"dtype"``, which a ``forward_parameters()`` dictionary does not have: take it
+            # from the input, as above, in a copy that leaves the caller's dictionary alone. A supplied ``"dtype"`` is
+            # replaced too, so a dictionary recorded on another image dtype cannot go stale. Only the dtype check of
+            # ``transform_tensor`` runs here, so that a subclass's shape checks still come after the params checks.
+            in_tensor = input[keys.index(DataKey.INPUT)]
+            _validate_input_dtype(
+                in_tensor, accepted_dtypes=[torch.bfloat16, torch.float16, torch.float32, torch.float64]
+            )
+            self._params = {**params, "dtype": torch.full((), DType.get(in_tensor.dtype).value, dtype=torch.long)}
+        else:
+            self._params = params
+
+        outputs: List[torch.Tensor] = []
+        for dcate, _input in zip(keys, input):
+            output: torch.Tensor
+            if dcate == DataKey.INPUT:
+                output = self.transform_input(_input, self._params, self.flags)
+            elif dcate == DataKey.MASK:
+                output = self.transform_mask(_input, self._params, self.flags)
+            elif dcate == DataKey.BBOX:
+                box = Boxes.from_tensor(_input, mode="vertices", validate_boxes=False)
+                box = self.transform_boxes(box, self._params, self.flags)
+                output = _export_boxes(box, "vertices", _input)
+            elif dcate == DataKey.BBOX_XYXY:
+                box = Boxes.from_tensor(_input, mode="xyxy", validate_boxes=False)
+                box = self.transform_boxes(box, self._params, self.flags)
+                output = _export_boxes(box, "xyxy", _input)
+            elif dcate == DataKey.BBOX_XYWH:
+                box = Boxes.from_tensor(_input, mode="xywh", validate_boxes=False)
+                box = self.transform_boxes(box, self._params, self.flags)
+                output = _export_boxes(box, "xywh", _input)
+            elif dcate == DataKey.KEYPOINTS:
+                output = self.transform_keypoint(_input, self._params, self.flags)
+            elif dcate == DataKey.CLASS:
+                output = self.transform_class(_input, self._params, self.flags)
+            else:
+                raise NotImplementedError
+            outputs.append(output)
+        if len(outputs) == 1:
+            return outputs[0]
+        return outputs
+
+    @torch.jit.ignore
+    def inverse(self, *args: Any, **kwargs: Any) -> Optional[torch.Tensor]:
+        # Accept the usual ``inverse(output, params=...)`` call too, so every call form raises this error rather
+        # than a signature TypeError.
+        raise RuntimeError(f"Inverse for {self.__class__.__name__} is not supported.")
+
+    @property
+    def transform_matrix(self) -> Optional[torch.Tensor]:
+        raise RuntimeError(f"Transformation matrices for {self.__class__.__name__} is not supported.")

@@ -1,0 +1,106 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+import torch
+
+from kornia.augmentation import random_generator as rg
+from kornia.augmentation._2d.intensity.base import IntensityAugmentationBase2D
+from kornia.core.utils import _clamp_unit_range
+from kornia.enhance import jpeg_codec_differentiable
+
+
+class RandomJPEG(IntensityAugmentationBase2D):
+    r"""Simulate differentiable JPEG coding for RGB images.
+
+    ``output = RandomJPEG(jpeg_quality, ...)(input)`` simulates JPEG coding for selected RGB images of shape
+    ``(B, 3, H, W)``.
+
+    .. image:: _static/img/RandomJPEG.png
+
+    See the Convention block on :class:`~kornia.augmentation.IntensityAugmentationBase2D`.
+    :func:`kornia.color.ycbcr_to_rgb` hard-clamps the decoded RGB values to ``[0, 1]``. The codec's final
+    soft-clipping call uses bounds ``[0, 255]`` and leaves those RGB values unchanged. The input must have
+    three channels: the codec works in YCbCr, and any other channel count raises a ``ShapeError``.
+
+    Convention:
+        - input values are clamped into ``[0, 1]`` before the operation, and the result is clamped
+          into the same range. This applies only to samples selected by the probability gate.
+
+    Args:
+        jpeg_quality: The range of compression rates to be applied.
+        p: probability of applying the transformation.
+        same_on_batch: apply the same transformation across the batch.
+        keepdim: whether to keep the output shape the same as input (True) or broadcast it
+                 to the batch form (False).
+
+    Shape:
+        - Input: ``(C, H, W)`` or ``(B, C, H, W)``
+        - Output: ``(B, C, H, W)``
+
+    .. note::
+        This function internally uses :func:`kornia.enhance.jpeg_codec_differentiable`.
+
+    See Also:
+        - :class:`RandomGaussianBlur`: smooths with a filter rather than JPEG coding artifacts.
+
+    Examples:
+        >>> import torch
+        >>> rng = torch.manual_seed(0)
+        >>> images = 0.1904 * torch.ones(2, 3, 32, 32)
+        >>> aug = RandomJPEG(jpeg_quality=(1.0, 50.0), p=1.)
+        >>> images_jpeg = aug(images)
+
+    To apply the exact augmenation again, you may take the advantage of the previous parameter state:
+        >>> images = 0.1904 * torch.ones(2, 3, 32, 32)
+        >>> aug = RandomJPEG(jpeg_quality=20.0, p=1.)  # Samples a JPEG quality from the range [30.0, 70.0]
+        >>> (aug(images) == aug(images, params=aug._params)).all()
+        tensor(True)
+
+    """
+
+    def __init__(
+        self,
+        jpeg_quality: Union[torch.Tensor, float, Tuple[float, float], List[float]] = 50.0,
+        same_on_batch: bool = False,
+        p: float = 1.0,
+        keepdim: bool = False,
+    ) -> None:
+        super().__init__(p=p, same_on_batch=same_on_batch, keepdim=keepdim)
+        self.jpeg_quality = jpeg_quality
+        self._param_generator = rg.JPEGGenerator(jpeg_quality)
+
+    def apply_transform(
+        self,
+        input: torch.Tensor,
+        params: Dict[str, torch.Tensor],
+        flags: Dict[str, Any],
+        transform: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if (
+            params["jpeg_quality"].numel() == 0
+            and input.shape[0] == 0
+            and input.shape[1] == 3
+            and input.shape[-2] > 0
+            and input.shape[-1] > 0
+        ):
+            # An empty batch draws no quality and has no pixels to code; JPEG coding keeps the shape (#4429).
+            return input.clone()
+        input = _clamp_unit_range(input)
+        jpeg_output: torch.Tensor = jpeg_codec_differentiable(input, params["jpeg_quality"])
+        return jpeg_output

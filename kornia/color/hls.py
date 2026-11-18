@@ -1,0 +1,249 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from __future__ import annotations
+
+import math
+from typing import ClassVar
+
+import torch
+from torch import nn
+
+from kornia.core.ops import _device_literal
+from kornia.core.utils import _clamp_range, _is_tracing_or_exporting, _needs_derivatives
+
+
+def rgb_to_hls(image: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    r"""Convert an RGB image to HLS.
+
+    ``hls = rgb_to_hls(image)`` converts a ``(*, 3, H, W)`` RGB image in :math:`[0, 1]` to hue, lightness and
+    saturation.
+
+    .. image:: _static/img/rgb_to_hls.png
+
+    Convention:
+        Channels are H, L, S at axis -3. Hue is measured in radians in :math:`[0, 2\pi)`, unlike
+        OpenCV, which uses degrees (halved for 8-bit images).
+
+    Args:
+        image: RGB image with shape ``(*, 3, H, W)``.
+        eps: added to the chroma and saturation denominators where they are non-zero. Zero denominators are guarded, so
+            ``eps=0`` is valid.
+
+    Returns:
+        HLS image with shape ``(*, 3, H, W)``.
+
+    See Also:
+        - :func:`hls_to_rgb`: the inverse.
+        - :class:`RgbToHls`: the module form, which has no ``eps`` and uses the default.
+
+    Example:
+        >>> input = torch.rand(2, 3, 4, 5)
+        >>> output = rgb_to_hls(input)  # 2x3x4x5
+
+    """
+    if not isinstance(image, torch.Tensor):
+        raise TypeError(f"Input type is not a torch.Tensor. Got {type(image)}")
+
+    if len(image.shape) < 3 or image.shape[-3] != 3:
+        raise ValueError(f"Input size must have a shape of (*, 3, H, W). Got {image.shape}")
+
+    # 3x1x1. Filled on the device in eager mode: ``torch.tensor(..., device=cuda)`` copies from the host and waits
+    # for every queued kernel. TorchScript, which cannot compile ``_constant_tensor``, keeps the host literal.
+    if torch.jit.is_scripting():
+        _RGB2HSL_IDX = torch.tensor([[[0.0]], [[1.0]], [[2.0]]], device=image.device, dtype=image.dtype)
+    else:
+        _RGB2HSL_IDX = _device_literal([[[0.0]], [[1.0]], [[2.0]]], device=image.device, dtype=image.dtype)
+
+    _img_max: tuple[torch.Tensor, torch.Tensor] = image.max(-3)
+    maxc = _img_max[0]
+    imax = _img_max[1]
+    minc: torch.Tensor = image.min(-3)[0]
+
+    # Compute the channels as separate tensors and stack them. Writing them with `out=` into channel views of a
+    # preallocated output is not traced by the TorchScript ONNX exporter, which then exports a graph that ignores
+    # the input, and torch.compile(fullgraph=True) rejects an `out=` tensor that is not contiguous.
+    l_ = maxc + minc
+    s = maxc - minc
+
+    # Use unit divisors when chroma or the lightness denominator is zero.
+    # Preserve the epsilon-adjusted calculation for nonzero denominators.
+    chroma_denominator = torch.where(s == 0, torch.ones_like(s), s + eps)
+
+    lightness_denominator = torch.where(l_ < 1.0, l_, 2.0 - l_)
+    saturation_denominator = torch.where(
+        lightness_denominator == 0, torch.ones_like(lightness_denominator), lightness_denominator + eps
+    )
+    s /= saturation_denominator  # saturation
+    l_ /= 2  # luminance
+
+    # Subtract before dividing: RGB / chroma has overflowing float16 gradients near gray,
+    # even when the hue and its gradient are representable.
+    r, g, b = image[..., 0, :, :], image[..., 1, :, :], image[..., 2, :, :]
+    cond = imax[..., None, :, :] == _RGB2HSL_IDX
+    h = (((g - b) / chroma_denominator) % 6) * cond[..., 0, :, :]
+    h += ((b - r) / chroma_denominator + 2) * cond[..., 1, :, :]
+    h += ((r - g) / chroma_denominator + 4) * cond[..., 2, :, :]
+    # h = 2.0 * math.pi * (60.0 * h) / 360.0
+    h *= math.pi / 3.0  # hue [0, 2*pi]
+    h = h.masked_fill(h >= 2.0 * math.pi, 0.0)
+
+    return torch.stack([h, l_, s], -3)
+
+
+def hls_to_rgb(image: torch.Tensor) -> torch.Tensor:
+    r"""Convert an HLS image to RGB.
+
+    ``rgb = hls_to_rgb(image)`` converts a ``(*, 3, H, W)`` image of hue in radians, lightness in :math:`[0, 1]` and
+    saturation in :math:`[0, 1]` to RGB.
+
+    Convention:
+        Channels are H, L, S at axis -3. Hue wraps modulo 2π. The result is not clipped, so lightness or saturation
+        outside :math:`[0, 1]` can give RGB values outside it.
+
+    Args:
+        image: HLS image with shape ``(*, 3, H, W)``.
+
+    Returns:
+        RGB image with shape ``(*, 3, H, W)``.
+
+    See Also:
+        - :func:`rgb_to_hls`: the inverse.
+        - :class:`HlsToRgb`: the module form.
+
+    Example:
+        >>> input = torch.rand(2, 3, 4, 5)
+        >>> output = hls_to_rgb(input)  # 2x3x4x5
+
+    """
+    if not isinstance(image, torch.Tensor):
+        raise TypeError(f"Input type is not a torch.Tensor. Got {type(image)}")
+
+    if len(image.shape) < 3 or image.shape[-3] != 3:
+        raise ValueError(f"Input size must have a shape of (*, 3, H, W). Got {image.shape}")
+
+    # 3x1x1, filled on the device in eager mode as in ``rgb_to_hls``.
+    if torch.jit.is_scripting():
+        _HLS2RGB = torch.tensor([[[0.0]], [[8.0]], [[4.0]]], device=image.device, dtype=image.dtype)
+    else:
+        _HLS2RGB = _device_literal([[[0.0]], [[8.0]], [[4.0]]], device=image.device, dtype=image.dtype)
+
+    im: torch.Tensor = image.unsqueeze(-4)
+    h_ch: torch.Tensor = im[..., 0, :, :]
+    l_ch: torch.Tensor = im[..., 1, :, :]
+    s_ch: torch.Tensor = im[..., 2, :, :]
+    h_ch = h_ch * (6 / math.pi)  # h * 360 / (2 * math.pi) / 30
+    a = s_ch * torch.min(l_ch, 1.0 - l_ch)
+
+    # kr = (0 + h) % 12
+    # kg = (8 + h) % 12
+    # kb = (4 + h) % 12
+    k: torch.Tensor = (h_ch + _HLS2RGB) % 12
+
+    # l - a * max(min(min(k - 3.0, 9.0 - k), 1), -1)
+    mink = torch.min(k - 3.0, 9.0 - k)
+    # ``mink`` is a buffer of this call, so without a derivative the clamp reuses it: one image-sized temporary fewer. A
+    # captured graph keeps that plain clamp whatever the grad mode, so that the check of ``torch.jit.trace`` under
+    # ``no_grad`` records the same graph.
+    if _is_tracing_or_exporting() or not _needs_derivatives(mink):
+        mink = mink.clamp_(min=-1.0, max=1.0)
+    else:
+        mink = _clamp_range(mink, -1.0, 1.0)
+    return torch.addcmul(l_ch, a, mink, value=-1)
+
+
+class RgbToHls(nn.Module):
+    r"""Convert an image from RGB to HLS (module form).
+
+    ``out = RgbToHls()(image)`` is :func:`rgb_to_hls` with its default ``eps``.
+
+    Convention:
+        - See the convention block of :func:`rgb_to_hls`.
+
+    Shape:
+        - image: ``(*, 3, H, W)``
+        - output: ``(*, 3, H, W)``
+
+    See Also:
+        - :func:`rgb_to_hls`: the one-call form, with an ``eps`` argument.
+        - :class:`HlsToRgb`: the inverse.
+
+    Examples:
+        >>> input = torch.rand(2, 3, 4, 5)
+        >>> hls = RgbToHls()
+        >>> output = hls(input)  # 2x3x4x5
+
+    """
+
+    ONNX_DEFAULT_INPUTSHAPE: ClassVar[list[int]] = [-1, 3, -1, -1]
+    ONNX_DEFAULT_OUTPUTSHAPE: ClassVar[list[int]] = [-1, 3, -1, -1]
+
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
+        """Convert an RGB tensor to HLS.
+
+        Args:
+            image: Input tensor with shape ``(*, 3, H, W)``.
+                Here, ``*`` means any number of leading dimensions (for example, batch size),
+                ``3`` corresponds to RGB channels, and ``H``/``W`` are height and width.
+
+        Returns:
+            HLS tensor with shape ``(*, 3, H, W)``.
+        """
+        return rgb_to_hls(image)
+
+
+class HlsToRgb(nn.Module):
+    r"""Convert an image from HLS to RGB (module form).
+
+    ``out = HlsToRgb()(image)`` is :func:`hls_to_rgb`.
+
+    Convention:
+        - See the convention block of :func:`hls_to_rgb`.
+
+    Shape:
+        - image: ``(*, 3, H, W)``
+        - output: ``(*, 3, H, W)``
+
+    See Also:
+        - :func:`hls_to_rgb`: the one-call form.
+        - :class:`RgbToHls`: the inverse.
+
+    References:
+        https://en.wikipedia.org/wiki/HSL_and_HSV
+
+    Examples:
+        >>> input = torch.rand(2, 3, 4, 5)
+        >>> rgb = HlsToRgb()
+        >>> output = rgb(input)  # 2x3x4x5
+
+    """
+
+    ONNX_DEFAULT_INPUTSHAPE: ClassVar[list[int]] = [-1, 3, -1, -1]
+    ONNX_DEFAULT_OUTPUTSHAPE: ClassVar[list[int]] = [-1, 3, -1, -1]
+
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
+        """Convert an HLS tensor to RGB.
+
+        Args:
+            image: Input tensor with shape ``(*, 3, H, W)``.
+                Here, ``*`` means any number of leading dimensions (for example, batch size),
+                ``3`` corresponds to HLS channels, and ``H``/``W`` are height and width.
+
+        Returns:
+            RGB tensor with shape ``(*, 3, H, W)``.
+        """
+        return hls_to_rgb(image)

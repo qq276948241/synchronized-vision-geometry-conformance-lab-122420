@@ -1,0 +1,159 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+import torch
+
+from kornia.augmentation import random_generator as rg
+from kornia.augmentation._2d.mix.base import MixAugmentationBaseV2
+from kornia.constants import DataKey, DType
+from kornia.core.utils import _to_device_nonblocking
+
+
+class RandomMixUpV2(MixAugmentationBaseV2):
+    r"""Mix pairs of images and labels, applied to a batch with probability ``p`` (default 1.0).
+
+    ``images, labels = RandomMixUpV2(data_keys=["input", "class"])(input, label)`` returns blended images and
+    paired labels with mixing coefficients. Use :class:`RandomCutMixV2` to replace a rectangular region instead.
+
+    Args:
+        p: probability for applying an augmentation to a batch. This param controls the augmentation
+                   probabilities batch-wisely.
+        lambda_val: min-max value of mixup strength. Default is 0-1.
+        same_on_batch: apply the same transformation across the batch.
+            This flag will not maintain permutation order.
+        keepdim: whether to keep the output shape the same as input (True) or broadcast it
+                        to the batch form (False).
+
+    Inputs:
+        - Input image tensors, shape of ``(B, C, H, W)``.
+        - Label: raw labels, shape of ``(B)``.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]:
+        - Adjusted image, shape of ``(B, C, H, W)``.
+        - Raw labels, permuted labels and lambdas for each mix, shape of ``(B, 3)``.
+
+    Convention:
+        - With ``data_keys=["input", "class"]``, the class output is ``(B, 3)``: its columns are the original
+          label, the label selected by ``_params["mixup_pairs"]``, and the sampled lambda. The image is
+          ``input * (1 - lambda) + paired_input * lambda``. Labels must be one-dimensional and are returned as
+          floating values in the image dtype, except that a ``float16`` or ``bfloat16`` image yields ``float32``
+          labels so integer class ids up to ``2 ** 24`` stay exact.
+        - ``p`` is a batch-wide gate applied once, unlike the per-sample ``p`` of :class:`RandomJigsaw`:
+          ``_params["batch_prob"]`` is all ones or all zeros,
+          and every row of a selected batch draws its lambda from ``lambda_val``. At ``p=0`` the image is unchanged
+          and the class output holds the original label twice with a zero lambda. ``same_on_batch=True`` shares
+          the lambda draw but not the pairing, which may pair a sample with itself.
+
+    .. image:: _static/img/RandomMixUpV2.png
+
+    Implementation for `mixup: BEYOND EMPIRICAL RISK MINIMIZATION` :cite:`zhang2018mixup`.
+
+    The implementation is on top of the following repository:
+    `https://github.com/hongyi-zhang/mixup/blob/master/cifar/utils.py
+    <https://github.com/hongyi-zhang/mixup/blob/master/cifar/utils.py>`_.
+
+    See the Convention block on :class:`~kornia.augmentation.MixAugmentationBaseV2`.
+
+    See Also:
+        - :class:`RandomCutMixV2`: mixes paired images through sampled rectangular regions.
+
+    Examples:
+        The loss and accuracy can use the returned original label, paired label and lambda:
+
+        .. code-block:: python
+
+            def loss_mixup(y, logits):
+                criterion = F.cross_entropy
+                loss_a = criterion(logits, y[:, 0].long(), reduction='none')
+                loss_b = criterion(logits, y[:, 1].long(), reduction='none')
+                return ((1 - y[:, 2]) * loss_a + y[:, 2] * loss_b).mean()
+
+            def acc_mixup(y, logits):
+                pred = torch.argmax(logits, dim=1).to(y.device)
+                return (1 - y[:, 2]) * pred.eq(y[:, 0]).float() + y[:, 2] * pred.eq(y[:, 1]).float()
+
+        >>> rng = torch.manual_seed(1)
+        >>> input = torch.rand(2, 1, 3, 3)
+        >>> label = torch.tensor([0, 1])
+        >>> mixup = RandomMixUpV2(data_keys=["input", "class"])
+        >>> mixup(input, label)
+        [tensor([[[[0.7576, 0.2793, 0.4031],
+                  [0.7347, 0.0293, 0.7999],
+                  [0.3971, 0.7544, 0.5695]]],
+        <BLANKLINE>
+        <BLANKLINE>
+                [[[0.4388, 0.6387, 0.5247],
+                  [0.6826, 0.3051, 0.4635],
+                  [0.4550, 0.5725, 0.4980]]]]), tensor([[0.0000, 0.0000, 0.1980],
+                [1.0000, 1.0000, 0.4162]])]
+
+    """
+
+    def __init__(
+        self,
+        lambda_val: Optional[Union[torch.Tensor, Tuple[float, float]]] = None,
+        same_on_batch: bool = False,
+        p: float = 1.0,
+        keepdim: bool = False,
+        data_keys: Optional[List[Union[str, int, DataKey]]] = None,
+    ) -> None:
+        super().__init__(p=1.0, p_batch=p, same_on_batch=same_on_batch, keepdim=keepdim, data_keys=data_keys)
+        self._param_generator = rg.MixupGenerator(lambda_val, p=1.0)
+
+    def apply_transform(
+        self, input: torch.Tensor, params: Dict[str, torch.Tensor], maybe_flags: Optional[Dict[str, Any]] = None
+    ) -> torch.Tensor:
+        input_permute = input.index_select(dim=0, index=_to_device_nonblocking(params["mixup_pairs"], input.device))
+
+        # Moved before it is expanded: the copy is B values instead of a full-size buffer, and every element of the
+        # broadcast holds the same value either way.
+        lam = _to_device_nonblocking(params["mixup_lambdas"].view(-1, 1, 1, 1), input.device, input.dtype)
+        lam = lam.expand_as(input)
+        return input * (1 - lam) + input_permute * lam
+
+    def apply_non_transform_class(
+        self, input: torch.Tensor, params: Dict[str, torch.Tensor], maybe_flags: Optional[Dict[str, Any]] = None
+    ) -> torch.Tensor:
+        image_dtype = DType.to_torch(int(params["dtype"].item()))
+        calc_dtype = image_dtype if image_dtype in (torch.float32, torch.float64) else torch.float32
+        return torch.stack(
+            [
+                input.to(device=input.device, dtype=calc_dtype),
+                input.to(device=input.device, dtype=calc_dtype),
+                torch.zeros((len(input),), device=input.device, dtype=calc_dtype),
+            ],
+            -1,
+        )
+
+    def apply_transform_class(
+        self, input: torch.Tensor, params: Dict[str, torch.Tensor], maybe_flags: Optional[Dict[str, Any]] = None
+    ) -> torch.Tensor:
+        labels_permute = input.index_select(dim=0, index=_to_device_nonblocking(params["mixup_pairs"], input.device))
+
+        image_dtype = DType.to_torch(int(params["dtype"].item()))
+        calc_dtype = image_dtype if image_dtype in (torch.float32, torch.float64) else torch.float32
+        return torch.stack(
+            [
+                input.to(device=input.device, dtype=calc_dtype),
+                labels_permute.to(device=input.device, dtype=calc_dtype),
+                _to_device_nonblocking(params["mixup_lambdas"], input.device, calc_dtype),
+            ],
+            -1,
+        )

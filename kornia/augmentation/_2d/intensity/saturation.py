@@ -1,0 +1,115 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from typing import Any, Dict, Optional, Tuple
+
+import torch
+
+from kornia.augmentation import random_generator as rg
+from kornia.augmentation._2d.intensity.base import IntensityAugmentationBase2D
+from kornia.augmentation.utils.param_validation import _learnable_range_bound, _load_unowned_learnable_range
+from kornia.core.utils import _clamp_unit_range, _to_device_nonblocking
+from kornia.enhance.adjust import adjust_saturation
+
+
+class RandomSaturation(IntensityAugmentationBase2D):
+    r"""Scale the HSV saturation of a three-channel image by a random factor.
+
+    ``output = RandomSaturation(saturation)(input)`` scales only the HSV saturation of each selected image by a
+    sampled factor. Use :class:`ColorJitter` for torchvision-compatible saturation, which blends the image with its
+    grayscale, ``factor * input + (1 - factor) * gray``.
+
+    .. image:: _static/img/RandomSaturation.png
+
+    See the Convention block on :class:`~kornia.augmentation.IntensityAugmentationBase2D`.
+
+    Args:
+        p: probability of applying the transformation.
+        saturation: the saturation factor to apply.
+        same_on_batch: apply the same transformation across the batch.
+        keepdim: whether to keep the output shape the same as input (True) or broadcast it
+                 to the batch form (False).
+    Shape:
+        - Input: ``(C, H, W)`` or ``(B, C, H, W)``, Optional: ``(B, 3, 3)``
+        - Output: ``(B, C, H, W)``
+
+    Convention:
+        - input values are clamped into ``[0, 1]`` before the operation, and the result is clamped
+          into the same range. This applies only to samples selected by the probability gate.
+        - the input must have three channels: the scaling is defined on the HSV saturation, and any other
+          channel count raises a ``ValueError`` on the forward pass.
+        - the drawn factor reaches :func:`kornia.enhance.adjust_saturation` unchanged, and ``1.0`` is the
+          identity, up to rounding, for a pixel in ``[0, 1]``.
+        - the HSV saturation is also clamped into ``[0, 1]`` before converting back to RGB.
+
+    .. note::
+        This function internally uses :func:`kornia.enhance.adjust_saturation`
+
+    See Also:
+        - :class:`RandomHue`: rotates hue instead of scaling saturation.
+        - :class:`ColorJiggle`: combines HSV saturation scaling with Kornia color adjustments.
+        - :class:`ColorJitter`: uses torchvision-compatible grayscale-blend saturation.
+
+    Examples:
+        >>> rng = torch.manual_seed(0)
+        >>> inputs = torch.rand(1, 3, 3, 3)
+        >>> aug = RandomSaturation(saturation = (0.5,2.),p=1.)
+        >>> aug(inputs)
+        tensor([[[[0.5569, 0.7682, 0.3529],
+                  [0.4811, 0.3474, 0.7411],
+                  [0.5028, 0.8964, 0.6772]],
+        <BLANKLINE>
+                 [[0.6323, 0.5358, 0.5265],
+                  [0.4203, 0.2706, 0.5525],
+                  [0.5185, 0.7863, 0.8681]],
+        <BLANKLINE>
+                 [[0.3711, 0.4989, 0.6816],
+                  [0.9152, 0.3971, 0.8742],
+                  [0.4636, 0.7060, 0.9527]]]])
+
+    To apply the exact augmenation again, you may take the advantage of the previous parameter state:
+
+        >>> input = torch.rand(1, 3, 32, 32)
+        >>> aug = RandomSaturation((0.8,1.2), p=1.)
+        >>> (aug(input) == aug(input, params=aug._params)).all()
+        tensor(True)
+
+    """
+
+    def __init__(
+        self,
+        saturation: Tuple[float, float] = (1.0, 1.0),
+        same_on_batch: bool = False,
+        p: float = 1.0,
+        keepdim: bool = False,
+    ) -> None:
+        super().__init__(p=p, same_on_batch=same_on_batch, keepdim=keepdim)
+        factor, center, bounds = _learnable_range_bound(saturation, "saturation", center=1.0)
+        self.saturation: torch.Tensor = factor
+        self._param_generator = rg.PlainUniformGenerator((self.saturation, "saturation_factor", center, bounds))
+        _load_unowned_learnable_range(self, "saturation", center)
+
+    def apply_transform(
+        self,
+        input: torch.Tensor,
+        params: Dict[str, torch.Tensor],
+        flags: Dict[str, Any],
+        transform: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        input = _clamp_unit_range(input)
+        saturation_factor = _to_device_nonblocking(params["saturation_factor"], input.device, input.dtype)
+        return _clamp_unit_range(adjust_saturation(input, saturation_factor))

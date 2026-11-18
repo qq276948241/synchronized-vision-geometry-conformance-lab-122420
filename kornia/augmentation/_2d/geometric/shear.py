@@ -1,0 +1,162 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+import math
+from typing import Any, Dict, Optional, Tuple, Union
+
+import torch
+
+from kornia.augmentation import random_generator as rg
+from kornia.augmentation._2d.geometric.base import GeometricAugmentationBase2D
+from kornia.constants import Resample, SamplePadding
+from kornia.core.utils import _as_tensor_nonblocking
+
+# from kornia.geometry.conversions import deg2rad (use torch.deg2rad instead)
+from kornia.geometry.transform import get_shear_matrix2d, warp_affine
+
+
+class RandomShear(GeometricAugmentationBase2D):
+    r"""Shear images by random angles in degrees, applied per sample with probability ``p`` (default 0.5).
+
+    ``output = RandomShear(shear, ...)(input)`` shears images of shape ``(B, C, H, W)`` about their centers by
+    sampled angles.
+
+    Args:
+        shear: Range of degrees to select from.
+            If float, a shear parallel to the x axis in the range (-shear, +shear) will be applied.
+            If (a, b), a shear parallel to the x axis in the range (a, b) will be applied.
+            If (a, b, c, d), then x-axis shear in (shear[0], shear[1]) and y-axis shear in (shear[2], shear[3])
+            will be applied. Will not apply shear by default.
+        resample: resample mode from "nearest" (0) or "bilinear" (1).
+        padding_mode: padding mode from "torch.zeros" (0), "border" (1) or "reflection" (2).
+        same_on_batch: apply the same transformation across the batch.
+        align_corners: interpolation flag.
+        p: probability of applying the transformation to each sample.
+        keepdim: whether to keep the output shape the same as input (True) or broadcast it to the batch form (False).
+
+    Shape:
+        - Input: ``(C, H, W)`` or ``(B, C, H, W)``
+        - Output: ``(B, C, H, W)``
+
+    Convention:
+        - See :class:`~kornia.augmentation.GeometricAugmentationBase2D` for coordinates, defaults and inverse.
+        - ``shear`` supplies one or two degree ranges for the x and y shears; a scalar or pair supplies only x
+          shear. The signs are those of :class:`RandomAffine`'s ``shear``.
+
+    .. note::
+        This function internally uses :func:`kornia.geometry.transform.warp_affine`.
+
+    .. note::
+        Unlike torchvision's ``RandomAffine(degrees=0, shear=...)``, which shears every image, this class shears each
+        sample with probability ``p``, 0.5 by default; with ``same_on_batch=True`` one draw decides for the whole batch.
+        Pass ``p=1.0`` to shear every sample.
+
+    See Also:
+        - :class:`RandomAffine`: samples a combined affine transformation.
+
+    Examples:
+        >>> import torch
+        >>> rng = torch.manual_seed(0)
+        >>> input = torch.rand(1, 1, 3, 3)
+        >>> aug = RandomShear((-5., 2., 5., 10.), p=1.)
+        >>> out = aug(input)
+        >>> out, aug.transform_matrix
+        (tensor([[[[0.4403, 0.7614, 0.1516],
+                  [0.1753, 0.3074, 0.6127],
+                  [0.4438, 0.8924, 0.4061]]]]), tensor([[[ 1.0000,  0.0100, -0.0100],
+                 [-0.1183,  0.9988,  0.1194],
+                 [ 0.0000,  0.0000,  1.0000]]]))
+        >>> aug.inverse(out)
+        tensor([[[[0.4045, 0.7577, 0.1393],
+                  [0.2071, 0.3074, 0.5582],
+                  [0.3958, 0.8868, 0.4265]]]])
+
+    To apply the exact augmenation again, you may take the advantage of the previous parameter state:
+        >>> input = torch.randn(1, 3, 32, 32)
+        >>> aug = RandomShear((-15., 20.), p=1.)
+        >>> (aug(input) == aug(input, params=aug._params)).all()
+        tensor(True)
+
+    """
+
+    def __init__(
+        self,
+        shear: Union[torch.Tensor, float, Tuple[float, float], Tuple[float, float, float, float]],
+        resample: Union[str, int, Resample] = Resample.BILINEAR.name,
+        same_on_batch: bool = False,
+        align_corners: bool = False,
+        padding_mode: Union[str, int, SamplePadding] = SamplePadding.ZEROS.name,
+        p: float = 0.5,
+        keepdim: bool = False,
+    ) -> None:
+        super().__init__(p=p, same_on_batch=same_on_batch, keepdim=keepdim)
+        self._param_generator: rg.ShearGenerator = rg.ShearGenerator(shear)
+        self.flags = {
+            "resample": Resample.get(resample),
+            "padding_mode": SamplePadding.get(padding_mode),
+            "align_corners": align_corners,
+        }
+
+    def compute_transformation(
+        self, input: torch.Tensor, params: Dict[str, torch.Tensor], flags: Dict[str, Any]
+    ) -> torch.Tensor:
+        # Inline ``deg2rad`` so the trace lowers to plain multiply (legacy ONNX has
+        # no symbolic for ``aten::deg2rad`` at opset 20).
+        deg2rad_factor: float = math.pi / 180.0
+        shear_x = _as_tensor_nonblocking(params["shear_x"], input.device, input.dtype) * deg2rad_factor
+        shear_y = _as_tensor_nonblocking(params["shear_y"], input.device, input.dtype) * deg2rad_factor
+        return get_shear_matrix2d(
+            _as_tensor_nonblocking(params["center"], input.device, input.dtype),
+            shear_x,
+            shear_y,
+        )
+
+    def apply_transform(
+        self,
+        input: torch.Tensor,
+        params: Dict[str, torch.Tensor],
+        flags: Dict[str, Any],
+        transform: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        _, _, height, width = input.shape
+        if not isinstance(transform, torch.Tensor):
+            raise TypeError(f"Expected the `transform` be a torch.Tensor. Got {type(transform)}.")
+
+        return warp_affine(
+            input,
+            transform[:, :2, :],
+            (height, width),
+            flags["resample"].name.lower(),
+            align_corners=flags["align_corners"],
+            padding_mode=flags["padding_mode"].name.lower(),
+        )
+
+    def inverse_transform(
+        self,
+        input: torch.Tensor,
+        flags: Dict[str, Any],
+        transform: Optional[torch.Tensor] = None,
+        size: Optional[Tuple[int, int]] = None,
+    ) -> torch.Tensor:
+        if not isinstance(transform, torch.Tensor):
+            raise TypeError(f"Expected the `transform` be a torch.Tensor. Got {type(transform)}.")
+        return self.apply_transform(
+            input,
+            params=self._params,
+            transform=torch.as_tensor(transform, device=input.device, dtype=input.dtype),
+            flags=flags,
+        )

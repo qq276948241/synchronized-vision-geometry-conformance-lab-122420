@@ -1,0 +1,117 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from typing import Any, Dict, Optional, Tuple
+
+import torch
+
+from kornia.augmentation import random_generator as rg
+from kornia.augmentation._2d.intensity.base import IntensityAugmentationBase2D
+from kornia.core.utils import _clamp_unit_range, _to_device_nonblocking
+from kornia.enhance.adjust import adjust_gamma
+
+
+class RandomGamma(IntensityAugmentationBase2D):
+    r"""Apply a random gamma power law to unit-range images.
+
+    ``output = RandomGamma(gamma, gain)(input)`` raises pixels in selected images to a sampled gamma and multiplies
+    them by sampled gain.
+
+    The formula is torchvision's ``adjust_gamma`` for a float image: ``clamp(gain * input ** gamma, 0, 1)``.
+
+    .. image:: _static/img/RandomGamma.png
+
+    See the Convention block on :class:`~kornia.augmentation.IntensityAugmentationBase2D`.
+
+    Args:
+        p: probability of applying the transformation.
+        gamma: the gamma factor to apply.
+        gain: the gain factor to apply.
+        same_on_batch: apply the same transformation across the batch.
+        keepdim: whether to keep the output shape the same as input (True) or broadcast it
+                 to the batch form (False).
+    Shape:
+        - Input: ``(C, H, W)`` or ``(B, C, H, W)``, Optional: ``(B, 3, 3)``
+        - Output: ``(B, C, H, W)``
+
+    Convention:
+        - input values are clamped into ``[0, 1]`` before the operation, and the result is clamped
+          into the same range. This applies only to samples selected by the probability gate.
+        - the clamp is not optional: unlike :class:`RandomBrightness` and :class:`RandomContrast` this class has
+          no ``clip_output``.
+        - ``gamma`` and ``gain`` must be non-negative. Neither is checked at construction: the check is in
+          :func:`kornia.enhance.adjust_gamma`, so a negative value raises a ``RuntimeError`` on the forward pass.
+          It is not run for an MPS image, where a negative value goes through the same formula unchecked.
+
+    .. note::
+        This function internally uses :func:`kornia.enhance.adjust_gamma`
+
+    See Also:
+        - :class:`RandomBrightness`: applies an additive linear adjustment.
+        - :class:`RandomContrast`: applies a multiplicative linear adjustment.
+
+    Examples:
+        >>> rng = torch.manual_seed(0)
+        >>> inputs = torch.rand(1, 3, 3, 3)
+        >>> aug = RandomGamma((0.5,2.),(1.5,1.5),p=1.)
+        >>> aug(inputs)
+        tensor([[[[1.0000, 1.0000, 0.3912],
+                  [0.4883, 0.7801, 1.0000],
+                  [1.0000, 1.0000, 0.9702]],
+        <BLANKLINE>
+                 [[1.0000, 0.8368, 0.9048],
+                  [0.1824, 0.5597, 0.7609],
+                  [1.0000, 1.0000, 1.0000]],
+        <BLANKLINE>
+                 [[0.5452, 0.7441, 1.0000],
+                  [1.0000, 0.8990, 1.0000],
+                  [0.9267, 1.0000, 1.0000]]]])
+
+    To apply the exact augmenation again, you may take the advantage of the previous parameter state:
+        >>> input = torch.rand(1, 3, 32, 32)
+        >>> aug = RandomGamma((0.8,1.2), p=1.)
+        >>> (aug(input) == aug(input, params=aug._params)).all()
+        tensor(True)
+
+    """
+
+    SUBSTITUTE_SKIPPED_SAMPLES = True
+
+    def __init__(
+        self,
+        gamma: Tuple[float, float] = (1.0, 1.0),
+        gain: Tuple[float, float] = (1.0, 1.0),
+        same_on_batch: bool = False,
+        p: float = 1.0,
+        keepdim: bool = False,
+    ) -> None:
+        super().__init__(p=p, same_on_batch=same_on_batch, keepdim=keepdim)
+        self._param_generator = rg.PlainUniformGenerator(
+            (gamma, "gamma_factor", None, None), (gain, "gain_factor", None, None)
+        )
+
+    def apply_transform(
+        self,
+        input: torch.Tensor,
+        params: Dict[str, torch.Tensor],
+        flags: Dict[str, Any],
+        transform: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        input = _clamp_unit_range(input)
+        gamma_factor = _to_device_nonblocking(params["gamma_factor"], input.device, input.dtype)
+        gain_factor = _to_device_nonblocking(params["gain_factor"], input.device, input.dtype)
+        return adjust_gamma(input, gamma_factor, gain_factor)

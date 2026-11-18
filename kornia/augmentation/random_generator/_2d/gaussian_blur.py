@@ -1,0 +1,87 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from typing import Dict, Tuple, Union
+
+import torch
+from torch import Tensor
+
+from kornia.augmentation.random_generator.base import (
+    RandomGeneratorBase,
+    UniformDistribution,
+)
+from kornia.augmentation.utils import (
+    _adapted_rsampling,
+    _common_param_check,
+    _joint_range_check,
+)
+
+__all__ = ["RandomGaussianBlurGenerator"]
+
+
+class RandomGaussianBlurGenerator(RandomGeneratorBase):
+    r"""Generate random gaussian blur parameters for a batch of images.
+
+    Args:
+        sigma: The range to uniformly sample the standard deviation for the Gaussian kernel.
+
+    Returns:
+        A dict of parameters to be passed for transformation.
+            - sigma: element-wise standard deviation with a shape of (B,).
+
+    Note:
+        The generated random numbers are not reproducible across different devices and dtypes. By default,
+        the parameters will be generated on CPU in float32. This can be changed by calling
+        ``self.set_rng_device_and_dtype(device="cuda", dtype=torch.float64)``.
+
+    """
+
+    def __init__(self, sigma: Union[Tuple[float, float], Tensor] = (0.1, 2.0)) -> None:
+        super().__init__()
+        if sigma[1] < sigma[0]:
+            raise TypeError(f"sigma_max should be higher than sigma_min: {sigma} passed.")
+
+        # `sigma` may be a plain (min, max) tuple of Python floats -- no device/dtype,
+        # nothing for `.to()`/`.half()` to move -- or a Tensor supplied by the caller.
+        # Only the Tensor case is derived state that needs to track the module: register
+        # it as a non-persistent buffer so `.to()` moves it through the normal nn.Module
+        # machinery instead of leaving it behind as a plain attribute. persistent=False
+        # keeps state_dict() keys unchanged, same rationale/convention as #4079/#4319.
+        if isinstance(sigma, torch.Tensor):
+            self.register_buffer("sigma", sigma, persistent=False)
+        else:
+            self.sigma = sigma
+        self.sigma_sampler: UniformDistribution
+
+    def __repr__(self) -> str:
+        return f"sigma={self.sigma}"
+
+    def make_samplers(self, device: torch.device, dtype: torch.dtype) -> None:
+        if not isinstance(self.sigma, (torch.Tensor)):
+            sigma = torch.tensor(self.sigma, device=device, dtype=dtype)
+        else:
+            sigma = self.sigma.to(device=device, dtype=dtype)
+
+        _joint_range_check(sigma, "sigma", (0, float("inf")))
+
+        self.sigma_sampler = UniformDistribution(sigma[0], sigma[1], validate_args=False)
+
+    def forward(self, batch_shape: Tuple[int, ...], same_on_batch: bool = False) -> Dict[str, Tensor]:
+        batch_size = batch_shape[0]
+        _common_param_check(batch_size, same_on_batch)
+        sigma = _adapted_rsampling((batch_size,), self.sigma_sampler, same_on_batch)
+        return {"sigma": sigma}

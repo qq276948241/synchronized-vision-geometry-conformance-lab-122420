@@ -1,0 +1,245 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from typing import Any, Dict, Optional, Tuple, Union
+
+import torch
+
+from kornia.augmentation import random_generator as rg
+from kornia.augmentation._2d.base import _input_metadata_only
+from kornia.augmentation._2d.geometric.base import GeometricAugmentationBase2D
+from kornia.augmentation._2d.geometric.resized_crop import _one_pixel_axes
+from kornia.constants import Resample
+from kornia.core.utils import _to_device_nonblocking, is_compiling
+from kornia.geometry.transform import crop_by_transform_mat, get_perspective_transform, resize
+from kornia.geometry.transform._crop import _corner_aligned_resize_transform, _half_pixel_resize_transform
+from kornia.geometry.transform.affwarp import _side_to_image_size
+
+
+class Resize(GeometricAugmentationBase2D):
+    """Resample images to a requested spatial size, applied to a batch with probability ``p`` (default 1.0).
+
+    ``output = Resize(size, ...)(input)`` resamples images of shape ``(B, C, H, W)`` to ``size``.
+
+    Args:
+        size: Size (h, w) in pixels of the resized region or just one side.
+        side: Which side to resize, if size is only of type int.
+        resample: Resampling mode.
+        align_corners: interpolation flag.
+        antialias: if True, then image will be filtered with Gaussian before downscaling. No effect for upscaling.
+        p: probability of resizing the batch; one draw decides for every sample.
+        keepdim: whether to keep the output shape the same as input (True) or broadcast it
+            to the batch form (False).
+
+    Convention:
+        See :class:`~kornia.augmentation.GeometricAugmentationBase2D` for coordinates, defaults and inverse.
+        A tuple ``size`` is the exact ``(height, width)`` output.
+        With an integer, ``side`` selects which input side is set to that value while preserving aspect ratio:
+        ``"short"`` (the default) selects the shortest side, ``"long"`` the longest, ``"vert"`` the height, and
+        ``"horz"`` the width. The derived side is truncated toward zero; if it becomes zero, the resize raises
+        ``AssertionError`` (for example, ``Resize(4, side="long")`` or ``LongestMaxSize(4)`` on a 1-by-10 image).
+        This class uses :func:`kornia.geometry.transform.resize`; ``align_corners`` is forwarded for bilinear and
+        bicubic sampling, and ``transform_matrix`` follows the grid they sample: at ``align_corners=False`` it is
+        the half-pixel map ``x' = (x + 0.5) * W_out / W_in - 0.5`` (likewise for ``y``), and at ``True`` it maps
+        the corner pixel centers onto each other; along an axis where the input or output is one pixel, it is a
+        translation sending the first input pixel onto output pixel 0, the pixel that resize samples there.
+        Nearest sampling uses the half-pixel grid and PyTorch's ``nearest-exact`` interpolation.
+        ``inverse()`` resamples to the prior canvas and cannot recover values discarded by a resize.
+
+    See Also:
+        - :class:`LongestMaxSize`: bounds the longest image side while preserving aspect ratio.
+        - :class:`SmallestMaxSize`: sets the shortest image side while preserving aspect ratio.
+
+    """
+
+    def __init__(
+        self,
+        size: Union[int, Tuple[int, int]],
+        side: str = "short",
+        resample: Union[str, int, Resample] = Resample.BILINEAR.name,
+        align_corners: bool = True,
+        antialias: bool = False,
+        p: float = 1.0,
+        keepdim: bool = False,
+    ) -> None:
+        super().__init__(p=1.0, same_on_batch=True, p_batch=p, keepdim=keepdim)
+        self._param_generator = rg.ResizeGenerator(resize_to=size, side=side)
+        self.flags = {
+            "size": size,
+            "side": side,
+            "resample": Resample.get(resample),
+            "align_corners": align_corners,
+            "antialias": antialias,
+        }
+
+    # apply_transform does a batched resize and ignores the transform matrix, so defer the
+    # matrix build (which needs a linalg solve) until `.transform_matrix` is read.
+    _compute_matrix_lazily = True
+
+    @_input_metadata_only
+    def compute_transformation(
+        self, input: torch.Tensor, params: Dict[str, torch.Tensor], flags: Dict[str, Any]
+    ) -> torch.Tensor:
+        if flags["resample"] == Resample.NEAREST or (
+            not flags["align_corners"] and flags["resample"] in (Resample.BILINEAR, Resample.BICUBIC)
+        ):
+            src = _to_device_nonblocking(params["src"], input.device, input.dtype)
+            dst = _to_device_nonblocking(params["dst"], input.device, input.dtype)
+            return _half_pixel_resize_transform(src, dst).expand(input.shape[0], -1, -1)
+        # NOTE: a former `if params["output_size"] == input.shape[-2:]: return eye_like(...)`
+        # short-circuit was dead code — comparing a tensor to a ``torch.Size`` falls back to
+        # identity ``==`` and is *always* Python ``False``, so the branch never ran. It also
+        # graph-broke torch.compile (a Python ``if`` on a would-be tensor). Dropped; the
+        # perspective transform below already yields identity when src == dst, so behaviour is
+        # byte-identical.
+        src, dst = params["src"], params["dst"]
+        transform: torch.Tensor = get_perspective_transform(src, dst)
+        # A one-pixel source or output axis has no corner-aligned scale and the solve returns NaN (#6644). As in
+        # RandomResizedCrop, that axis is a translation onto output pixel 0, where F.interpolate samples the first
+        # pixel; every other size keeps the solved matrix bit for bit.
+        one_pixel = (_one_pixel_axes(src, src.device) | _one_pixel_axes(dst, src.device)).any(-1)
+        transform = torch.where(one_pixel[:, None, None], _corner_aligned_resize_transform(src, dst), transform)
+        return _to_device_nonblocking(transform, input.device, input.dtype).expand(input.shape[0], -1, -1)
+
+    def apply_transform(
+        self,
+        input: torch.Tensor,
+        params: Dict[str, torch.Tensor],
+        flags: Dict[str, Any],
+        transform: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        # The generator always sets `src` to the full input box, so the per-sample crop is a
+        # no-op and this reduces to a single batched resize of the whole input to `output_size`.
+        # Using the static `flags["size"]` for a tuple size keeps this torch.compile
+        # fullgraph-safe (an int side depends on the input aspect ratio, so it falls back to the
+        # data-dependent `output_size` param).
+        if isinstance(flags["size"], (tuple, list)):
+            out_size: Tuple[int, int] = (int(flags["size"][0]), int(flags["size"][1]))
+        elif is_compiling() or input.shape[0] == 0:
+            # `output_size` is a function of the (static) input shape; recompute it rather than read the tensor,
+            # which graph capture (torch.compile, torch.export) cannot do.
+            # An empty batch has no row to read it from, and the generator returns no `output_size` for it (#4429).
+            h, w = input.shape[-2:]
+            out_size = _side_to_image_size(int(flags["size"]), w / h, flags["side"])
+        else:
+            out_size = tuple(params["output_size"][0].tolist())
+        return resize(
+            input,
+            out_size,
+            interpolation="nearest-exact" if flags["resample"] == Resample.NEAREST else flags["resample"].name.lower(),
+            align_corners=(
+                flags["align_corners"] if flags["resample"] in [Resample.BILINEAR, Resample.BICUBIC] else None
+            ),
+            antialias=flags["antialias"],
+        )
+
+    def inverse_transform(
+        self,
+        input: torch.Tensor,
+        flags: Dict[str, Any],
+        transform: Optional[torch.Tensor] = None,
+        size: Optional[Tuple[int, int]] = None,
+    ) -> torch.Tensor:
+        if not isinstance(size, tuple):
+            raise TypeError(f"Expected the size be a tuple. Got {type(size)}")
+
+        if not isinstance(transform, torch.Tensor):
+            raise TypeError(f"Expected the `transform` be a torch.Tensor. Got {type(transform)}.")
+
+        if flags["resample"] == Resample.NEAREST:
+            # ``grid_sample`` only supports legacy ``nearest``. The forward path uses
+            # ``nearest-exact``, so invert a resize with the same interpolation rule.
+            return resize(input, size, interpolation="nearest-exact")
+
+        return crop_by_transform_mat(
+            input,
+            transform[:, :2, :],
+            size,
+            flags["resample"].name.lower(),
+            "zeros",
+            flags["align_corners"],
+        )
+
+
+class LongestMaxSize(Resize):
+    """Resize so the longest side equals ``max_size``, applied to a batch with probability ``p`` (default 1.0).
+
+    ``output = LongestMaxSize(max_size)(input)`` resizes images while preserving their aspect ratio.
+    Use :class:`SmallestMaxSize` to set the shortest side instead.
+
+    Args:
+        max_size: length of the longest output side.
+        resample: Resampling mode, as in :class:`Resize`.
+        align_corners: interpolation flag, as in :class:`Resize`.
+        p: probability of resizing the batch; one draw decides for every sample.
+
+    Convention:
+        See :class:`Resize` for the common resize conventions. This behaves like
+        ``Resize(max_size, side="long", antialias=False, keepdim=False)``; ``antialias`` and ``keepdim``
+        are not accepted constructor arguments. Its longest output side equals ``max_size`` and the other
+        side is truncated while preserving aspect ratio.
+
+    See Also:
+        - :class:`SmallestMaxSize`: makes the shortest side equal to its bound.
+        - :class:`Resize`: resamples to an explicit output size.
+
+    """
+
+    def __init__(
+        self,
+        max_size: int,
+        resample: Union[str, int, Resample] = Resample.BILINEAR.name,
+        align_corners: bool = True,
+        p: float = 1.0,
+    ) -> None:
+        # TODO: Support max_size list input to randomly select from
+        super().__init__(size=max_size, side="long", resample=resample, align_corners=align_corners, p=p)
+
+
+class SmallestMaxSize(Resize):
+    """Resize so the shortest side equals ``max_size``, applied to a batch with probability ``p`` (default 1.0).
+
+    ``output = SmallestMaxSize(max_size)(input)`` resizes images while preserving their aspect ratio.
+    Use :class:`LongestMaxSize` to bound the longest side instead.
+
+    Args:
+        max_size: length of the shortest output side.
+        resample: Resampling mode, as in :class:`Resize`.
+        align_corners: interpolation flag, as in :class:`Resize`.
+        p: probability of resizing the batch; one draw decides for every sample.
+
+    Convention:
+        See :class:`Resize` for the common resize conventions. This behaves like
+        ``Resize(max_size, side="short", antialias=False, keepdim=False)``; ``antialias`` and ``keepdim``
+        are not accepted constructor arguments. Its shortest output side equals ``max_size`` and the other
+        side is truncated while preserving aspect ratio.
+
+    See Also:
+        - :class:`LongestMaxSize`: makes the longest side equal to its bound.
+        - :class:`Resize`: resamples to an explicit output size.
+
+    """
+
+    def __init__(
+        self,
+        max_size: int,
+        resample: Union[str, int, Resample] = Resample.BILINEAR.name,
+        align_corners: bool = True,
+        p: float = 1.0,
+    ) -> None:
+        # TODO: Support max_size list input to randomly select from
+        super().__init__(size=max_size, side="short", resample=resample, align_corners=align_corners, p=p)

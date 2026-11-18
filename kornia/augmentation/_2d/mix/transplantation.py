@@ -1,0 +1,441 @@
+# LICENSE HEADER MANAGED BY add-license-header
+#
+# Copyright 2018 Kornia Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+from __future__ import annotations
+
+from typing import Any, Optional, Sequence, Union
+
+import torch
+
+from kornia.augmentation._2d.mix.base import MixAugmentationBaseV2
+from kornia.augmentation.utils import _validate_input_dtype
+from kornia.constants import DataKey
+from kornia.core.check import KORNIA_CHECK
+from kornia.core.utils import _to_device_nonblocking
+
+__all__ = ["RandomTransplantation"]
+
+
+class RandomTransplantation(MixAugmentationBaseV2):
+    r"""Paste a labelled region from the previous batch image, applied per sample with probability ``p`` (default 0.5).
+
+    ``image_out, mask_out = RandomTransplantation(data_keys=["input", "mask"])(input, mask)`` copies the region of
+    one drawn label, image features and segmentation mask alike, from the previous batch image into each selected
+    image. Use :class:`RandomTransplantation3D` for volume dispatch in
+    :class:`~kornia.augmentation.container.AugmentationSequential`.
+
+    Args:
+        excluded_labels: sequence of labels which should not be transplanted from a donor. This can be useful if only
+          parts of the image are annotated and the non-annotated regions (with a specific label index) should be
+          excluded from the augmentation. If no label is left in a donor image, that acceptor receives nothing
+          while the rest of the batch is transplanted as usual.
+        p: probability of applying the transformation to each sample. This parameter controls how many images in a
+          batch receive a transplant.
+        p_batch: probability for applying an augmentation to a batch. This param controls the augmentation
+          probabilities batch-wise.
+        data_keys: the input type sequential for applying augmentations. There must be at least one "mask" torch.Tensor.
+          If no data keys are given, the first torch.Tensor is assumed to be `DataKey.INPUT` and the second
+          torch.Tensor `DataKey.MASK`.
+          Accepts "input", "mask".
+
+    Note:
+        - This augmentation requires that segmentation masks are available for all images in the batch and that at
+          least some objects in the image are annotated.
+        - When using this class directly (`RandomTransplantation()(...)`), it works for arbitrary spatial dimensions
+          including 2D and 3D images. When wrapping in
+          :class:`kornia.augmentation.container.AugmentationSequential`, use
+          :class:`kornia.augmentation.RandomTransplantation` for 2D and
+          :class:`kornia.augmentation.RandomTransplantation3D` for 3D images.
+
+    Inputs:
+        - Segmentation mask torch.Tensor which is used to determine the objects for transplantation: ``(B, *)``.
+        - (optional) Additional image or mask tensors where the features are transplanted based on the first
+          segmentation mask: ``(B, C, *)`` (`DataKey.INPUT`) or ``(B, *)`` (`DataKey.MASK`).
+
+    Returns:
+        torch.Tensor | list[torch.Tensor]:
+
+        torch.Tensor:
+            - Augmented mask tensors: ``(B, *)``.
+        list[torch.Tensor]:
+            - Augmented mask tensors: ``(B, *)``.
+            - Additional augmented image or mask tensors: ``(B, C, *)`` (`DataKey.INPUT`) or ``(B, *)``
+              (`DataKey.MASK`).
+
+    Convention:
+        - the transplant is driven by the first ``"mask"`` input. An image is ``(B, C, *spatial)`` and a mask
+          ``(B, *spatial)`` for any number of spatial dimensions, including none (a ``(B,)`` mask moves whole
+          images). There is no unbatched form, and the inherited ``keepdim`` is inert on a direct call. In
+          :class:`~kornia.augmentation.container.AugmentationSequential` a 2D ``(B, H, W)`` mask comes back as
+          ``(B, 1, H, W)``, like from any other child, unless the container sets ``keepdim=True``.
+        - ``p`` gates samples and ``p_batch`` the whole call. The donor of acceptor ``i`` is image ``(i - 1) mod B``
+          of the full batch, with its original content, whether or not it is an acceptor itself; at ``B = 1`` the
+          call is an identity.
+        - one label is drawn uniformly from the donor's distinct labels minus ``excluded_labels`` (over labels, not
+          area), on the global CPU generator whatever the mask's device. An acceptor whose donor has no eligible
+          label is dropped from ``acceptor_indices`` and its ``batch_prob`` is cleared.
+        - ``selection`` in ``_params`` is what the transform reads: row ``d`` marks the positions moved from
+          ``donor_indices[d]`` into ``acceptor_indices[d]``. A ``params`` passed back is used as given and completed
+          in place. Labels are drawn only when ``selected_labels`` and ``selection`` are both missing; a missing
+          ``selection`` alone is rebuilt from the given labels as they are (by design, ``excluded_labels`` filters
+          only drawn labels), and a label list shorter than the acceptors leaves the trailing ones untouched.
+        - images are ``float16``, ``bfloat16``, ``float32`` or ``float64``; a mask keeps its own dtype (``bool``,
+          integer or floating). Only ``"input"`` / ``"image"`` and ``"mask"`` keys are implemented; any other key
+          raises ``NotImplementedError``. A mask is needed only to draw the parameters; a call that draws them
+          without one, or whose inputs do not match ``data_keys``, raises a kornia error that names the mask (and
+          the key count, on a mismatch) before any input is read. With a complete ``params`` any subset of the
+          inputs is accepted, which is how :class:`~kornia.augmentation.container.AugmentationSequential` applies
+          the transplant, one input at a time. Outputs come back in input order, a single one as a bare tensor.
+        - like every mix augmentation it is not geometric: ``transform_matrix`` and ``inverse()`` both raise
+          ``RuntimeError``, and the ``inverse()`` of a :class:`~kornia.augmentation.container.AugmentationSequential`
+          holding one raises the same error.
+        - a mask with a singleton channel axis, ``(B, 1, *spatial)``, next to an image of the same rank is read as
+          the ``(B, *spatial)`` mask: the labels and ``selection`` come from its spatial layout and it comes back in
+          its own ``(B, 1, *spatial)`` layout. That is the layout a container hands on once any other augmentation
+          has run, so the transplant works at any position in a pipeline, not only as the first step
+          (`#4707 <https://github.com/kornia/kornia/issues/4707>`_). A further mask one rank above the driving
+          mask is read as ``(B, C, *spatial)``, and every channel moves through the same ``selection``. With no
+          image in the call, a mask keeps its own rank and a size-1 first spatial axis is not squeezed.
+
+    .. image:: _static/img/RandomTransplantation.png
+
+    The augmentation is described in `Semantic segmentation of surgical hyperspectral images under geometric domain
+    shifts` :cite:`sellner2023semantic`.
+
+    See Also:
+        - :class:`RandomTransplantation3D`: performs transplantation on 3D volumes and masks.
+
+    Examples:
+        >>> import torch
+        >>> rng = torch.manual_seed(0)
+        >>> aug = RandomTransplantation(p=1.)
+        >>> image = torch.randn(2, 3, 5, 5)
+        >>> mask = torch.randint(0, 3, (2, 5, 5))
+        >>> mask
+        tensor([[[0, 0, 1, 1, 0],
+                 [1, 2, 0, 0, 0],
+                 [1, 2, 1, 1, 0],
+                 [0, 0, 0, 0, 2],
+                 [2, 2, 2, 0, 2]],
+        <BLANKLINE>
+                [[2, 0, 0, 2, 1],
+                 [2, 1, 0, 2, 1],
+                 [2, 0, 1, 0, 2],
+                 [2, 2, 2, 0, 2],
+                 [2, 1, 0, 0, 0]]])
+        >>> image_out, mask_out = aug(image, mask)
+        >>> image_out.shape
+        torch.Size([2, 3, 5, 5])
+        >>> mask_out.shape
+        torch.Size([2, 5, 5])
+        >>> mask_out
+        tensor([[[2, 0, 1, 2, 0],
+                 [2, 2, 0, 2, 0],
+                 [2, 2, 1, 1, 2],
+                 [2, 2, 2, 0, 2],
+                 [2, 2, 2, 0, 2]],
+        <BLANKLINE>
+                [[0, 0, 0, 2, 0],
+                 [2, 1, 0, 0, 0],
+                 [2, 0, 1, 0, 0],
+                 [0, 0, 0, 0, 2],
+                 [2, 1, 0, 0, 0]]])
+        >>> aug._params["selected_labels"]  # Image 0 received label 2 from image 1 and image 1 label 0 from image 0
+        tensor([2, 0])
+
+    You can apply the same augmentation again in which case the same objects get transplanted between the images:
+
+        >>> aug._params["selection"]  # The pixels (objects) which get transplanted
+        tensor([[[ True, False, False,  True, False],
+                 [ True, False, False,  True, False],
+                 [ True, False, False, False,  True],
+                 [ True,  True,  True, False,  True],
+                 [ True, False, False, False, False]],
+        <BLANKLINE>
+                [[ True,  True, False, False,  True],
+                 [False, False,  True,  True,  True],
+                 [False, False, False, False,  True],
+                 [ True,  True,  True,  True, False],
+                 [False, False, False,  True, False]]])
+        >>> image2 = torch.zeros(2, 3, 5, 5)
+        >>> image2[1] = 1
+        >>> image2[:, 0]
+        tensor([[[0., 0., 0., 0., 0.],
+                 [0., 0., 0., 0., 0.],
+                 [0., 0., 0., 0., 0.],
+                 [0., 0., 0., 0., 0.],
+                 [0., 0., 0., 0., 0.]],
+        <BLANKLINE>
+                [[1., 1., 1., 1., 1.],
+                 [1., 1., 1., 1., 1.],
+                 [1., 1., 1., 1., 1.],
+                 [1., 1., 1., 1., 1.],
+                 [1., 1., 1., 1., 1.]]])
+        >>> image_out2, mask_out2 = aug(image2, mask, params=aug._params)
+        >>> image_out2[:, 0]
+        tensor([[[1., 0., 0., 1., 0.],
+                 [1., 0., 0., 1., 0.],
+                 [1., 0., 0., 0., 1.],
+                 [1., 1., 1., 0., 1.],
+                 [1., 0., 0., 0., 0.]],
+        <BLANKLINE>
+                [[0., 0., 1., 1., 0.],
+                 [1., 1., 0., 0., 0.],
+                 [1., 1., 1., 1., 0.],
+                 [0., 0., 0., 0., 1.],
+                 [1., 1., 1., 0., 1.]]])
+
+    """
+
+    def __init__(
+        self,
+        excluded_labels: Optional[Union[Sequence[int], torch.Tensor]] = None,
+        p: float = 0.5,
+        p_batch: float = 1.0,
+        data_keys: Optional[list[str | int | DataKey]] = None,
+    ) -> None:
+        super().__init__(p=p, p_batch=p_batch)
+
+        if excluded_labels is None:
+            excluded_labels = []
+        if not isinstance(excluded_labels, torch.Tensor):
+            excluded_labels = torch.tensor(excluded_labels)
+        self.excluded_labels: torch.Tensor = excluded_labels
+        KORNIA_CHECK(
+            self.excluded_labels.ndim == 1,
+            f"excluded_labels must be a 1-dimensional sequence, but got {self.excluded_labels.ndim} dimensions.",
+        )
+
+        if data_keys is None:
+            data_keys = [DataKey.INPUT, DataKey.MASK]
+        self.data_keys = [DataKey.get(inp) for inp in data_keys]
+        self._channel_dim = 1
+
+    def apply_non_transform_mask(
+        self, input: torch.Tensor, params: dict[str, torch.Tensor], flags: dict[str, Any]
+    ) -> torch.Tensor:
+        return input
+
+    def transform_input(self, acceptor: torch.Tensor, donor: torch.Tensor, selection: torch.Tensor) -> torch.Tensor:
+        # Expand selection to the channel dimension
+        selection = _to_device_nonblocking(selection, acceptor.device).unsqueeze(dim=self._channel_dim).expand_as(donor)
+        # The same values as ``acceptor[selection] = donor[selection]``, without the ``nonzero`` that boolean indexing
+        # runs, which reads the selection back on the host.
+        return torch.where(selection, donor, acceptor)
+
+    def transform_mask(self, acceptor: torch.Tensor, donor: torch.Tensor, selection: torch.Tensor) -> torch.Tensor:
+        if acceptor.ndim == selection.ndim + 1:
+            # A mask with a singleton channel axis, ``(B, 1, *spatial)``, as a container hands it on (#4707).
+            selection = selection.unsqueeze(dim=self._channel_dim).expand_as(donor)
+        # As in ``transform_input``: a ``where`` instead of boolean indexing, which reads the selection on the host.
+        return torch.where(_to_device_nonblocking(selection, acceptor.device), donor, acceptor)
+
+    def _check_mask_given(self, input: Sequence[torch.Tensor], data_keys: list[DataKey]) -> None:
+        # The parameters are drawn from the mask, so name it before any lookup fails on its absence.
+        names = [k.name.lower() for k in data_keys]
+        KORNIA_CHECK(
+            len(data_keys) == len(input),
+            f"Length of keys ({len(data_keys)}) does not match number of inputs ({len(input)}). "
+            f"{type(self).__name__} needs a mask to draw its parameters: pass one tensor per data_keys entry, "
+            f"the mask included, or pass complete params. Got data_keys={names}.",
+        )
+        KORNIA_CHECK(
+            DataKey.MASK in data_keys,
+            f"{type(self).__name__} needs a mask to draw its parameters: pass one and name it with a 'mask' "
+            f"entry in data_keys, or pass complete params. Got data_keys={names}.",
+        )
+
+    def params_from_input(
+        self,
+        *input: torch.Tensor,
+        data_keys: list[DataKey],
+        params: dict[str, torch.Tensor],
+        extra_args: Optional[dict[DataKey, dict[str, Any]]] = None,
+    ) -> dict[str, torch.Tensor]:
+        """Compute parameters for the transformation which are based on one or more input tensors.
+
+        This function is, for example, called by :class:`kornia.augmentation.container.ops.AugmentationSequentialOps`
+        before the augmentation is applied on the individual input tensors.
+
+        Args:
+            *input: All input tensors passed to the augmentation pipeline.
+            data_keys: Associated data key for every input torch.Tensor.
+            params: Dictionary of parameters computed so far by the augmentation pipeline (e.g. including the
+                    `batch_prob`).
+            extra_args: Optional dictionary of extra arguments with specific options for different input types.
+
+        Returns:
+             Updated dictionary of parameters with the necessary information to apply the augmentation on all input
+             tensors separately.
+
+        """
+        self._check_mask_given(input, data_keys)
+
+        # The first mask key will be used for the transplantation
+        mask: torch.Tensor = input[data_keys.index(DataKey.MASK)]
+        # Once any earlier step has run, AugmentationSequential hands the mask on as ``(B, 1, *spatial)``, the
+        # image's rank. Drive the transplant from the spatial layout, so the selection is the one a
+        # ``(B, *spatial)`` mask gives and the singleton axis is re-added per input in ``transform_mask`` (#4707).
+        if (
+            mask.ndim > self._channel_dim
+            and mask.shape[self._channel_dim] == 1
+            and any(key == DataKey.INPUT and _input.ndim == mask.ndim for _input, key in zip(input, data_keys))
+        ):
+            mask = mask.squeeze(self._channel_dim)
+        for _input, key in zip(input, data_keys):
+            if key == DataKey.INPUT:
+                KORNIA_CHECK(
+                    _input.ndim == mask.ndim + 1,
+                    "Every segmentation mask must have one fewer dimension (no channel dimension) than the image, "
+                    f"but got {mask.ndim} for the segmentation mask and {_input.ndim} for the input image.",
+                )
+                KORNIA_CHECK(
+                    mask.size() == torch.Size([s for i, s in enumerate(_input.size()) if i != self._channel_dim]),
+                    "The dimensions of the input image and segmentation mask must match except for the channel "
+                    f"dimension, but got {_input.size()} for the input image and {mask.size()} for the segmentation "
+                    "mask.",
+                )
+
+        if "acceptor_indices" not in params:
+            params["acceptor_indices"] = torch.where(params["batch_prob"] > 0.5)[0]
+        if "donor_indices" not in params:
+            params["donor_indices"] = (params["acceptor_indices"] - 1) % len(params["batch_prob"])
+
+        # Labels exist only to build a selection, so an explicit selection is never second-guessed by a draw.
+        if "selected_labels" not in params and "selection" not in params:
+            if self.excluded_labels.device != mask.device:
+                self.excluded_labels = self.excluded_labels.to(mask.device)
+
+            donor_labels: list[torch.Tensor] = []
+            eligible: list[int] = []
+            for d in range(len(params["donor_indices"])):
+                # Select a random label from the donor image
+                current_mask = mask[params["donor_indices"][d]]
+                labels = current_mask.unique()
+
+                # Remove any label which is part of the excluded labels. Skip the reduction when there is nothing
+                # to exclude: on MPS (PyTorch 2.9) ``all`` over an empty axis yields an undefined result, usually
+                # False, where CPU and CUDA return True, and the filter would then discard every label.
+                if self.excluded_labels.numel() > 0:
+                    labels = labels[(labels.view(1, -1) != self.excluded_labels.view(-1, 1)).all(dim=0)]
+
+                if len(labels) > 0:
+                    donor_labels.append(labels[torch.randperm(len(labels))[0]])
+                    eligible.append(d)
+
+            if len(eligible) < len(params["donor_indices"]):
+                # A donor without an eligible label has nothing to give, so its acceptor is not an acceptor.
+                # Dropping the pair keeps `selected_labels` aligned with the donors it is zipped against below;
+                # merely skipping the label would shift every later label onto the wrong donor. No placeholder
+                # label can stand in for "nothing": every value of a bounded dtype may occur in a mask. The gate
+                # is closed for the dropped acceptors too, so a replay that rebuilds `acceptor_indices` from
+                # `batch_prob` stays aligned with the pruned rows.
+                keep = torch.tensor(eligible, dtype=torch.long, device=params["donor_indices"].device)
+                dropped = torch.ones(len(params["acceptor_indices"]), dtype=torch.bool, device=keep.device)
+                dropped[keep] = False
+                batch_prob = params["batch_prob"].clone()
+                batch_prob[params["acceptor_indices"][dropped]] = 0
+                params["batch_prob"] = batch_prob
+                params["acceptor_indices"] = params["acceptor_indices"][keep]
+                params["donor_indices"] = params["donor_indices"][keep]
+
+            params["selected_labels"] = (
+                torch.stack(donor_labels)
+                if len(donor_labels) > 0
+                else torch.empty(0, dtype=mask.dtype, device=mask.device)
+            )
+
+        if "selection" not in params:
+            selection = torch.zeros(
+                (len(params["acceptor_indices"]), *mask.shape[1:]), dtype=torch.bool, device=mask.device
+            )
+            selected_labels: torch.Tensor = params["selected_labels"]
+            KORNIA_CHECK(
+                selected_labels.ndim == 1,
+                f"selected_labels must be a 1-dimensional torch.tensor, but got {selected_labels.ndim} dimensions.",
+            )
+            KORNIA_CHECK(
+                len(selected_labels) <= len(params["acceptor_indices"]),
+                lambda: (
+                    f"There cannot be more selected labels ({len(selected_labels)}) than images where this "
+                    f"augmentation should be applied ({len(params['acceptor_indices'])})."
+                ),
+            )
+
+            for d, selected_label in zip(range(len(params["donor_indices"])), selected_labels):
+                current_mask = mask[params["donor_indices"][d]]
+                selection[d].masked_fill_(current_mask == selected_label, True)
+
+            params["selection"] = selection
+
+        return params
+
+    def forward(
+        self,
+        *input: torch.Tensor,
+        params: Optional[dict[str, torch.Tensor]] = None,
+        data_keys: Optional[list[str | int | DataKey]] = None,
+        **kwargs: dict[str, Any],
+    ) -> torch.Tensor | list[torch.Tensor]:
+        keys: list[DataKey]
+        keys = self.data_keys if data_keys is None else [DataKey.get(inp) for inp in data_keys]
+
+        if params is None:
+            self._check_mask_given(input, keys)
+            mask: torch.Tensor = input[keys.index(DataKey.MASK)]
+            self._params = self.forward_parameters(mask.shape)
+        else:
+            self._params = params
+
+        if any(k not in self._params for k in ["acceptor_indices", "donor_indices", "selection"]):
+            self._params.update(self.params_from_input(*input, data_keys=keys, params=self._params))
+
+        outputs: list[torch.Tensor] = []
+        for dcate, _input in zip(keys, input):
+            # The indices are drawn on the CPU; indexing device data with them would copy them with a blocking transfer.
+            acceptor_indices = _to_device_nonblocking(self._params["acceptor_indices"], _input.device)
+            acceptor = _input[acceptor_indices].clone()
+            donor = _input[_to_device_nonblocking(self._params["donor_indices"], _input.device)]
+
+            output: torch.Tensor
+            if dcate == DataKey.INPUT:
+                _validate_input_dtype(
+                    _input, accepted_dtypes=[torch.bfloat16, torch.float16, torch.float32, torch.float64]
+                )
+
+                applied = self.transform_input(acceptor, donor, self._params["selection"])
+                output = self.apply_non_transform(_input, self._params, self.flags)
+                output = output.index_put(
+                    (acceptor_indices,),
+                    self.apply_non_transform_mask(applied, self._params, self.flags),
+                )
+            elif dcate == DataKey.MASK:
+                applied = self.transform_mask(acceptor, donor, self._params["selection"])
+                output = self.apply_non_transform_mask(_input, self._params, self.flags)
+                output = output.index_put(
+                    (acceptor_indices,),
+                    self.apply_non_transform_mask(applied, self._params, self.flags),
+                )
+            else:
+                raise NotImplementedError
+
+            outputs.append(output)
+
+        if len(outputs) == 1:
+            return outputs[0]
+
+        return outputs
